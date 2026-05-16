@@ -1,0 +1,4 @@
+aiohttp==3.9.3
+pandas==2.2.0
+numpy==1.26.4
+metaapi-cloud-sdk==26.0.2
