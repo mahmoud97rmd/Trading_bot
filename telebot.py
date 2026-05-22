@@ -188,6 +188,7 @@ async def run_oanda_backtest(start_dt, mode='candle'):
     csv_filename = f"BT_Oanda_Inspector_{datetime.now().strftime('%H%M%S')}.csv"
     trade_logs = []
     total_prof, peak_equity, max_dd = 0.0, 0.0, 0.0
+    total_win, total_loss, win_count, loss_count = 0.0, 0.0, 0, 0
     be_count = 0
     
     await send_tg_msg(f"⏳ <b>بدء الباك تيست</b>\nمن: {start_dt.strftime('%Y-%m-%d')}")
@@ -293,6 +294,8 @@ async def run_oanda_backtest(start_dt, mode='candle'):
                         be_count += 1
                     elif outcome in ["WIN", "LOSS"]:
                         p_usd = round(abs(act_ent - (tp_p if outcome=="WIN" else sl_p)) * 100 * bot_state['lot_size'], 2) * (1 if outcome=="WIN" else -1)
+                    if outcome == 'WIN': total_win += p_usd; win_count += 1
+                    elif outcome == 'LOSS': total_loss += p_usd; loss_count += 1
                     else:
                         p_usd = 0.0
                     
@@ -305,8 +308,8 @@ async def run_oanda_backtest(start_dt, mode='candle'):
                     
                     trade_logs.append({
                         'Timeframe': tf, 'Type': f"BUY {b_type}" if buy_sig else f"SELL {s_type}",
-                        'Entry Time': entry_t.strftime('%Y-%m-%d %H:%M'),
-                        'Exit Time': exit_t.strftime('%Y-%m-%d %H:%M'),
+                        'Entry Time': (entry_t + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
+                        'Exit Time': (exit_t + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
                         'Entry Price': round(act_ent, 2),
                         'TP': tp_p, 'SL': sl_p,
                         'Pips': round(abs(act_ent - (tp_p if outcome=="WIN" else sl_p)) / bot_state['pip_value'], 1) if outcome in ["WIN", "LOSS"] else 0,
@@ -318,35 +321,24 @@ async def run_oanda_backtest(start_dt, mode='candle'):
                     reason = "REJECTED (Trend blocked)" if bot_state['use_trend_filter'] else "REJECTED (Unknown)"
                     trade_logs.append({
                         'Timeframe': tf, 'Type': 'BUY (BLOCKED)' if stoch_buy_any else 'SELL (BLOCKED)',
-                        'Entry Time': curr['time'].strftime('%Y-%m-%d %H:%M'),
+                        'Entry Time': (curr['time'] + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
                         'Exit Time': '---', 'Entry Price': curr['close'],
                         'TP': 0, 'SL': 0, 'Pips': 0, 'Outcome': reason, 'Profit ($)': 0.0
                     })
-                else:
-                    # Near misses detection
-                    if (20 < prev['K'] <= 25) and (curr['K'] > prev['K']):
-                        trade_logs.append({
-                            'Timeframe': tf, 'Type': 'NEAR MISS (BUY)',
-                            'Entry Time': curr['time'].strftime('%Y-%m-%d %H:%M'),
-                            'Exit Time': '---', 'Entry Price': curr['close'],
-                            'TP': 0, 'SL': 0, 'Pips': 0, 
-                            'Outcome': f"Bounced at {prev['K']:.1f} (Missed 20)", 'Profit ($)': 0.0
-                        })
-                    elif (75 <= prev['K'] < 80) and (curr['K'] < prev['K']):
-                        trade_logs.append({
-                            'Timeframe': tf, 'Type': 'NEAR MISS (SELL)',
-                            'Entry Time': curr['time'].strftime('%Y-%m-%d %H:%M'),
-                            'Exit Time': '---', 'Entry Price': curr['close'],
-                            'TP': 0, 'SL': 0, 'Pips': 0, 
-                            'Outcome': f"Bounced at {prev['K']:.1f} (Missed 80)", 'Profit ($)': 0.0
-                        })
 
         if trade_logs:
             df_logs = pd.DataFrame(trade_logs)
+            total_trades = win_count + loss_count
+            win_rate = round(win_count / total_trades * 100, 1) if total_trades > 0 else 0
+            dd_pct = round(max_dd / peak_equity * 100, 1) if peak_equity > 0 else 0
             summary_row = pd.DataFrame([
-                {'Timeframe': '--- SUMMARY ---', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': 'TOTAL NET PROFIT:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'${round(total_prof, 2)}', 'Profit ($)': ''},
-                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': 'MAX DRAWDOWN:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'${round(max_dd, 2)}', 'Profit ($)': ''},
-                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': 'BREAK-EVEN TRADES:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': str(be_count), 'Profit ($)': ''}
+                {'Timeframe': '══════════════', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '✅ الربح الكلي:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'{win_count} صفقة | +${round(total_win,2)}', 'Profit ($)': ''},
+                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '❌ الخسارة الكلية:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'{loss_count} صفقة | -${abs(round(total_loss,2))}', 'Profit ($)': ''},
+                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '💰 المحصلة النهائية:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'${round(total_prof,2)}', 'Profit ($)': ''},
+                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '🎯 نسبة الفوز:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'{win_rate}% ({total_trades} صفقة)', 'Profit ($)': ''},
+                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '📉 أقصى سحب (DD):', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': f'${round(max_dd,2)} ({dd_pct}%)', 'Profit ($)': ''},
+                {'Timeframe': '', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '🔄 بريك إيفن:', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': str(be_count), 'Profit ($)': ''},
+                {'Timeframe': '══════════════', 'Type': '', 'Entry Time': '', 'Exit Time': '', 'Entry Price': '', 'TP': '', 'SL': '', 'Pips': '', 'Outcome': '', 'Profit ($)': ''}
             ])
             pd.concat([df_logs, summary_row]).to_csv(csv_filename, index=False)
             await send_tg_document(csv_filename, f"📊 التقرير التفصيلي متاح الآن.\nالربح الصافي: ${round(total_prof, 2)}")
