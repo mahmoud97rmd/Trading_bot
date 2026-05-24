@@ -40,6 +40,7 @@ bot_state = {
     'tp_pips': {'1m': 25, '2m': 30, '3m': 40, '5m': 70, '15m': 80},
     'sl_pips': {'1m': 100, '2m': 100, '3m': 100, '5m': 100, '15m': 150},
     # مستويات الستوكاستيك
+    'stoch_k': 5, 'stoch_d': 5, 'stoch_smooth': 5,  # قيم الستوكاستيك
     'use_stoch_deep': True,   # 10/90
     'use_stoch_mid':  True,   # 15/85
     'use_stoch_shal': True,   # 20/80
@@ -254,12 +255,15 @@ def calculate_indicators(df):
     df['ema15']  = df['close'].ewm(span=15,  adjust=False).mean()
     df['ema50']  = df['close'].ewm(span=50,  adjust=False).mean()
     df['ema150'] = df['close'].ewm(span=150, adjust=False).mean()
-    low_min  = df['low'].rolling(window=5).min()
-    high_max = df['high'].rolling(window=5).max()
+    _k = bot_state.get('stoch_k', 5)
+    _d = bot_state.get('stoch_d', 5)
+    _s = bot_state.get('stoch_smooth', 5)
+    low_min  = df['low'].rolling(window=_k).min()
+    high_max = df['high'].rolling(window=_k).max()
     denom = (high_max - low_min).replace(0, 1e-10)
     df['k_raw'] = 100 * ((df['close'] - low_min) / denom)
-    df['K'] = df['k_raw'].ewm(span=5, adjust=False).mean()
-    df['D'] = df['K'].ewm(span=5, adjust=False).mean()
+    df['K'] = df['k_raw'].ewm(span=_s, adjust=False).mean()
+    df['D'] = df['K'].ewm(span=_d, adjust=False).mean()
     df['tr0'] = abs(df['high'] - df['low'])
     df['tr1'] = abs(df['high'] - df['close'].shift())
     df['tr2'] = abs(df['low']  - df['close'].shift())
@@ -270,6 +274,31 @@ def calculate_indicators(df):
 
 # =============================================================
 # UI KEYBOARDS
+
+def get_stoch_settings_keyboard():
+    k = bot_state['stoch_k']
+    d = bot_state['stoch_d']
+    s = bot_state['stoch_smooth']
+    return {"inline_keyboard": [
+        [{"text": f"الإعداد الحالي: Stoch({k},{s},{d})", "callback_data": "noop"}],
+        [{"text": "━━ K Period ━━", "callback_data": "noop"}],
+        [{"text": "➖ K", "callback_data": "dec_stoch_k"},
+         {"text": f"K = {k}", "callback_data": "noop"},
+         {"text": "➕ K", "callback_data": "inc_stoch_k"}],
+        [{"text": "━━ Smooth ━━", "callback_data": "noop"}],
+        [{"text": "➖ S", "callback_data": "dec_stoch_s"},
+         {"text": f"S = {s}", "callback_data": "noop"},
+         {"text": "➕ S", "callback_data": "inc_stoch_s"}],
+        [{"text": "━━ D Period ━━", "callback_data": "noop"}],
+        [{"text": "➖ D", "callback_data": "dec_stoch_d"},
+         {"text": f"D = {d}", "callback_data": "noop"},
+         {"text": "➕ D", "callback_data": "inc_stoch_d"}],
+        [{"text": "5,5,5 (افتراضي)", "callback_data": "reset_stoch"},
+         {"text": "14,3,3", "callback_data": "preset_14_3_3"}],
+        [{"text": "🔙 رجوع", "callback_data": "menu_filters"}]
+    ]}
+
+
 # =============================================================
 
 def get_main_keyboard():
@@ -309,6 +338,7 @@ def get_filters_keyboard():
         [{"text": f"{simple_icon} SIMPLE: توازي ema50 + ema150 فقط", "callback_data": "set_filter_simple"}],
         [{"text": f"{noma_icon} NO MA: بلا موفينجات (ستوكاستيك فقط)", "callback_data": "set_filter_noma"}],
         [{"text": "━━ مستويات الستوكاستيك ━━", "callback_data": "noop"}],
+        [{"text": f"⚙️ إعدادات Stoch({bot_state['stoch_k']},{bot_state['stoch_smooth']},{bot_state['stoch_d']})", "callback_data": "menu_stoch_settings"}],
         [{"text": f"DEEP 10/90: {dp_icon}", "callback_data": "toggle_stoch_deep"},
          {"text": f"MID  15/85: {md_icon}", "callback_data": "toggle_stoch_mid"},
          {"text": f"SHAL 20/80: {sh_icon}", "callback_data": "toggle_stoch_shal"}],
@@ -1136,6 +1166,16 @@ async def process_tg_update(update):
                         await send_tg_msg(f"❌ خطأ: {e}")
                 asyncio.create_task(_close())
 
+        elif d == "menu_stoch_settings":
+            await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "inc_stoch_k": bot_state['stoch_k'] = min(bot_state['stoch_k']+1, 50); await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "dec_stoch_k": bot_state['stoch_k'] = max(bot_state['stoch_k']-1, 1);  await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "inc_stoch_s": bot_state['stoch_smooth'] = min(bot_state['stoch_smooth']+1, 50); await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "dec_stoch_s": bot_state['stoch_smooth'] = max(bot_state['stoch_smooth']-1, 1);  await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "inc_stoch_d": bot_state['stoch_d'] = min(bot_state['stoch_d']+1, 50); await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "dec_stoch_d": bot_state['stoch_d'] = max(bot_state['stoch_d']-1, 1);  await edit_tg_msg(chat_id, msg_id, "⚙️ <b>إعدادات الستوكاستيك:</b>", get_stoch_settings_keyboard())
+        elif d == "reset_stoch":  bot_state['stoch_k'] = 5; bot_state['stoch_d'] = 5; bot_state['stoch_smooth'] = 5; await edit_tg_msg(chat_id, msg_id, "✅ تم إعادة الضبط لـ 5,5,5", get_stoch_settings_keyboard())
+        elif d == "preset_14_3_3": bot_state['stoch_k'] = 14; bot_state['stoch_d'] = 3; bot_state['stoch_smooth'] = 3; await edit_tg_msg(chat_id, msg_id, "✅ تم ضبط 14,3,3", get_stoch_settings_keyboard())
         elif d == "noop":
             pass
 
