@@ -171,7 +171,7 @@ def is_danger_time(dt_utc):
     """فحص فترة الخطر 16:00-18:30 دمشق (= 13:00-15:30 UTC)"""
     dh = (dt_utc.hour + 3) % 24
     dm = dt_utc.minute
-    return (dh == 16) or (dh == 17) or (dh == 18 and dm <= 30)
+    return (dh == 19) or (dh == 20) or (dh == 21)
 
 
 # =============================================================
