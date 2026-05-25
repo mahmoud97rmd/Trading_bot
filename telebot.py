@@ -344,7 +344,7 @@ def get_filters_keyboard():
          {"text": f"SHAL 20/80: {sh_icon}", "callback_data": "toggle_stoch_shal"}],
         [{"text": "━━ فلاتر الوقت ━━", "callback_data": "noop"}],
         [{"text": f"Time Filter 08-17 UTC: {t_icon}", "callback_data": "toggle_time"},
-         {"text": f"حظر 16-18:30 دمشق: {d_icon}", "callback_data": "toggle_danger"}],
+         {"text": f"حظر 19:00-22:00 دمشق: {d_icon}", "callback_data": "toggle_danger"}],
         [{"text": f"ثبات الترند ({bot_state['cons_count']} شموع): {c_icon}", "callback_data": "toggle_f_cons"}],
         [{"text": "🔙 القائمة الرئيسية", "callback_data": "menu_main"}]
     ]}
