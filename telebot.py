@@ -15,7 +15,7 @@ ACCOUNT_ID    = '7d54fa6f-eaf7-4637-92a1-e0356ee729f8'
 TG_TOKEN      = '8779425898:AAG2tyWLIasXmvFlTWjf9tqWuHO08QHJvgk'
 OANDA_ID      = '101-001-39389982-001'
 OANDA_API     = 'd05b25b3f1ce0c8fa105ffefa45efb01-a5c26f544a26a4f810f1809913a2795f'
-OANDA_URL     = 'https://api-fxtrade.oanda.com/v3'
+OANDA_URL     = 'https://api-fxpractice.oanda.com/v3'
 
 _TFS = ['1m', '2m', '3m', '5m', '15m']
 
@@ -882,10 +882,10 @@ async def run_oanda_backtest(start_dt):
             trig_zones = '+'.join([z for z,v in [('DEEP',bot_state['comp_use_deep']),
                                                   ('MID', bot_state['comp_use_mid']),
                                                   ('SHAL',bot_state['comp_use_shal'])] if v]) or 'none'
-            adv_fire = f"MACD/OsMA≥10 | LB={bot_state['comp_lookback']} FWD={bot_state['comp_tolerance_fwd']}"
-            strat_detail = f"{tol_desc} | Trigger:{trig_zones} | Fire:{fire_zones}"
+            fire_zones = f"MACD/OsMA≥10 | LB={bot_state['comp_lookback']} FWD={bot_state['comp_tolerance_fwd']}"
         else:
-            strat_detail = tol_desc
+            trig_zones = 'N/A'
+            fire_zones = 'N/A'
 
         summary = {
             'البند':   ['✅ الربح الكلي','❌ الخسارة الكلية','💰 المحصلة',
@@ -898,8 +898,8 @@ async def run_oanda_backtest(start_dt):
                         f'${round(max_dd,2)} ({dd_pct}%)',
                         str(be_count),
                         tol_desc,
-                        trig_zones if sm=='COMPOSITE' else 'N/A',
-                        fire_zones if sm=='COMPOSITE' else 'N/A'],
+                        trig_zones,
+                        fire_zones],
         }
         with pd.ExcelWriter(fname, engine='openpyxl') as writer:
             df_logs.to_excel(writer, sheet_name='الصفقات', index=False)
@@ -1253,7 +1253,6 @@ async def run_advanced_backtest(days=7):
                                                 ('MID', bot_state['comp_use_mid']),
                                                 ('SHAL',bot_state['comp_use_shal'])] if v]) or 'none'
             adv_fire = f"MACD/OsMA≥10 | LB={bot_state['comp_lookback']} FWD={bot_state['comp_tolerance_fwd']}"
-            adv_fire += f' | {adv_dom}'
         else:
             adv_trig = adv_fire = 'N/A'
 
