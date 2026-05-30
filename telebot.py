@@ -38,7 +38,7 @@ bot_state = {
     'last_update_id': 0,
     'tp_pips':      {'1m': 25, '2m': 30, '3m': 40, '5m': 70, '15m': 80},
     'sl_pips':      {'1m': 100, '2m': 100, '3m': 100, '5m': 100, '15m': 150},
-    'strategy_mode': 'STOCH_NEW',   
+    'strategy_mode': 'COMPOSITE',   
     'filter_mode':    'NO_MA',       
     'stoch_k':        5,
     'stoch_d':        5,
@@ -52,8 +52,8 @@ bot_state = {
     'comp_tolerance_fwd': 5,   
     'comp_use_deep': True,   
     'comp_use_mid':  True,   
-    'comp_use_shal': False,
-    'comp_disable_window': False,  
+    'comp_use_shal': False,  
+    'comp_disable_window': False,
     'setup_state': {
         tf: {
             'buy_active':    False,
@@ -206,7 +206,7 @@ def _get_comp_zones(bs):
     return buy_zones, sell_zones
 
 # =============================================================
-# STRATEGY C — COMPOSITE (CLEAN STATE MACHINE - NO KEY ERRORS)
+# STRATEGY C — COMPOSITE
 # =============================================================
 def _run_composite_state(state: dict, curr: pd.Series, prev: pd.Series,
                           bs: dict, df: pd.DataFrame, idx: int) -> tuple:
@@ -244,7 +244,7 @@ def _run_composite_state(state: dict, curr: pd.Series, prev: pd.Series,
         state['buy_fire_idx'] = idx
     elif state['buy_active']:
         state['buy_wait'] += 1
-        if state['buy_wait'] > fwd and not bs.get('comp_disable_window'):
+        if state['buy_wait'] > fwd and not bs.get('comp_disable_window', False):
             state['buy_active'] = False
             state['buy_wait'] = 0
 
@@ -254,7 +254,7 @@ def _run_composite_state(state: dict, curr: pd.Series, prev: pd.Series,
         state['sell_fire_idx'] = idx
     elif state['sell_active']:
         state['sell_wait'] += 1
-        if state['sell_wait'] > fwd and not bs.get('comp_disable_window'):
+        if state['sell_wait'] > fwd and not bs.get('comp_disable_window', False):
             state['sell_active'] = False
             state['sell_wait'] = 0
 
@@ -517,7 +517,7 @@ async def run_oanda_backtest(start_dt):
     bot_state['is_backtesting'] = True
     c_log("بدء الباك تيست...")
     sm = bot_state['strategy_mode']
-    tol_desc = (f"COMPOSITE/LB{bot_state['comp_lookback']}_FWD{bot_state['comp_tolerance_fwd']}" if sm == 'COMPOSITE' else f"{sm}/{bot_state['filter_mode']}")
+    tol_desc = (f"COMPOSITE (Window={'OFF' if bot_state['comp_disable_window'] else str(bot_state['comp_lookback'])+'/'+str(bot_state['comp_tolerance_fwd'])})" if sm == 'COMPOSITE' else f"{sm}/{bot_state['filter_mode']}")
     await send_tg_msg(f"⏳ <b>بدء الباك تيست</b>\nمن: {start_dt.strftime('%Y-%m-%d')}\nالاستراتيجية: {tol_desc}")
     fname       = f"BT_{datetime.now().strftime('%H%M%S')}.xlsx"
     trade_logs  = []; blocked_logs= []
@@ -612,7 +612,7 @@ async def run_advanced_backtest(days=7):
     bot_state['is_backtesting'] = True
     start_dt = datetime.now(timezone.utc) - timedelta(days=days)
     sm = bot_state['strategy_mode']
-    tol_desc = (f"COMPOSITE/LB{bot_state['comp_lookback']}_FWD{bot_state['comp_tolerance_fwd']}" if sm == 'COMPOSITE' else f"{sm}/{bot_state['filter_mode']}")
+    tol_desc = (f"COMPOSITE (Window={'OFF' if bot_state['comp_disable_window'] else str(bot_state['comp_lookback'])+'/'+str(bot_state['comp_tolerance_fwd'])})" if sm == 'COMPOSITE' else f"{sm}/{bot_state['filter_mode']}")
     await send_tg_msg(f"⏳ <b>Advanced Backtest</b>\nمن: {start_dt.strftime('%Y-%m-%d')} ({days} أيام)\nالاستراتيجية: {tol_desc}")
     trade_logs  = []; blocked_logs = []
     total_prof  = peak_equity = max_dd = 0.0
@@ -746,7 +746,7 @@ def _style_sheet(ws):
     for col in ws.columns: ws.column_dimensions[col[0].column_letter].width = min(max((len(str(c.value or '')) for c in col), default=8) + 3, 28)
 
 # =============================================================
-# DIAGNOSTIC ENGINE (FIXED & 100% OPERATIONAL)
+# DIAGNOSTIC ENGINE
 # =============================================================
 async def run_diagnostic():
     lines = [f"🔬 <b>تشخيص COMPOSITE</b>"]
@@ -797,7 +797,7 @@ async def run_diagnostic():
             if was_buy  and not bt_state['buy_active']  and not b: setups_cancelled += 1
             if was_sell and not bt_state['sell_active'] and not s: setups_cancelled += 1
         lines.append(f"🎯 إشارات في آخر 200 شمعة: {sigs} (BUY:{buy_sigs} SELL:{sell_sigs})\n   Setups مفتوحة: {setups_opened} | أُطلقت: {setups_fired} | ألغيت: {setups_cancelled}")
-        if sigs == 0 and setups_opened > 0: lines.append(f"⚠️ {setups_opened} setup تفتح لكن لا إشارات\n   macd_rsi >= 10 لا يحدث بعد التقاطع\n   أو يحدث قبله فقط")
+        if sigs == 0 and setups_opened > 0: lines.append(f"⚠️ {setups_opened} setup تفتح لكن لا إشارات\n   النافذة الزمنية: {'معطلة' if bot_state['comp_disable_window'] else 'مفعلة'}")
     await send_tg_msg("\n".join(lines))
 
 # =============================================================
@@ -874,7 +874,7 @@ async def timeframe_scanner(tf):
 async def process_tg_update(update):
     if 'message' in update and 'text' in update['message']:
         msg = update['message']['text'].strip(); bot_state['chat_id'] = update['message']['chat']['id']
-        if msg == '/start': await send_tg_msg("🤖 <b>مرحباً! Gold Scalper v3</b>\nتم إصلاح محرك COMPOSITE بنجاح.", get_main_keyboard())
+        if msg == '/start': await send_tg_msg("🤖 <b>مرحباً! Gold Scalper v3</b>\nتم إصلاح محرك COMPOSITE وتفعيل زر التعطيل.", get_main_keyboard())
         elif msg == '/diag':
             asyncio.create_task(run_diagnostic())
             await send_tg_msg("⏳ جاري التشخيص وبناء التقرير...")
@@ -923,11 +923,14 @@ async def process_tg_update(update):
             attr = d.replace("toggle_", "")
             bot_state[attr] = not bot_state[attr]; _reset_composite_states()
             await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
+        elif d == "toggle_comp_window":
+            bot_state['comp_disable_window'] = not bot_state.get('comp_disable_window', False)
+            _reset_composite_states()
+            await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "inc_lookback": bot_state['comp_lookback'] = min(bot_state['comp_lookback']+1, 10); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "dec_lookback": bot_state['comp_lookback'] = max(bot_state['comp_lookback']-1, 1); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "inc_fwd": bot_state['comp_tolerance_fwd'] = min(bot_state['comp_tolerance_fwd']+1, 10); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "dec_fwd": bot_state['comp_tolerance_fwd'] = max(bot_state['comp_tolerance_fwd']-1, 1); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
-        elif d == \"toggle_comp_window\": bot_state[\"comp_disable_window\"] = not bot_state.get(\"comp_disable_window\", False); _reset_composite_states(); await edit_tg_msg(chat_id, msg_id, \"🎛 الفلاتر:\", get_filters_keyboard())
         elif d == "toggle_time": bot_state['use_time_filter'] = not bot_state['use_time_filter']; await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "toggle_danger": bot_state['use_danger_filter'] = not bot_state['use_danger_filter']; await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "menu_tfs": await edit_tg_msg(chat_id, msg_id, "⏱ إدارة الفريمات:", get_tf_keyboard())
