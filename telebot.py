@@ -927,6 +927,7 @@ async def process_tg_update(update):
         elif d == "dec_lookback": bot_state['comp_lookback'] = max(bot_state['comp_lookback']-1, 1); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "inc_fwd": bot_state['comp_tolerance_fwd'] = min(bot_state['comp_tolerance_fwd']+1, 10); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "dec_fwd": bot_state['comp_tolerance_fwd'] = max(bot_state['comp_tolerance_fwd']-1, 1); await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
+        elif d == \"toggle_comp_window\": bot_state[\"comp_disable_window\"] = not bot_state.get(\"comp_disable_window\", False); _reset_composite_states(); await edit_tg_msg(chat_id, msg_id, \"🎛 الفلاتر:\", get_filters_keyboard())
         elif d == "toggle_time": bot_state['use_time_filter'] = not bot_state['use_time_filter']; await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "toggle_danger": bot_state['use_danger_filter'] = not bot_state['use_danger_filter']; await edit_tg_msg(chat_id, msg_id, "🎛 الفلاتر:", get_filters_keyboard())
         elif d == "menu_tfs": await edit_tg_msg(chat_id, msg_id, "⏱ إدارة الفريمات:", get_tf_keyboard())
