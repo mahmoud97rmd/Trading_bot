@@ -1,5 +1,5 @@
 """
-Gold Scalper Bot — v5 (Added RSI Reversal Strategy)
+Gold Scalper Bot — v5.1 (Live Tracking & Async Lock Fixed)
 Strategies : STOCH-NEW  |  STOCH-OLD  |  RSI-REVERSAL
 """
 
@@ -7,6 +7,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import traceback
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,7 @@ from aiohttp import web
 # ─────────────────────────────────────────────────────────────
 METAAPI_TOKEN = 'eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9..NRMo-BO9ezZBEb4XmCQzkMsRN1iAz1rVSk7XWFP-ZGS_AZEyxSfIjnJ5w-r4egazV7tnxNLjjMuAdUb25T3ur3XWKCL4Jo9LFPy9tZzhIMRtlhq8d6YAHK9uxJclqJv5BZQFDeMeiFtyalLNjaE100Lp2zEnGWwlloxF-dpCw5DXvVKeGfMyVx4L2kisshcysDo7OeMkDBU1UB7leHi2eviEl7XQCpmhxdzT4BwMkf8YERx2jouKVu8-koVy00aon0drktGBSlQDOFw2WV0hg-VUfeCBR_Hgw2czqKVJ_lj_ZN3EsjWirirpiuXWbtwdD-VPokjKtX1z3ugcSTS1nd2iFIzauUHdOfb7Jl0R6cm8FosVS-4Iu046DiMsrxiAJ4PBywOXQhsFzZiePqmil1w5HHCxrw_78HNR9XcjBETMpHx9W48llIeUOkBVbsKfBP5iYtGSjS52i0QgpvHkfKrtXfbkMT0_9yJFG2kfZJHwJ5BJzWT4aKXto3l6iGe45xe4ZJhYhZX_RkC6dxR2w84M-uY-wlqiv_sxjHNOguSyOx4lfaeoq5H-LuJiWpHAYxEJUQWoQAQ7PObZOXCDWLRc_vP2gcbv1qYxTjD54FHnqhyf-oTGzAkWG5CVQFKpp9jTHQ3pXEYTSgIUTfHDbtoesAY1HG3nHcHbwujnqo0'
 ACCOUNT_ID    = '7d54fa6f-eaf7-4637-92a1-e0356ee729f8'
-TG_TOKEN      = '8779425898:AAGJFaArYBeUGP7WfL24U-keKmqHLeqRRvg'
+TG_TOKEN      = '8779425898:AAG2tyWLIasXmvFlTWjf9tqWuHO08QHJvgk'
 OANDA_API     = 'd05b25b3f1ce0c8fa105ffefa45efb01-a5c26f544a26a4f810f1809913a2795f'
 OANDA_URL     = 'https://api-fxpractice.oanda.com/v3'
 
@@ -56,7 +57,7 @@ bot_state: dict = {
     'last_update_id':    0,
     'tp_pips':           {'1m': 25, '2m': 30, '3m': 40, '5m': 70, '15m': 80},
     'sl_pips':           {'1m': 100, '2m': 100, '3m': 100, '5m': 100, '15m': 150},
-    'strategy_mode':     'STOCH_OLD', # STOCH_NEW | STOCH_OLD | RSI_REV
+    'strategy_mode':     'STOCH_OLD',
     'filter_mode':       'NO_MA',
     # Stoch Params
     'stoch_k':           5,
@@ -99,22 +100,17 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     
-    # MAs
     df['ema15']  = _ema(df['close'], 15)
     df['ema50']  = _ema(df['close'], 50)
     df['ema150'] = _ema(df['close'], 150)
 
-    # Stochastic
-    k_period = bot_state['stoch_k']
-    smooth   = bot_state['stoch_smooth']
-    d_period = bot_state['stoch_d']
+    k_period, smooth, d_period = bot_state['stoch_k'], bot_state['stoch_smooth'], bot_state['stoch_d']
     low_min  = df['low'].rolling(k_period).min()
     high_max = df['high'].rolling(k_period).max()
     denom    = (high_max - low_min).replace(0, 1e-10)
     df['K']  = (100.0 * (df['close'] - low_min) / denom).ewm(span=smooth, adjust=False).mean()
     df['D']  = df['K'].ewm(span=d_period, adjust=False).mean()
 
-    # RSI (14)
     rsi_p = bot_state['rsi_period']
     delta = df['close'].diff()
     up    = delta.clip(lower=0)
@@ -124,7 +120,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = ema_up / ema_down
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # ATR
     tr = pd.concat([
         (df['high'] - df['low']).abs(),
         (df['high'] - df['close'].shift()).abs(),
@@ -138,28 +133,14 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # SIGNAL GENERATION
 # ─────────────────────────────────────────────────────────────
 def get_rsi_signals(prev2_rsi: float, prev_rsi: float, curr_rsi: float) -> tuple:
-    """
-    RSI Reversal Logic (V-Shape & Inverted V-Shape)
-    Requires the RSI to reach the extreme and explicitly reverse.
-    """
     buy_sig, sell_sig, b_label, s_label = False, False, "", ""
-
-    # Reversal Upwards (Buy) — Was going down to <= level, now going up
     if prev2_rsi >= prev_rsi and curr_rsi > prev_rsi:
-        if bot_state['use_rsi_18'] and prev_rsi <= 18:
-            buy_sig, b_label = True, "RSI(18-REV)"
-        elif bot_state['use_rsi_25'] and prev_rsi <= 25:
-            buy_sig, b_label = True, "RSI(25-REV)"
-
-    # Reversal Downwards (Sell) — Was going up to >= level, now going down
+        if bot_state['use_rsi_18'] and prev_rsi <= 18: buy_sig, b_label = True, "RSI(18-REV)"
+        elif bot_state['use_rsi_25'] and prev_rsi <= 25: buy_sig, b_label = True, "RSI(25-REV)"
     if prev2_rsi <= prev_rsi and curr_rsi < prev_rsi:
-        if bot_state['use_rsi_83'] and prev_rsi >= 83:
-            sell_sig, s_label = True, "RSI(83-REV)"
-        elif bot_state['use_rsi_77'] and prev_rsi >= 77:
-            sell_sig, s_label = True, "RSI(77-REV)"
-
+        if bot_state['use_rsi_83'] and prev_rsi >= 83: sell_sig, s_label = True, "RSI(83-REV)"
+        elif bot_state['use_rsi_77'] and prev_rsi >= 77: sell_sig, s_label = True, "RSI(77-REV)"
     return buy_sig, sell_sig, b_label, s_label
-
 
 def get_stoch_signals(prev_k: float, prev_d: float, curr_k: float, curr_d: float) -> tuple:
     mode = bot_state['strategy_mode']
@@ -198,7 +179,6 @@ def compute_trend_ok(df: pd.DataFrame, i: int, curr: pd.Series) -> tuple:
         c = df.loc[idx]
         if not (c['ema50'] > c['ema150']): b_ema = False
         if not (c['ema150'] > c['ema50']): s_ema = False
-
     if mode == 'SIMPLE': return b_ema, s_ema
     ma_buy  = curr['ema15'] > curr['ema50'] > curr['ema150']
     ma_sell = curr['ema15'] < curr['ema50'] < curr['ema150']
@@ -213,7 +193,6 @@ def compute_trend_ok_live(df: pd.DataFrame, curr: pd.Series) -> tuple:
         c = df.iloc[(-2) - j]
         if not (c['ema50'] > c['ema150']): b_ema = False
         if not (c['ema150'] > c['ema50']): s_ema = False
-
     if mode == 'SIMPLE': return b_ema, s_ema
     ma_buy  = curr['ema15'] > curr['ema50'] > curr['ema150']
     ma_sell = curr['ema15'] < curr['ema50'] < curr['ema150']
@@ -224,7 +203,6 @@ def is_danger_time(dt_utc: datetime) -> bool:
 
 def _get_signal_for_bar(df: pd.DataFrame, i: int, curr: pd.Series, prev: pd.Series, prev2: pd.Series) -> tuple:
     trend_buy, trend_sell = compute_trend_ok(df, i, curr)
-    
     if bot_state['strategy_mode'] == 'RSI_REV':
         raw_buy, raw_sell, b_lbl, s_lbl = get_rsi_signals(prev2['rsi'], prev['rsi'], curr['rsi'])
     else:
@@ -233,7 +211,6 @@ def _get_signal_for_bar(df: pd.DataFrame, i: int, curr: pd.Series, prev: pd.Seri
     buy_sig  = raw_buy  and trend_buy
     sell_sig = raw_sell and trend_sell
     label    = b_lbl if buy_sig else s_lbl
-    
     return buy_sig, sell_sig, label, raw_buy, raw_sell, b_lbl, s_lbl
 
 # ─────────────────────────────────────────────────────────────
@@ -244,8 +221,7 @@ _oanda_sem: asyncio.Semaphore | None = None
 
 def _get_oanda_sem() -> asyncio.Semaphore:
     global _oanda_sem
-    if _oanda_sem is None:
-        _oanda_sem = asyncio.Semaphore(3)
+    if _oanda_sem is None: _oanda_sem = asyncio.Semaphore(3)
     return _oanda_sem
 
 async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 5000, end_time: datetime = None) -> list:
@@ -260,7 +236,7 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 50
             try:
                 async with get_http().get(url, headers=headers, params=params) as resp:
                     if resp.status == 200:
-                        data = json.loads(await resp.text())
+                        data = await resp.json()
                         return [
                             {
                                 'time':  pd.to_datetime(c['time'], utc=True),
@@ -271,26 +247,27 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 50
                             }
                             for c in data.get('candles', []) if c['complete']
                         ]
-                    elif resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        await asyncio.sleep(1)
+                    elif resp.status == 429: await asyncio.sleep(2 ** attempt)
+                    else: await asyncio.sleep(1)
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 await asyncio.sleep(1)
     return []
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPERS
+# TELEGRAM HELPERS (MODIFIED FOR MESSAGE TRACKING)
 # ─────────────────────────────────────────────────────────────
-async def send_tg_msg(text: str, reply_markup: dict = None) -> None:
-    if not bot_state['chat_id']: return
+async def send_tg_msg(text: str, reply_markup: dict = None) -> int | None:
+    if not bot_state['chat_id']: return None
     payload = {'chat_id': bot_state['chat_id'], 'text': text, 'parse_mode': 'HTML'}
     if reply_markup: payload['reply_markup'] = reply_markup
     try:
         async with get_http().post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage', json=payload) as resp:
-            pass
+            data = await resp.json()
+            if data.get('ok'):
+                return data['result']['message_id']
     except Exception as e:
         c_log(f'TG send error: {e}')
+    return None
 
 async def edit_tg_msg(chat_id: int, message_id: int, text: str, reply_markup: dict = None) -> None:
     payload = {'chat_id': chat_id, 'message_id': message_id, 'text': text, 'parse_mode': 'HTML'}
@@ -301,9 +278,11 @@ async def edit_tg_msg(chat_id: int, message_id: int, text: str, reply_markup: di
     except Exception as e:
         c_log(f'TG edit error: {e}')
 
-async def answer_callback(cbq_id: str, text: str = None) -> None:
+async def answer_callback(cbq_id: str, text: str = None, show_alert: bool = False) -> None:
     payload = {'callback_query_id': cbq_id}
-    if text: payload['text'] = text
+    if text:
+        payload['text'] = text
+        if show_alert: payload['show_alert'] = True
     try:
         async with get_http().post(f'https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery', json=payload) as _:
             pass
@@ -522,17 +501,19 @@ def _entry_params(curr: pd.Series, is_buy: bool, tf: str) -> tuple:
     return act_ent, tp_p, sl_p, eff_tp
 
 # ─────────────────────────────────────────────────────────────
-# STANDARD BACKTEST
+# STANDARD BACKTEST (WITH LIVE TRACKING)
 # ─────────────────────────────────────────────────────────────
 async def run_oanda_backtest(start_dt: datetime) -> None:
-    if bot_state['is_backtesting']:
-        await send_tg_msg('⚠️ يوجد باك تيست قيد المعالجة.'); return
-
-    bot_state['is_backtesting'] = True
     desc  = f"{bot_state['strategy_mode']} / {bot_state['filter_mode']}"
     fname = f"BT_{datetime.now().strftime('%H%M%S')}.xlsx"
+    
+    status_text = f'⏳ <b>بدء الباك تيست</b>\nمن: {start_dt.strftime("%Y-%m-%d")}\nالاستراتيجية: {desc}'
+    msg_id = await send_tg_msg(status_text)
 
-    await send_tg_msg(f'⏳ <b>بدء الباك تيست</b>\nمن: {start_dt.strftime("%Y-%m-%d")}\nالاستراتيجية: {desc}')
+    async def update_status(extra: str):
+        if msg_id: await edit_tg_msg(bot_state['chat_id'], msg_id, f'{status_text}\n\n{extra}')
+        else: await send_tg_msg(extra)
+
     trade_logs, blocked_logs = [], []
     total_prof = peak_equity = max_dd = total_win = total_loss = 0.0
     win_count = loss_count = be_count = 0
@@ -540,20 +521,41 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
     try:
         for tf in bot_state['timeframes']:
             if not bot_state['active_tfs'][tf]: continue
+            
+            await update_status(f'🔄 <b>[{tf}]</b>: جاري جلب الشموع الأساسية للمحاكاة...')
             c_data = await fetch_oanda_candles('XAU_USD', tf, 5000)
-            if len(c_data) < 300: continue
+            if len(c_data) < 300: 
+                await update_status(f'⚠️ <b>[{tf}]</b>: تم التخطي (البيانات المتوفرة غير كافية: {len(c_data)} شمعة)')
+                await asyncio.sleep(2)
+                continue
 
             df = calculate_indicators(pd.DataFrame(c_data).sort_values('time').reset_index(drop=True))
             safe_start = max(10, bot_state['cons_count'])
 
             tf_end    = datetime.now(timezone.utc)
-            total_min = int((tf_end - start_dt).total_seconds() / 60) + 72 * 60 + 60
-            m1_raw    = await fetch_oanda_candles('XAU_USD', '1m', min(total_min, 5000), tf_end)
-            if total_min > 5000 and m1_raw:
-                m1_extra = await fetch_oanda_candles('XAU_USD', '1m', 5000, m1_raw[0]['time'])
-                m1_raw   = m1_extra + m1_raw
+            total_min = int((tf_end - start_dt).total_seconds() / 60) + 72 * 60
+            
+            await update_status(f'📥 <b>[{tf}]</b>: جاري جلب شموع دقيقة (1m) لضمان دقة الأهداف (الكمية المطلوبة: {total_min})...')
+            m1_raw = []
+            current_end = tf_end
+            fetched = 0
+            while fetched < total_min:
+                chunk = min(total_min - fetched, 5000)
+                cndls = await fetch_oanda_candles('XAU_USD', '1m', chunk, current_end)
+                if not cndls: break
+                m1_raw = cndls + m1_raw
+                
+                new_end = cndls[0]['time']
+                if new_end >= current_end: break # Safety break to avoid infinite loop
+                current_end = new_end
+                
+                fetched += len(cndls)
+                if len(cndls) < chunk: break
+                await asyncio.sleep(0.5)
+
             minute_candles = sorted(m1_raw, key=lambda x: x['time'])
 
+            await update_status(f'⚙️ <b>[{tf}]</b>: بدء فحص الإشارات ومحاكاة الصفقات (إجمالي الشموع المتاحة: {len(df)})...')
             for i in df[df['time'] >= start_dt].index:
                 if i < safe_start: continue
                 if i % 50 == 0: await asyncio.sleep(0)
@@ -564,13 +566,11 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
 
                 buy_sig, sell_sig, label, raw_buy, raw_sell, b_lbl, s_lbl = _get_signal_for_bar(df, i, curr, prev, prev2)
                 
-                # Tracking blocked signals
                 ts = (curr['time'] + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M')
                 if not buy_sig and raw_buy:
                     blocked_logs.append({'Timeframe': tf, 'Type': f'BUY BLOCKED ({b_lbl})', 'Entry Time': ts, 'Entry Price': curr['close'], 'Reason': f'REJECTED ({bot_state["filter_mode"]})'})
                 if not sell_sig and raw_sell:
                     blocked_logs.append({'Timeframe': tf, 'Type': f'SELL BLOCKED ({s_lbl})', 'Entry Time': ts, 'Entry Price': curr['close'], 'Reason': f'REJECTED ({bot_state["filter_mode"]})'})
-
 
                 if not (buy_sig or sell_sig) or i + 1 >= len(df): continue
 
@@ -593,8 +593,11 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
                 trade_logs.append(_build_trade_row(tf, is_buy, label, next_c['time'], exit_t, act_ent, tp_p, sl_p, outcome, p_usd))
 
         if not trade_logs:
-            await send_tg_msg('⚠️ لم يتم العثور على أي صفقات.'); return
+            await update_status('⚠️ لم يتم العثور على أي صفقات خلال هذه الفترة.')
+            return
 
+        await update_status('✅ <b>اكتمل الفحص لجميع الفريمات!</b> جاري تحضير ملف الإكسل والتقرير النهائي...')
+        
         total_trades = win_count + loss_count
         win_rate     = round(win_count / total_trades * 100, 1) if total_trades else 0
         summary = {
@@ -613,21 +616,25 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
         os.remove(fname)
 
     except Exception as e:
-        await send_tg_msg(f'❌ خطأ في الباك تيست: {e}')
+        err_msg = traceback.format_exc()
+        c_log(f'Backtest Error: {err_msg}')
+        await update_status(f'❌ <b>حدث خطأ غير متوقع أثناء الفحص:</b>\n<code>{e}</code>\nتم إلغاء العملية.')
     finally:
         bot_state['is_backtesting'] = False
 
 # ─────────────────────────────────────────────────────────────
-# ADVANCED BACKTEST
+# ADVANCED BACKTEST (WITH LIVE TRACKING)
 # ─────────────────────────────────────────────────────────────
 async def run_advanced_backtest(days: int = 7) -> None:
-    if bot_state['is_backtesting']:
-        await send_tg_msg('⚠️ يوجد باك تيست قيد المعالجة.'); return
-
-    bot_state['is_backtesting'] = True
-    start_dt = datetime.now(timezone.utc) - timedelta(days=days)
     desc     = f"{bot_state['strategy_mode']} / {bot_state['filter_mode']}"
-    await send_tg_msg(f'⏳ <b>Advanced Backtest</b>\nمن: {start_dt.strftime("%Y-%m-%d")}\nالاستراتيجية: {desc}')
+    start_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    
+    status_text = f'⏳ <b>Advanced Backtest</b>\nمن: {start_dt.strftime("%Y-%m-%d")}\nالاستراتيجية: {desc}'
+    msg_id = await send_tg_msg(status_text)
+
+    async def update_status(extra: str):
+        if msg_id: await edit_tg_msg(bot_state['chat_id'], msg_id, f'{status_text}\n\n{extra}')
+        else: await send_tg_msg(extra)
 
     trade_logs = []
     total_prof = peak_equity = max_dd = total_win = total_loss = 0.0
@@ -636,20 +643,41 @@ async def run_advanced_backtest(days: int = 7) -> None:
     try:
         for tf in bot_state['timeframes']:
             if not bot_state['active_tfs'][tf]: continue
+            
+            await update_status(f'🔄 <b>[{tf}]</b>: جاري جلب الشموع الأساسية للمحاكاة...')
             c_data = await fetch_oanda_candles('XAU_USD', tf, 5000)
-            if len(c_data) < 300: continue
+            if len(c_data) < 300: 
+                await update_status(f'⚠️ <b>[{tf}]</b>: تم التخطي (البيانات المتوفرة غير كافية)')
+                await asyncio.sleep(2)
+                continue
 
             df = calculate_indicators(pd.DataFrame(c_data).sort_values('time').reset_index(drop=True))
             safe_start = max(10, bot_state['cons_count'])
 
             tf_end    = datetime.now(timezone.utc)
-            total_min = int((tf_end - start_dt).total_seconds() / 60) + 72 * 60 + 60
-            m1_raw    = await fetch_oanda_candles('XAU_USD', '1m', min(total_min, 5000), tf_end)
-            if total_min > 5000 and m1_raw:
-                m1_extra = await fetch_oanda_candles('XAU_USD', '1m', 5000, m1_raw[0]['time'])
-                m1_raw   = m1_extra + m1_raw
+            total_min = int((tf_end - start_dt).total_seconds() / 60) + 72 * 60
+            
+            await update_status(f'📥 <b>[{tf}]</b>: جاري جلب شموع دقيقة (1m) لضمان دقة الأهداف (الكمية المطلوبة: {total_min})...')
+            m1_raw = []
+            current_end = tf_end
+            fetched = 0
+            while fetched < total_min:
+                chunk = min(total_min - fetched, 5000)
+                cndls = await fetch_oanda_candles('XAU_USD', '1m', chunk, current_end)
+                if not cndls: break
+                m1_raw = cndls + m1_raw
+                
+                new_end = cndls[0]['time']
+                if new_end >= current_end: break # Safety break
+                current_end = new_end
+                
+                fetched += len(cndls)
+                if len(cndls) < chunk: break
+                await asyncio.sleep(0.5)
+
             minute_candles = sorted(m1_raw, key=lambda x: x['time'])
 
+            await update_status(f'⚙️ <b>[{tf}]</b>: بدء فحص الإشارات ومحاكاة الصفقات (إجمالي الشموع المتاحة: {len(df)})...')
             for i in df[df['time'] >= start_dt].index:
                 if i < safe_start: continue
                 if i % 50 == 0: await asyncio.sleep(0)
@@ -680,8 +708,10 @@ async def run_advanced_backtest(days: int = 7) -> None:
                 trade_logs.append(_build_trade_row(tf, is_buy, label, next_c['time'], exit_t, act_ent, tp_p, sl_p, outcome, p_usd))
 
         if not trade_logs:
-            await send_tg_msg('⚠️ لم يتم العثور على صفقات.'); return
+            await update_status('⚠️ لم يتم العثور على صفقات خلال هذه الفترة.')
+            return
 
+        await update_status('✅ <b>اكتمل الفحص لجميع الفريمات!</b> جاري تحضير ملف الإكسل والتقرير النهائي...')
         total_trades = win_count + loss_count
         win_rate     = round(win_count / total_trades * 100, 1) if total_trades else 0
         pf           = round(total_win / abs(total_loss), 2) if total_loss else 999.0
@@ -704,7 +734,9 @@ async def run_advanced_backtest(days: int = 7) -> None:
         os.remove(xlsx_adv)
 
     except Exception as e:
-        await send_tg_msg(f'❌ خطأ: {e}')
+        err_msg = traceback.format_exc()
+        c_log(f'Advanced Backtest Error: {err_msg}')
+        await update_status(f'❌ <b>حدث خطأ غير متوقع أثناء الفحص:</b>\n<code>{e}</code>\nتم إلغاء العملية.')
     finally:
         bot_state['is_backtesting'] = False
 
@@ -760,7 +792,6 @@ async def timeframe_scanner(tf: str) -> None:
             df, now_utc = calculate_indicators(pd.DataFrame(raw)), datetime.now(timezone.utc)
             curr, prev, prev2  = df.iloc[-2], df.iloc[-3], df.iloc[-4]
             
-            # Dashboard string updates depending on Strategy
             if bot_state['strategy_mode'] == 'RSI_REV':
                 bot_state['market_data'][tf] = f"{df.iloc[-1]['close']:.2f} | RSI:{curr['rsi']:.1f}"
             else:
@@ -805,10 +836,17 @@ async def process_tg_update(update: dict) -> None:
         bot_state['chat_id'] = update['message']['chat']['id']
 
         if msg == '/start':
-            await send_tg_msg('🤖 <b>Gold Scalper Bot v5</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD | RSI-REVERSAL', get_main_keyboard())
+            await send_tg_msg('🤖 <b>Gold Scalper Bot v5.1</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD | RSI-REVERSAL', get_main_keyboard())
         elif msg.startswith('/backtest'):
-            try: asyncio.create_task(run_oanda_backtest(datetime.strptime(msg.split()[1], '%Y-%m-%d').replace(tzinfo=timezone.utc)))
-            except: await send_tg_msg('⚠️ الاستخدام: <code>/backtest YYYY-MM-DD</code>')
+            if bot_state['is_backtesting']:
+                await send_tg_msg('⚠️ <b>عذراً:</b> البوت يقوم بباك تيست حالياً. الرجاء الانتظار حتى ينتهي.')
+            else:
+                try: 
+                    start_dt = datetime.strptime(msg.split()[1], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                    bot_state['is_backtesting'] = True
+                    asyncio.create_task(run_oanda_backtest(start_dt))
+                except: 
+                    await send_tg_msg('⚠️ الاستخدام: <code>/backtest YYYY-MM-DD</code>')
         return
 
     if 'callback_query' not in update: return
@@ -868,7 +906,7 @@ async def process_tg_update(update: dict) -> None:
 
         # ── RSI Settings ───────────────────────────────────────────
         elif d.startswith('toggle_rsi_'):
-            level = d.split('_')[2] # 18, 25, 77, 83
+            level = d.split('_')[2]
             key = f'use_rsi_{level}'
             bot_state[key] = not bot_state[key]
             await edit_tg_msg(chat_id, msg_id, '📈 <b>إعدادات استراتيجية RSI:</b>', get_rsi_settings_keyboard())
@@ -899,11 +937,20 @@ async def process_tg_update(update: dict) -> None:
                 bot_state[t_key][tf] = bot_state[t_key][tf] + step if p[0] == 'inc' else max(5, bot_state[t_key][tf] - step)
                 await edit_tg_msg(chat_id, msg_id, f'✏️ <b>تعديل [{tf}]:</b>', get_tpsl_edit_keyboard(tf))
         
-        # ── Backtest Triggers ──────────────────────────────────────
+        # ── Backtest Triggers (LOCKED & PROTECTED) ─────────────────
         elif d.startswith('bto_adv_'):
-            asyncio.create_task(run_advanced_backtest(days=int(d.split('_')[2])))
+            if bot_state['is_backtesting']:
+                await answer_callback(q['id'], '⚠️ عذراً: البوت يقوم بباك تيست حالياً! الرجاء الانتظار.', show_alert=True)
+            else:
+                bot_state['is_backtesting'] = True
+                asyncio.create_task(run_advanced_backtest(days=int(d.split('_')[2])))
+                
         elif d.startswith('bto_'):
-            asyncio.create_task(run_oanda_backtest(datetime.now(timezone.utc) - timedelta(days=int(d.split('_')[1]))))
+            if bot_state['is_backtesting']:
+                await answer_callback(q['id'], '⚠️ عذراً: البوت يقوم بباك تيست حالياً! الرجاء الانتظار.', show_alert=True)
+            else:
+                bot_state['is_backtesting'] = True
+                asyncio.create_task(run_oanda_backtest(datetime.now(timezone.utc) - timedelta(days=int(d.split('_')[1]))))
         
         # ── Live Connection & Reports ──────────────────────────────
         elif d == 'toggle_live_conn':
@@ -977,7 +1024,7 @@ async def supervised(coro_fn, *args):
 
 _start_time = datetime.now(timezone.utc)
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.Response(text=f'Gold Scalper Bot v5 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
+    return web.Response(text=f'Gold Scalper Bot v5.1 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
 
 async def main() -> None:
     get_http()
