@@ -1,6 +1,6 @@
 """
-Gold Scalper Bot — v4 (Fully Fixed & Restored)
-Strategies : STOCH-NEW  |  STOCH-OLD
+Gold Scalper Bot — v5 (Added RSI Reversal Strategy)
+Strategies : STOCH-NEW  |  STOCH-OLD  |  RSI-REVERSAL
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from aiohttp import web
 # ─────────────────────────────────────────────────────────────
 METAAPI_TOKEN = 'eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9..NRMo-BO9ezZBEb4XmCQzkMsRN1iAz1rVSk7XWFP-ZGS_AZEyxSfIjnJ5w-r4egazV7tnxNLjjMuAdUb25T3ur3XWKCL4Jo9LFPy9tZzhIMRtlhq8d6YAHK9uxJclqJv5BZQFDeMeiFtyalLNjaE100Lp2zEnGWwlloxF-dpCw5DXvVKeGfMyVx4L2kisshcysDo7OeMkDBU1UB7leHi2eviEl7XQCpmhxdzT4BwMkf8YERx2jouKVu8-koVy00aon0drktGBSlQDOFw2WV0hg-VUfeCBR_Hgw2czqKVJ_lj_ZN3EsjWirirpiuXWbtwdD-VPokjKtX1z3ugcSTS1nd2iFIzauUHdOfb7Jl0R6cm8FosVS-4Iu046DiMsrxiAJ4PBywOXQhsFzZiePqmil1w5HHCxrw_78HNR9XcjBETMpHx9W48llIeUOkBVbsKfBP5iYtGSjS52i0QgpvHkfKrtXfbkMT0_9yJFG2kfZJHwJ5BJzWT4aKXto3l6iGe45xe4ZJhYhZX_RkC6dxR2w84M-uY-wlqiv_sxjHNOguSyOx4lfaeoq5H-LuJiWpHAYxEJUQWoQAQ7PObZOXCDWLRc_vP2gcbv1qYxTjD54FHnqhyf-oTGzAkWG5CVQFKpp9jTHQ3pXEYTSgIUTfHDbtoesAY1HG3nHcHbwujnqo0'
 ACCOUNT_ID    = '7d54fa6f-eaf7-4637-92a1-e0356ee729f8'
-TG_TOKEN      = '8779425898:AAG2tyWLIasXmvFlTWjf9tqWuHO08QHJvgk'
+TG_TOKEN      = '8779425898:AAGJFaArYBeUGP7WfL24U-keKmqHLeqRRvg'
 OANDA_API     = 'd05b25b3f1ce0c8fa105ffefa45efb01-a5c26f544a26a4f810f1809913a2795f'
 OANDA_URL     = 'https://api-fxpractice.oanda.com/v3'
 
@@ -56,14 +56,22 @@ bot_state: dict = {
     'last_update_id':    0,
     'tp_pips':           {'1m': 25, '2m': 30, '3m': 40, '5m': 70, '15m': 80},
     'sl_pips':           {'1m': 100, '2m': 100, '3m': 100, '5m': 100, '15m': 150},
-    'strategy_mode':     'STOCH_OLD',
+    'strategy_mode':     'STOCH_OLD', # STOCH_NEW | STOCH_OLD | RSI_REV
     'filter_mode':       'NO_MA',
+    # Stoch Params
     'stoch_k':           5,
     'stoch_smooth':      5,
     'stoch_d':           5,
     'use_stoch_deep':    True,
     'use_stoch_mid':     True,
     'use_stoch_shal':    False,
+    # RSI Params
+    'rsi_period':        14,
+    'use_rsi_18':        True,
+    'use_rsi_25':        False,
+    'use_rsi_77':        False,
+    'use_rsi_83':        True,
+    # General Filters
     'use_f_cons':        False,
     'cons_count':        3,
     'use_time_filter':   False,
@@ -90,31 +98,69 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
+    
+    # MAs
     df['ema15']  = _ema(df['close'], 15)
     df['ema50']  = _ema(df['close'], 50)
     df['ema150'] = _ema(df['close'], 150)
 
+    # Stochastic
     k_period = bot_state['stoch_k']
     smooth   = bot_state['stoch_smooth']
     d_period = bot_state['stoch_d']
-
     low_min  = df['low'].rolling(k_period).min()
     high_max = df['high'].rolling(k_period).max()
     denom    = (high_max - low_min).replace(0, 1e-10)
     df['K']  = (100.0 * (df['close'] - low_min) / denom).ewm(span=smooth, adjust=False).mean()
     df['D']  = df['K'].ewm(span=d_period, adjust=False).mean()
 
+    # RSI (14)
+    rsi_p = bot_state['rsi_period']
+    delta = df['close'].diff()
+    up    = delta.clip(lower=0)
+    down  = -1 * delta.clip(upper=0)
+    ema_up   = up.ewm(com=rsi_p - 1, adjust=False).mean()
+    ema_down = down.ewm(com=rsi_p - 1, adjust=False).mean()
+    rs = ema_up / ema_down
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # ATR
     tr = pd.concat([
         (df['high'] - df['low']).abs(),
         (df['high'] - df['close'].shift()).abs(),
         (df['low']  - df['close'].shift()).abs(),
     ], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean().bfill()
+    
     return df
 
 # ─────────────────────────────────────────────────────────────
 # SIGNAL GENERATION
 # ─────────────────────────────────────────────────────────────
+def get_rsi_signals(prev2_rsi: float, prev_rsi: float, curr_rsi: float) -> tuple:
+    """
+    RSI Reversal Logic (V-Shape & Inverted V-Shape)
+    Requires the RSI to reach the extreme and explicitly reverse.
+    """
+    buy_sig, sell_sig, b_label, s_label = False, False, "", ""
+
+    # Reversal Upwards (Buy) — Was going down to <= level, now going up
+    if prev2_rsi >= prev_rsi and curr_rsi > prev_rsi:
+        if bot_state['use_rsi_18'] and prev_rsi <= 18:
+            buy_sig, b_label = True, "RSI(18-REV)"
+        elif bot_state['use_rsi_25'] and prev_rsi <= 25:
+            buy_sig, b_label = True, "RSI(25-REV)"
+
+    # Reversal Downwards (Sell) — Was going up to >= level, now going down
+    if prev2_rsi <= prev_rsi and curr_rsi < prev_rsi:
+        if bot_state['use_rsi_83'] and prev_rsi >= 83:
+            sell_sig, s_label = True, "RSI(83-REV)"
+        elif bot_state['use_rsi_77'] and prev_rsi >= 77:
+            sell_sig, s_label = True, "RSI(77-REV)"
+
+    return buy_sig, sell_sig, b_label, s_label
+
+
 def get_stoch_signals(prev_k: float, prev_d: float, curr_k: float, curr_d: float) -> tuple:
     mode = bot_state['strategy_mode']
     if mode == 'STOCH_NEW':
@@ -176,13 +222,19 @@ def compute_trend_ok_live(df: pd.DataFrame, curr: pd.Series) -> tuple:
 def is_danger_time(dt_utc: datetime) -> bool:
     return 19 <= (dt_utc.hour + 3) % 24 <= 21
 
-def _get_signal_for_bar(df: pd.DataFrame, i: int, curr: pd.Series, prev: pd.Series) -> tuple:
+def _get_signal_for_bar(df: pd.DataFrame, i: int, curr: pd.Series, prev: pd.Series, prev2: pd.Series) -> tuple:
     trend_buy, trend_sell = compute_trend_ok(df, i, curr)
-    raw_buy, raw_sell, b_lbl, s_lbl = get_stoch_signals(prev['K'], prev['D'], curr['K'], curr['D'])
+    
+    if bot_state['strategy_mode'] == 'RSI_REV':
+        raw_buy, raw_sell, b_lbl, s_lbl = get_rsi_signals(prev2['rsi'], prev['rsi'], curr['rsi'])
+    else:
+        raw_buy, raw_sell, b_lbl, s_lbl = get_stoch_signals(prev['K'], prev['D'], curr['K'], curr['D'])
+        
     buy_sig  = raw_buy  and trend_buy
     sell_sig = raw_sell and trend_sell
     label    = b_lbl if buy_sig else s_lbl
-    return buy_sig, sell_sig, label
+    
+    return buy_sig, sell_sig, label, raw_buy, raw_sell, b_lbl, s_lbl
 
 # ─────────────────────────────────────────────────────────────
 # OANDA REST HELPER
@@ -275,7 +327,8 @@ async def send_tg_document(file_path: str, caption: str) -> None:
 # KEYBOARDS
 # ─────────────────────────────────────────────────────────────
 def _strat_label() -> str:
-    return {'STOCH_NEW': '📈 STOCH-NEW', 'STOCH_OLD': '📉 STOCH-OLD'}[bot_state['strategy_mode']]
+    labels = {'STOCH_NEW': '📈 STOCH-NEW', 'STOCH_OLD': '📉 STOCH-OLD', 'RSI_REV': '📊 RSI-REVERSAL'}
+    return labels[bot_state['strategy_mode']]
 
 def get_main_keyboard() -> dict:
     live = '🟢 متصل' if bot_state['live_connected'] else '🔴 غير متصل'
@@ -292,22 +345,18 @@ def get_main_keyboard() -> dict:
 def get_filters_keyboard() -> dict:
     fm = bot_state['filter_mode']
     fi = {k: '✅' if fm == k else '⬜' for k in ('FULL', 'SIMPLE', 'NO_MA')}
-    dp = '🟢' if bot_state['use_stoch_deep'] else '🔴'
-    md = '🟢' if bot_state['use_stoch_mid'] else '🔴'
-    sh = '🟢' if bot_state['use_stoch_shal'] else '🔴'
     ci = '🟢' if bot_state['use_f_cons'] else '🔴'
     t_i = '🟢' if bot_state['use_time_filter'] else '🔴'
     d_i = '🟢' if bot_state['use_danger_filter'] else '🔴'
-    k, s, d = bot_state['stoch_k'], bot_state['stoch_smooth'], bot_state['stoch_d']
     return {'inline_keyboard': [
-        [{'text': '━━ فلتر الترند (اختر واحداً) ━━', 'callback_data': 'noop'}],
+        [{'text': '━━ فلتر الترند (مطبق على كل الاستراتيجيات) ━━', 'callback_data': 'noop'}],
         [{'text': f"{fi['FULL']} FULL: ema15 + ema50 + ema150", 'callback_data': 'set_filter_full'}],
         [{'text': f"{fi['SIMPLE']} SIMPLE: ema50 + ema150", 'callback_data': 'set_filter_simple'}],
-        [{'text': f"{fi['NO_MA']} NO MA: ستوكاستيك فقط", 'callback_data': 'set_filter_noma'}],
-        [{'text': '━━ مستويات الستوكاستيك ━━', 'callback_data': 'noop'}],
-        [{'text': f'⚙️ Stoch({k}, {s}, {d})  — اضغط للضبط', 'callback_data': 'menu_stoch_settings'}],
-        [{'text': f'DEEP 10/90: {dp}', 'callback_data': 'toggle_stoch_deep'}, {'text': f'MID  15/85: {md}', 'callback_data': 'toggle_stoch_mid'}, {'text': f'SHAL 20/80: {sh}', 'callback_data': 'toggle_stoch_shal'}],
+        [{'text': f"{fi['NO_MA']} NO MA: بدون فلاتر ترند", 'callback_data': 'set_filter_noma'}],
         [{'text': f'ثبات الترند ({bot_state["cons_count"]} شموع): {ci}', 'callback_data': 'toggle_f_cons'}],
+        [{'text': '━━ إعدادات الاستراتيجيات والمؤشرات ━━', 'callback_data': 'noop'}],
+        [{'text': f'⚙️ Stoch({bot_state["stoch_k"]}, {bot_state["stoch_smooth"]}, {bot_state["stoch_d"]}) — المستويات', 'callback_data': 'menu_stoch_settings'}],
+        [{'text': f'📈 RSI({bot_state["rsi_period"]}) — المستويات والانعكاس', 'callback_data': 'menu_rsi_settings'}],
         [{'text': '━━ فلاتر الوقت ━━', 'callback_data': 'noop'}],
         [{'text': f'Time Filter 08-17 UTC: {t_i}', 'callback_data': 'toggle_time'}, {'text': f'حظر 19-22 دمشق: {d_i}', 'callback_data': 'toggle_danger'}],
         [{'text': '🔙 القائمة الرئيسية', 'callback_data': 'menu_main'}],
@@ -315,16 +364,41 @@ def get_filters_keyboard() -> dict:
 
 def get_stoch_settings_keyboard() -> dict:
     k, s, d = bot_state['stoch_k'], bot_state['stoch_smooth'], bot_state['stoch_d']
+    dp = '🟢' if bot_state['use_stoch_deep'] else '🔴'
+    md = '🟢' if bot_state['use_stoch_mid'] else '🔴'
+    sh = '🟢' if bot_state['use_stoch_shal'] else '🔴'
     return {'inline_keyboard': [
         [{'text': f'الإعداد الحالي: Stoch({k}, {s}, {d})', 'callback_data': 'noop'}],
-        [{'text': '📝 أرسل نصياً: /stoch K S D', 'callback_data': 'noop'}],
+        [{'text': '━━ مستويات الستوكاستيك ━━', 'callback_data': 'noop'}],
+        [{'text': f'DEEP 10/90: {dp}', 'callback_data': 'toggle_stoch_deep'}, {'text': f'MID  15/85: {md}', 'callback_data': 'toggle_stoch_mid'}, {'text': f'SHAL 20/80: {sh}', 'callback_data': 'toggle_stoch_shal'}],
         [{'text': '━━ K Period ━━', 'callback_data': 'noop'}],
         [{'text': '➖', 'callback_data': 'dec_stoch_k'}, {'text': f'K = {k}', 'callback_data': 'noop'}, {'text': '➕', 'callback_data': 'inc_stoch_k'}],
         [{'text': '━━ Smooth ━━', 'callback_data': 'noop'}],
         [{'text': '➖', 'callback_data': 'dec_stoch_s'}, {'text': f'S = {s}', 'callback_data': 'noop'}, {'text': '➕', 'callback_data': 'inc_stoch_s'}],
         [{'text': '━━ D Period ━━', 'callback_data': 'noop'}],
         [{'text': '➖', 'callback_data': 'dec_stoch_d'}, {'text': f'D = {d}', 'callback_data': 'noop'}, {'text': '➕', 'callback_data': 'inc_stoch_d'}],
-        [{'text': '5, 5, 5 (افتراضي)', 'callback_data': 'preset_5_5_5'}, {'text': '14, 3, 3', 'callback_data': 'preset_14_3_3'}, {'text': '10, 3, 3', 'callback_data': 'preset_10_3_3'}],
+        [{'text': '🔙 رجوع للفلاتر', 'callback_data': 'menu_filters'}],
+    ]}
+
+def get_rsi_settings_keyboard() -> dict:
+    r18 = '🟢' if bot_state['use_rsi_18'] else '🔴'
+    r25 = '🟢' if bot_state['use_rsi_25'] else '🔴'
+    r77 = '🟢' if bot_state['use_rsi_77'] else '🔴'
+    r83 = '🟢' if bot_state['use_rsi_83'] else '🔴'
+    p   = bot_state['rsi_period']
+    return {'inline_keyboard': [
+        [{'text': f'⚙️ إعدادات RSI — Period: {p}', 'callback_data': 'noop'}],
+        [{'text': 'المنطق: يلامس المستوى ثم ينعكس للجهة المعاكسة', 'callback_data': 'noop'}],
+        [{'text': '━━ مستويات الشراء (دعوم) ━━', 'callback_data': 'noop'}],
+        [
+            {'text': f'مستوى 18: {r18}', 'callback_data': 'toggle_rsi_18'},
+            {'text': f'مستوى 25: {r25}', 'callback_data': 'toggle_rsi_25'},
+        ],
+        [{'text': '━━ مستويات البيع (مقاومات) ━━', 'callback_data': 'noop'}],
+        [
+            {'text': f'مستوى 77: {r77}', 'callback_data': 'toggle_rsi_77'},
+            {'text': f'مستوى 83: {r83}', 'callback_data': 'toggle_rsi_83'},
+        ],
         [{'text': '🔙 رجوع للفلاتر', 'callback_data': 'menu_filters'}],
     ]}
 
@@ -482,14 +556,22 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
 
             for i in df[df['time'] >= start_dt].index:
                 if i < safe_start: continue
-                # تفريغ الذاكرة كل 50 شمعة
                 if i % 50 == 0: await asyncio.sleep(0)
 
-                curr, prev = df.loc[i], df.loc[i - 1]
+                curr, prev, prev2 = df.loc[i], df.loc[i - 1], df.loc[i - 2]
                 if bot_state['use_time_filter'] and not (8 <= curr['time'].hour <= 17): continue
                 if bot_state['use_danger_filter'] and is_danger_time(curr['time']): continue
 
-                buy_sig, sell_sig, label = _get_signal_for_bar(df, i, curr, prev)
+                buy_sig, sell_sig, label, raw_buy, raw_sell, b_lbl, s_lbl = _get_signal_for_bar(df, i, curr, prev, prev2)
+                
+                # Tracking blocked signals
+                ts = (curr['time'] + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M')
+                if not buy_sig and raw_buy:
+                    blocked_logs.append({'Timeframe': tf, 'Type': f'BUY BLOCKED ({b_lbl})', 'Entry Time': ts, 'Entry Price': curr['close'], 'Reason': f'REJECTED ({bot_state["filter_mode"]})'})
+                if not sell_sig and raw_sell:
+                    blocked_logs.append({'Timeframe': tf, 'Type': f'SELL BLOCKED ({s_lbl})', 'Entry Time': ts, 'Entry Price': curr['close'], 'Reason': f'REJECTED ({bot_state["filter_mode"]})'})
+
+
                 if not (buy_sig or sell_sig) or i + 1 >= len(df): continue
 
                 next_c = df.loc[i + 1]
@@ -516,13 +598,15 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
         total_trades = win_count + loss_count
         win_rate     = round(win_count / total_trades * 100, 1) if total_trades else 0
         summary = {
-            'البند': ['✅ الربح الكلي', '❌ الخسارة الكلية', '💰 المحصلة', '🎯 نسبة الفوز', '📉 أقصى DD', '🔄 بريك إيفن'],
-            'القيمة': [f'{win_count} | +${round(total_win, 2)}', f'{loss_count} | -${abs(round(total_loss, 2))}', f'${round(total_prof, 2)}', f'{win_rate}% ({total_trades} صفقة)', f'${round(max_dd, 2)}', str(be_count)],
+            'البند': ['✅ الربح الكلي', '❌ الخسارة الكلية', '💰 المحصلة', '🎯 نسبة الفوز', '📉 أقصى DD', '🔄 بريك إيفن', '📌 الاستراتيجية'],
+            'القيمة': [f'{win_count} | +${round(total_win, 2)}', f'{loss_count} | -${abs(round(total_loss, 2))}', f'${round(total_prof, 2)}', f'{win_rate}% ({total_trades} صفقة)', f'${round(max_dd, 2)}', str(be_count), desc],
         }
 
         with pd.ExcelWriter(fname, engine='openpyxl') as writer:
             pd.DataFrame(trade_logs).to_excel(writer, sheet_name='الصفقات', index=False)
             pd.DataFrame(summary).to_excel(writer, sheet_name='الملخص', index=False)
+            if blocked_logs:
+                pd.DataFrame(blocked_logs).to_excel(writer, sheet_name='المرفوضة', index=False)
             _style_sheet(writer.sheets['الصفقات'])
 
         await send_tg_document(fname, f'📊 <b>الباك تيست</b> | {desc}\n✅ +${round(total_win, 2)} | ❌ -${abs(round(total_loss, 2))}\n💰 ${round(total_prof, 2)} | 🎯 {win_rate}%')
@@ -570,11 +654,11 @@ async def run_advanced_backtest(days: int = 7) -> None:
                 if i < safe_start: continue
                 if i % 50 == 0: await asyncio.sleep(0)
 
-                curr, prev = df.loc[i], df.loc[i - 1]
+                curr, prev, prev2 = df.loc[i], df.loc[i - 1], df.loc[i - 2]
                 if bot_state['use_time_filter'] and not (8 <= curr['time'].hour <= 17): continue
                 if bot_state['use_danger_filter'] and is_danger_time(curr['time']): continue
 
-                buy_sig, sell_sig, label = _get_signal_for_bar(df, i, curr, prev)
+                buy_sig, sell_sig, label, *_ = _get_signal_for_bar(df, i, curr, prev, prev2)
                 if not (buy_sig or sell_sig) or i + 1 >= len(df): continue
 
                 next_c = df.loc[i + 1]
@@ -674,18 +758,20 @@ async def timeframe_scanner(tf: str) -> None:
             except Exception: await asyncio.sleep(15); continue
 
             df, now_utc = calculate_indicators(pd.DataFrame(raw)), datetime.now(timezone.utc)
-            curr, prev  = df.iloc[-2], df.iloc[-3]
-            bot_state['market_data'][tf] = f"{df.iloc[-1]['close']:.2f} | K:{curr['K']:.1f}  D:{curr['D']:.1f}"
+            curr, prev, prev2  = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+            
+            # Dashboard string updates depending on Strategy
+            if bot_state['strategy_mode'] == 'RSI_REV':
+                bot_state['market_data'][tf] = f"{df.iloc[-1]['close']:.2f} | RSI:{curr['rsi']:.1f}"
+            else:
+                bot_state['market_data'][tf] = f"{df.iloc[-1]['close']:.2f} | K:{curr['K']:.1f}  D:{curr['D']:.1f}"
 
             if (bot_state['use_danger_filter'] and is_danger_time(now_utc)) or (bot_state['use_time_filter'] and not (8 <= now_utc.hour <= 17)):
                 bot_state['market_data'][tf] = f"⏸ خمول | {df.iloc[-1]['close']:.2f}"; await asyncio.sleep(10); continue
 
             if bot_state['last_signal_time'][tf] == curr['time']: await asyncio.sleep(10); continue
 
-            trend_buy, trend_sell = compute_trend_ok_live(df, curr)
-            raw_buy, raw_sell, b_lbl, s_lbl = get_stoch_signals(prev['K'], prev['D'], curr['K'], curr['D'])
-            buy_sig, sell_sig = raw_buy and trend_buy, raw_sell and trend_sell
-            label = b_lbl if buy_sig else s_lbl
+            buy_sig, sell_sig, label, *_ = _get_signal_for_bar(df, df.index[-2], curr, prev, prev2)
 
             if bot_state['use_max_spread'] and (buy_sig or sell_sig):
                 try:
@@ -719,7 +805,7 @@ async def process_tg_update(update: dict) -> None:
         bot_state['chat_id'] = update['message']['chat']['id']
 
         if msg == '/start':
-            await send_tg_msg('🤖 <b>Gold Scalper Bot v4</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD', get_main_keyboard())
+            await send_tg_msg('🤖 <b>Gold Scalper Bot v5</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD | RSI-REVERSAL', get_main_keyboard())
         elif msg.startswith('/backtest'):
             try: asyncio.create_task(run_oanda_backtest(datetime.strptime(msg.split()[1], '%Y-%m-%d').replace(tzinfo=timezone.utc)))
             except: await send_tg_msg('⚠️ الاستخدام: <code>/backtest YYYY-MM-DD</code>')
@@ -735,6 +821,7 @@ async def process_tg_update(update: dict) -> None:
         elif d == 'menu_main': await edit_tg_msg(chat_id, msg_id, '🏠 القائمة الرئيسية:', get_main_keyboard())
         elif d == 'menu_filters': await edit_tg_msg(chat_id, msg_id, '🎛 <b>فلاتر وإعدادات التداول:</b>', get_filters_keyboard())
         elif d == 'menu_stoch_settings': await edit_tg_msg(chat_id, msg_id, '⚙️ <b>إعدادات الستوكاستيك:</b>', get_stoch_settings_keyboard())
+        elif d == 'menu_rsi_settings': await edit_tg_msg(chat_id, msg_id, '📈 <b>إعدادات استراتيجية RSI:</b>', get_rsi_settings_keyboard())
         elif d == 'menu_tfs': await edit_tg_msg(chat_id, msg_id, '⏱ إدارة الفريمات الزمنية:', get_tf_keyboard())
         elif d == 'menu_settings': await edit_tg_msg(chat_id, msg_id, '🛠 إعدادات المخاطرة:', get_settings_keyboard())
         elif d == 'menu_backtest': await edit_tg_msg(chat_id, msg_id, f'🔬 <b>باك تيست</b> — {_strat_label()}', get_backtest_keyboard())
@@ -743,10 +830,11 @@ async def process_tg_update(update: dict) -> None:
             bot_state['status'] = 'PAUSED' if bot_state['status'] == 'RUNNING' else 'RUNNING'
             await edit_tg_msg(chat_id, msg_id, '🏠 القائمة الرئيسية:', get_main_keyboard())
         elif d == 'cycle_strategy':
-            bot_state['strategy_mode'] = 'STOCH_OLD' if bot_state['strategy_mode'] == 'STOCH_NEW' else 'STOCH_NEW'
+            modes = ['STOCH_NEW', 'STOCH_OLD', 'RSI_REV']
+            bot_state['strategy_mode'] = modes[(modes.index(bot_state['strategy_mode']) + 1) % len(modes)]
             await edit_tg_msg(chat_id, msg_id, '🏠 القائمة الرئيسية:', get_main_keyboard())
 
-        # ── Time Filters (RESTORED) ────────────────────────────────
+        # ── Time Filters ───────────────────────────────────────────
         elif d == 'toggle_time':
             bot_state['use_time_filter'] = not bot_state['use_time_filter']
             await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
@@ -754,7 +842,7 @@ async def process_tg_update(update: dict) -> None:
             bot_state['use_danger_filter'] = not bot_state['use_danger_filter']
             await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
 
-        # ── Timeframe Toggles (RESTORED) ───────────────────────────
+        # ── Timeframe Toggles ──────────────────────────────────────
         elif d.startswith('toggle_tf_'):
             tf = d.split('_')[2]
             if tf in bot_state['active_tfs']:
@@ -765,43 +853,27 @@ async def process_tg_update(update: dict) -> None:
         elif d == 'set_filter_full': bot_state['filter_mode'] = 'FULL'; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
         elif d == 'set_filter_simple': bot_state['filter_mode'] = 'SIMPLE'; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
         elif d == 'set_filter_noma': bot_state['filter_mode'] = 'NO_MA'; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
-        elif d == 'toggle_stoch_deep': bot_state['use_stoch_deep'] = not bot_state['use_stoch_deep']; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
-        elif d == 'toggle_stoch_mid': bot_state['use_stoch_mid'] = not bot_state['use_stoch_mid']; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
-        elif d == 'toggle_stoch_shal': bot_state['use_stoch_shal'] = not bot_state['use_stoch_shal']; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
         
-        # ── Stochastic Settings (RESTORED) ─────────────────────────
-        elif d == 'toggle_f_cons':
-            bot_state['use_f_cons'] = not bot_state['use_f_cons']
-            await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
-        elif d == 'inc_stoch_k':
-            bot_state['stoch_k'] = min(bot_state['stoch_k'] + 1, 100)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'dec_stoch_k':
-            bot_state['stoch_k'] = max(bot_state['stoch_k'] - 1, 1)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'inc_stoch_s':
-            bot_state['stoch_smooth'] = min(bot_state['stoch_smooth'] + 1, 100)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'dec_stoch_s':
-            bot_state['stoch_smooth'] = max(bot_state['stoch_smooth'] - 1, 1)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'inc_stoch_d':
-            bot_state['stoch_d'] = min(bot_state['stoch_d'] + 1, 100)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'dec_stoch_d':
-            bot_state['stoch_d'] = max(bot_state['stoch_d'] - 1, 1)
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'preset_5_5_5':
-            bot_state['stoch_k'] = bot_state['stoch_smooth'] = bot_state['stoch_d'] = 5
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'preset_14_3_3':
-            bot_state['stoch_k'] = 14; bot_state['stoch_smooth'] = 3; bot_state['stoch_d'] = 3
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
-        elif d == 'preset_10_3_3':
-            bot_state['stoch_k'] = 10; bot_state['stoch_smooth'] = 3; bot_state['stoch_d'] = 3
-            await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        # ── Stochastic Settings ────────────────────────────────────
+        elif d == 'toggle_stoch_deep': bot_state['use_stoch_deep'] = not bot_state['use_stoch_deep']; await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'toggle_stoch_mid': bot_state['use_stoch_mid'] = not bot_state['use_stoch_mid']; await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'toggle_stoch_shal': bot_state['use_stoch_shal'] = not bot_state['use_stoch_shal']; await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'toggle_f_cons': bot_state['use_f_cons'] = not bot_state['use_f_cons']; await edit_tg_msg(chat_id, msg_id, '🎛 الفلاتر:', get_filters_keyboard())
+        elif d == 'inc_stoch_k': bot_state['stoch_k'] = min(bot_state['stoch_k'] + 1, 100); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'dec_stoch_k': bot_state['stoch_k'] = max(bot_state['stoch_k'] - 1, 1); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'inc_stoch_s': bot_state['stoch_smooth'] = min(bot_state['stoch_smooth'] + 1, 100); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'dec_stoch_s': bot_state['stoch_smooth'] = max(bot_state['stoch_smooth'] - 1, 1); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'inc_stoch_d': bot_state['stoch_d'] = min(bot_state['stoch_d'] + 1, 100); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
+        elif d == 'dec_stoch_d': bot_state['stoch_d'] = max(bot_state['stoch_d'] - 1, 1); await edit_tg_msg(chat_id, msg_id, '⚙️ إعدادات الستوكاستيك:', get_stoch_settings_keyboard())
 
-        # ── Risk Settings (RESTORED) ───────────────────────────────
+        # ── RSI Settings ───────────────────────────────────────────
+        elif d.startswith('toggle_rsi_'):
+            level = d.split('_')[2] # 18, 25, 77, 83
+            key = f'use_rsi_{level}'
+            bot_state[key] = not bot_state[key]
+            await edit_tg_msg(chat_id, msg_id, '📈 <b>إعدادات استراتيجية RSI:</b>', get_rsi_settings_keyboard())
+
+        # ── Risk Settings ──────────────────────────────────────────
         elif d == 'toggle_be':
             bot_state['use_be'] = not bot_state['use_be']
             await edit_tg_msg(chat_id, msg_id, '🛠 إعدادات المخاطرة:', get_settings_keyboard())
@@ -833,7 +905,7 @@ async def process_tg_update(update: dict) -> None:
         elif d.startswith('bto_'):
             asyncio.create_task(run_oanda_backtest(datetime.now(timezone.utc) - timedelta(days=int(d.split('_')[1]))))
         
-        # ── Live Connection & Reports (RESTORED) ───────────────────
+        # ── Live Connection & Reports ──────────────────────────────
         elif d == 'toggle_live_conn':
             if not bot_state['live_connected']:
                 await edit_tg_msg(chat_id, msg_id, '⏳ جاري الاتصال بالسيرفر...', get_main_keyboard())
@@ -905,7 +977,7 @@ async def supervised(coro_fn, *args):
 
 _start_time = datetime.now(timezone.utc)
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.Response(text=f'Gold Scalper Bot v4 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
+    return web.Response(text=f'Gold Scalper Bot v5 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
 
 async def main() -> None:
     get_http()
