@@ -1516,27 +1516,27 @@ async def process_tg_update(update: dict) -> None:
                     await edit_tg_msg(chat_id, msg_id, f'❌ خطأ في جلب البيانات:\n{e}', get_main_keyboard())
 
         # ── Backtest triggers ─────────────────────────────────────────
-            elif d.startswith('bto_adv_'):
-            days = int(d.split('_')[2])
-            asyncio.create_task(run_advanced_backtest(days=days))
+        elif d.startswith('bto_adv_'):
+        days = int(d.split('_')[2])
+        asyncio.create_task(run_advanced_backtest(days=days))
 
-            elif d.startswith('bto_'):
-            days  = int(d.split('_')[1])
-            start = datetime.now(timezone.utc) - timedelta(days=days)
-            asyncio.create_task(run_oanda_backtest(start))
+        elif d.startswith('bto_'):
+        days  = int(d.split('_')[1])
+        start = datetime.now(timezone.utc) - timedelta(days=days)
+        asyncio.create_task(run_oanda_backtest(start))
 
-            elif d == 'close_all':
-            if not (bot_state['live_connected'] and bot_state['connection_obj']):
-                await send_tg_msg('⚠️ غير متصل بالسيرفر.')
-            else:
-                try:
-                    positions = await bot_state['connection_obj'].get_positions()
-                    if not positions:
-                        await send_tg_msg('ℹ️ لا توجد صفقات مفتوحة حالياً.')
-                    else:
-                        for p in positions:
-                            await bot_state['connection_obj'].close_position(p['id'])
-                        await send_tg_msg(f'✅ تم إغلاق {len(positions)} صفقة.')
+        elif d == 'close_all':
+        if not (bot_state['live_connected'] and bot_state['connection_obj']):
+            await send_tg_msg('⚠️ غير متصل بالسيرفر.')
+        else:
+            try:
+                positions = await bot_state['connection_obj'].get_positions()
+                if not positions:
+                    await send_tg_msg('ℹ️ لا توجد صفقات مفتوحة حالياً.')
+                else:
+                    for p in positions:
+                        await bot_state['connection_obj'].close_position(p['id'])
+                    await send_tg_msg(f'✅ تم إغلاق {len(positions)} صفقة.')
                     except Exception as e:
                         await send_tg_msg(f'❌ خطأ في الإغلاق: {e}')
 
