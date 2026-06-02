@@ -1,5 +1,5 @@
 """
-Gold Scalper Bot — v5.4 (Ultimate Edition: Live Tracking + 3 Export Options)
+Gold Scalper Bot — v5.5 (Bugfix: File Upload Parse_Mode & Fail-Safe)
 Strategies : STOCH-NEW  |  STOCH-OLD  |  RSI-REVERSAL
 """
 
@@ -34,7 +34,6 @@ def make_progress_bar(pct: int, length: int = 12) -> str:
     return '█' * filled + '░' * (length - filled)
 
 async def upload_to_fileio(filepath: str) -> str:
-    """يرفع الملف إلى سحابة مؤقتة ويعيد رابط التحميل المباشر"""
     try:
         with open(filepath, 'rb') as f:
             data = aiohttp.FormData()
@@ -273,7 +272,7 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 50
     return []
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPERS
+# TELEGRAM HELPERS (BUGFIX APPLIED HERE)
 # ─────────────────────────────────────────────────────────────
 async def send_tg_msg(text: str, reply_markup: dict = None) -> int | None:
     if not bot_state['chat_id']: return None
@@ -315,7 +314,9 @@ async def send_tg_document(file_path: str, caption: str) -> bool:
             data = aiohttp.FormData()
             data.add_field('chat_id', str(bot_state['chat_id']))
             data.add_field('document', f, filename=os.path.basename(file_path))
-            data.add_field('caption', caption, parse_mode='HTML')
+            data.add_field('caption', caption)
+            # الحل الجذري للانهيار الصامت: تمرير التنسيق كحقل منفصل وليس كخيار مدمج
+            data.add_field('parse_mode', 'HTML')
             
             timeout = aiohttp.ClientTimeout(total=60)
             async with get_http().post(f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument', data=data, timeout=timeout) as resp:
@@ -537,6 +538,7 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
 
     async def update_status(extra: str):
         if msg_id: await edit_tg_msg(bot_state['chat_id'], msg_id, f'{status_text}\n\n{extra}')
+        else: await send_tg_msg(extra)
 
     trade_logs = []
     total_prof = peak_equity = max_dd = total_win = total_loss = 0.0
@@ -623,14 +625,13 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
             'القيمة': [f'{win_count} | +${round(total_win, 2)}', f'{loss_count} | -${abs(round(total_loss, 2))}', f'${round(total_prof, 2)}', f'{win_rate}% ({total_trades} صفقة)', f'${round(max_dd, 2)}', str(be_count), desc],
         }
 
-        # ── إعداد الخيارات ──
         df_exec = pd.DataFrame(trade_logs)
         
-        # 1. الخيار الأول (CSV)
+        # إنشاء الـ CSV
         csv_fname = fname.replace('.xlsx', '.csv')
         df_exec.to_csv(csv_fname, index=False)
 
-        # 2. الخيار الثاني (إكسل مضغوط ZIP)
+        # إنشاء الـ ZIP مع Excel
         zip_fname = fname.replace('.xlsx', '.zip')
         try:
             with pd.ExcelWriter(fname, engine='openpyxl') as writer:
@@ -644,7 +645,6 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
             await update_status(f'❌ فشل في بناء وتجهيز الملفات: {excel_err}')
             return
 
-        # 4. الخيار الرابع (سحابة File.io)
         await update_status('☁️ <b>جاري الرفع إلى السحابة لتوفير رابط مباشر...</b>')
         cloud_link = await upload_to_fileio(zip_fname)
 
@@ -652,13 +652,17 @@ async def run_oanda_backtest(start_dt: datetime) -> None:
         
         msg_text = f'📊 <b>الباك تيست</b> | {desc}\n✅ +${round(total_win, 2)} | ❌ -${abs(round(total_loss, 2))}\n💰 ${round(total_prof, 2)} | 🎯 {win_rate}%\n'
         if cloud_link:
-            msg_text += f'\n🔗 <b>رابط التحميل السحابي (يحذف تلقائياً بعد التنزيل):</b>\n{cloud_link}'
+            msg_text += f'\n🔗 <b>رابط التحميل السحابي (يحذف بعد أسبوع):</b>\n{cloud_link}'
 
-        # إرسال الملفات
-        await send_tg_document(csv_fname, f'📄 <b>[خيار 1] ملف CSV خفيف</b>\n{msg_text}')
-        await send_tg_document(zip_fname, f'🗜️ <b>[خيار 2] ملف Excel مضغوط</b>\n{msg_text}')
+        # خطة الطوارئ (Fail-Safe) - تأكد من الإرسال
+        s1 = await send_tg_document(csv_fname, f'📄 <b>[خيار 1] ملف CSV خفيف</b>\n{msg_text}')
+        s2 = await send_tg_document(zip_fname, f'🗜️ <b>[خيار 2] ملف Excel مضغوط</b>\n{msg_text}')
         
-        await update_status('🎉 <b>تم الانتهاء بنجاح! جرب الملفات وأخبرني أي خيار أثبت كفاءته أكثر.</b>')
+        if not s1 and not s2:
+            # إذا فشل إرسال الملفات، نرسل النتائج كرسالة نصية مع الرابط السحابي
+            await update_status(f'⚠️ <b>فشل رفع الملفات لتيليجرام!</b> (حجم كبير أو مشكلة اتصال)\nلكن لا تقلق، إليك التقرير والرابط:\n\n{msg_text}')
+        else:
+            await update_status('🎉 <b>تم الانتهاء بنجاح! جرب الملفات وأخبرني أي خيار أثبت كفاءته أكثر.</b>')
             
         for f in [fname, csv_fname, zip_fname]:
             if os.path.exists(f): os.remove(f)
@@ -683,6 +687,7 @@ async def run_advanced_backtest(days: int = 7) -> None:
 
     async def update_status(extra: str):
         if msg_id: await edit_tg_msg(bot_state['chat_id'], msg_id, f'{status_text}\n\n{extra}')
+        else: await send_tg_msg(extra)
 
     trade_logs = []
     total_prof = peak_equity = max_dd = total_win = total_loss = 0.0
@@ -766,14 +771,11 @@ async def run_advanced_backtest(days: int = 7) -> None:
         win_rate     = round(win_count / total_trades * 100, 1) if total_trades else 0
         pf           = round(total_win / abs(total_loss), 2) if total_loss else 999.0
 
-        # ── إعداد الخيارات ──
         df_exec = pd.DataFrame(trade_logs)
         
-        # 1. الخيار الأول (CSV)
         csv_fname = fname.replace('.xlsx', '.csv')
         df_exec.to_csv(csv_fname, index=False)
 
-        # 2. الخيار الثاني (إكسل مضغوط ZIP)
         zip_fname = fname.replace('.xlsx', '.zip')
         try:
             with pd.ExcelWriter(fname, engine='openpyxl') as writer:
@@ -786,7 +788,6 @@ async def run_advanced_backtest(days: int = 7) -> None:
             await update_status(f'❌ فشل في بناء الملفات: {excel_err}')
             return
 
-        # 4. الخيار الرابع (الرفع السحابي)
         await update_status('☁️ <b>جاري الرفع إلى السحابة لتوفير رابط مباشر...</b>')
         cloud_link = await upload_to_fileio(zip_fname)
 
@@ -799,13 +800,15 @@ async def run_advanced_backtest(days: int = 7) -> None:
             f'📉 Drawdown: ${round(max_dd, 2)}'
         )
         if cloud_link:
-            msg_text += f'\n\n🔗 <b>رابط التحميل السحابي (يحذف تلقائياً):</b>\n{cloud_link}'
+            msg_text += f'\n\n🔗 <b>رابط التحميل السحابي (يحذف بعد أسبوع):</b>\n{cloud_link}'
 
-        # إرسال الملفات
-        await send_tg_document(csv_fname, f'📄 <b>[خيار 1] ملف CSV خفيف</b>\n{msg_text}')
-        await send_tg_document(zip_fname, f'🗜️ <b>[خيار 2] ملف Excel مضغوط</b>\n{msg_text}')
+        s1 = await send_tg_document(csv_fname, f'📄 <b>[خيار 1] ملف CSV خفيف</b>\n{msg_text}')
+        s2 = await send_tg_document(zip_fname, f'🗜️ <b>[خيار 2] ملف Excel مضغوط</b>\n{msg_text}')
         
-        await update_status('🎉 <b>تم الانتهاء بنجاح! جرب الملفات لاختيار الأنسب.</b>')
+        if not s1 and not s2:
+            await update_status(f'⚠️ <b>فشل رفع الملفات لتيليجرام!</b> (حجم كبير أو مشكلة اتصال)\nلكن لا تقلق، إليك التقرير والرابط:\n\n{msg_text}')
+        else:
+            await update_status('🎉 <b>تم الانتهاء بنجاح! جرب الملفات لاختيار الأنسب.</b>')
             
         for f in [fname, csv_fname, zip_fname]:
             if os.path.exists(f): os.remove(f)
@@ -913,7 +916,7 @@ async def process_tg_update(update: dict) -> None:
         bot_state['chat_id'] = update['message']['chat']['id']
 
         if msg == '/start':
-            await send_tg_msg('🤖 <b>Gold Scalper Bot v5.4</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD | RSI-REVERSAL', get_main_keyboard())
+            await send_tg_msg('🤖 <b>Gold Scalper Bot v5.5</b>\nالاستراتيجيات المتاحة: STOCH-NEW | STOCH-OLD | RSI-REVERSAL', get_main_keyboard())
         elif msg.startswith('/backtest'):
             if bot_state['is_backtesting']:
                 await send_tg_msg('⚠️ <b>عذراً:</b> البوت يقوم بباك تيست حالياً. الرجاء الانتظار حتى ينتهي.')
@@ -1072,7 +1075,7 @@ async def supervised(coro_fn, *args):
 
 _start_time = datetime.now(timezone.utc)
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.Response(text=f'Gold Scalper Bot v5.4 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
+    return web.Response(text=f'Gold Scalper Bot v5.5 — OK\nUptime: {datetime.now(timezone.utc) - _start_time}', content_type='text/plain')
 
 async def main() -> None:
     get_http()
