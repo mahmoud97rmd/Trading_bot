@@ -850,38 +850,60 @@ async def run_gann_backtest(days: int) -> None:
             if mc: monitor_tfs_data[btf] = sorted(mc, key=lambda c: c['time'])
 
         await prog.set_phase('تشغيل المحاكاة...')
-        start_ts = start_dt.timestamp()
-        h1_in_range = [c for c in candles_h1 if c['time'].timestamp() >= start_ts]
+        start_ts  = start_dt.timestamp()
+        end_ts    = end_dt.timestamp()
+        # فلترة: نأخذ الشموع التي أُغلقت ضمن الفترة المطلوبة
+        # وقت الإغلاق = وقت الفتح + 1 ساعة
+        h1_in_range = [c for c in candles_h1
+                       if (c['time'].timestamp() + 3600) >= start_ts
+                       and c['time'].timestamp() + 3600 <= end_ts]
         total_h1 = len(h1_in_range)
         await prog.set_tf('H1', total_h1)
+
+        cycle_logs   = []   # لسجل الدورات في إكسل
+        tp_pts_def   = bot_state['gann_tp_points']
+        sl_pts_def   = bot_state['gann_sl_points']
+        cs           = bot_state['contract_size']
 
         for idx, h1 in enumerate(h1_in_range):
             if prog.cancelled: break
             if idx % 5 == 0: await asyncio.sleep(0)
 
             close    = float(h1['close'])
-            t_start  = h1['time']
+            # ← الإصلاح الأساسي: نبدأ المراقبة من وقت إغلاق H1 (وقت الفتح + 1 ساعة)
+            t_start  = h1['time'] + timedelta(hours=1)
             t_end    = t_start + timedelta(hours=cycle_h)
             levels   = gann_calc_levels(close)
-            active_lv = [l for l in levels if l['dir'] != 'ref' and (not (bot_state['gann_zone_filter'] == 'star') or l['star'])]
+            active_lv = [l for l in levels if l['dir'] != 'ref'
+                         and (bot_state['gann_zone_filter'] != 'star' or l['star'])]
 
-            level_status: dict[str, str] = {}
+            cycle_trades  = 0
+            cycle_min_dist = None  # أقرب مسافة من السعر لأي مستوى (لتشخيص عدم الوصول)
+
+            # level_status منفصل لكل فريم (مهم في وضع الكسر+ريتيست)
             level_used: set[str] = set()
+            tf_level_status: dict[str, dict] = {btf: {} for btf in monitor_tfs_data}
 
             for btf, candles_m in monitor_tfs_data.items():
                 m_window = [c for c in candles_m if t_start <= c['time'] < t_end]
-                if len(m_window) < 3: continue
+                if not m_window: continue
                 m_before = [c for c in candles_m if c['time'] < t_start]
                 atr_val  = _gann_atr(m_before, bot_state['gann_atr_period']) if tpsl_mode == 'atr' else None
+                tf_status = tf_level_status[btf]
 
                 for bar in m_window:
                     bar_close = float(bar['close'])
                     bar_time  = bar['time']
                     remaining_bars = [b for b in m_window if b['time'] > bar['time']]
 
+                    # تتبع أقرب مسافة من السعر لأي مستوى (للتشخيص)
+                    for lv in active_lv:
+                        d = abs(bar_close - lv['price'])
+                        if cycle_min_dist is None or d < cycle_min_dist:
+                            cycle_min_dist = d
+
                     for lv in active_lv:
                         k = lv['key']
-                        # نفس المستوى ونفس الفريم معاً → لا تكرار
                         combo_key = f'{k}_{btf}'
                         if combo_key in level_used: continue
 
@@ -889,10 +911,10 @@ async def run_gann_backtest(days: int) -> None:
                             if abs(bar_close - lv['price']) > margin: continue
                             is_buy = (lv['dir'] == 'dn')
                         else:
-                            cur_status = level_status.get(k)
+                            cur_status = tf_status.get(k)
                             if not cur_status:
-                                if lv['dir'] == 'up' and bar_close > lv['price']: level_status[k] = 'broken_up'
-                                elif lv['dir'] == 'dn' and bar_close < lv['price']: level_status[k] = 'broken_dn'
+                                if lv['dir'] == 'up' and bar_close > lv['price']: tf_status[k] = 'broken_up'
+                                elif lv['dir'] == 'dn' and bar_close < lv['price']: tf_status[k] = 'broken_dn'
                                 continue
                             if abs(bar_close - lv['price']) > margin: continue
                             is_buy = (cur_status == 'broken_up')
@@ -902,15 +924,14 @@ async def run_gann_backtest(days: int) -> None:
                             sl_d = atr_val * bot_state['gann_atr_sl_mult']
                             tp_d = atr_val * bot_state['gann_atr_tp_mult']
                         else:
-                            sl_d = bot_state['gann_sl_points'] * pv
-                            tp_d = bot_state['gann_tp_points'] * pv
-                        tp_px = entry + tp_d if is_buy else entry - tp_d
-                        sl_px = entry - sl_d if is_buy else entry + sl_d
+                            sl_d = sl_pts_def * pv
+                            tp_d = tp_pts_def * pv
+                        tp_px  = entry + tp_d if is_buy else entry - tp_d
+                        sl_px  = entry - sl_d if is_buy else entry + sl_d
                         tp_pts = round(tp_d / pv)
                         sl_pts = round(sl_d / pv)
 
                         outcome = 'OPEN'; p_usd = 0.0
-                        cs = bot_state['contract_size']
                         for fb in remaining_bars:
                             fh = float(fb['high']); fl = float(fb['low'])
                             if is_buy:
@@ -923,30 +944,52 @@ async def run_gann_backtest(days: int) -> None:
                         if outcome == 'OPEN': continue
 
                         level_used.add(combo_key)
+                        cycle_trades += 1
                         if outcome == 'WIN':  res['win']  += 1; res['total_win_usd']  += p_usd
                         else:                 res['loss'] += 1; res['total_loss_usd'] += abs(p_usd)
                         res['total_prof'] += p_usd
                         res['peak_equity'] = max(res['peak_equity'], res['total_prof'])
                         res['max_dd']      = max(res['max_dd'], res['peak_equity'] - res['total_prof'])
 
-                        direction = 'BUY' if is_buy else 'SELL'
+                        dam_bar = _utc_to_dam(bar_time)
                         res['trade_logs'].append({
-                            'Time (UTC)':  bar_time.strftime('%Y-%m-%d %H:%M'),
-                            'TF':          btf,
-                            'Direction':   direction,
-                            'Level':       lv['price'],
-                            'Star ⭐':     '⭐' if lv['star'] else '',
-                            'Entry':       entry,
-                            'TP':          round(tp_px, 2),
-                            'SL':          round(sl_px, 2),
-                            'TP (pts)':    tp_pts,
-                            'SL (pts)':    sl_pts,
-                            'Lot':         lot,
-                            'Outcome':     outcome,
-                            'Profit ($)':  p_usd,
-                            'Equity ($)':  round(res['total_prof'], 2),
+                            'وقت الصفقة (DAM)': dam_bar.strftime('%Y-%m-%d %H:%M'),
+                            'TF':           btf,
+                            'اتجاه':        'BUY 📈' if is_buy else 'SELL 📉',
+                            'المستوى':      lv['price'],
+                            'قوي ⭐':        '⭐' if lv['star'] else '',
+                            'الدخول':       entry,
+                            'TP':           round(tp_px, 2),
+                            'SL':           round(sl_px, 2),
+                            'TP (نقطة)':   tp_pts,
+                            'SL (نقطة)':   sl_pts,
+                            'Lot':          lot,
+                            'النتيجة':      '✅ WIN' if outcome == 'WIN' else '❌ LOSS',
+                            'ربح ($)':      p_usd,
+                            'رصيد ($)':     round(res['total_prof'], 2),
                         })
-                        break
+                        break  # صفقة واحدة لكل شمعة
+
+            # سجل الدورة
+            dam_cycle = _utc_to_dam(t_start)
+            lv_labels = ', '.join(f'{l["price"]:.2f}{"⭐" if l["star"] else ""}({("R" if l["dir"]=="up" else "S")})' for l in active_lv[:4])
+            if cycle_trades > 0:
+                reason = f'✅ {cycle_trades} صفقة'
+            elif not any(len([c for c in cm if t_start <= c['time'] < t_end]) > 0 for cm in monitor_tfs_data.values()):
+                reason = '⚠️ لا توجد بيانات للفريم في هذه الفترة'
+            elif cycle_min_dist is not None:
+                dist_pts = round(cycle_min_dist / pv)
+                reason = f'🔴 لم يصل السعر — أقرب مستوى كان {dist_pts} نقطة'
+            else:
+                reason = '🔴 لا توجد شموع مراقبة'
+            cycle_logs.append({
+                'وقت بدء الدورة (DAM)':    dam_cycle.strftime('%Y-%m-%d %H:%M'),
+                'وقت انتهاء الدورة (DAM)': _utc_to_dam(t_end).strftime('%Y-%m-%d %H:%M'),
+                'إغلاق H1':                close,
+                'أبرز المستويات':          lv_labels,
+                'عدد المستويات النشطة':   len(active_lv),
+                'الصفقات':                 reason,
+            })
 
             await prog.tick(idx + 1, res['win'], res['loss'], res['be'], res['total_prof'])
 
@@ -957,29 +1000,53 @@ async def run_gann_backtest(days: int) -> None:
         icon = 'PROFIT ▲' if res['total_prof'] >= 0 else 'LOSS ▼'
         tg_lines = [
             f'<b>باكتيست جان اكتمل ✅</b>', f'<b>{desc}</b>',
-            f'{start_dt.strftime("%Y-%m-%d")} → {end_dt.strftime("%Y-%m-%d")}\n',
+            f'{_utc_to_dam(start_dt).strftime("%Y-%m-%d")} → {_utc_to_dam(end_dt).strftime("%Y-%m-%d")}\n',
             f'Net: <b>{icon} ${round(res["total_prof"],2)}</b>',
             f'Win:  +${round(res["total_win_usd"],2)} ({res["win"]})',
             f'Loss: -${abs(round(res["total_loss_usd"],2))} ({res["loss"]})',
             f'WR: {wr}% ({total_trades} صفقة)',
-            f'Max DD: ${round(res["max_dd"],2)} ({dd_pct}%)\n',
-            f'TP/SL: {"ATR" if tpsl_mode=="atr" else "نقاط ثابتة"}  |  Lot: {lot}',
+            f'Max DD: ${round(res["max_dd"],2)} ({dd_pct}%)',
+            f'دورات H1: {len(cycle_logs)}  |  TP/SL: {"ATR" if tpsl_mode=="atr" else "نقاط ثابتة"} | Lot: {lot}  |  cs={cs}',
             '\nإرسال ملف Excel...',
         ]
         await prog.done('\n'.join(tg_lines))
 
-        # ── Excel export (one sheet, same _style_sheet as TEMA backtest) ──
-        if res['trade_logs']:
-            with pd.ExcelWriter(fname, engine='openpyxl') as writer:
-                df = pd.DataFrame(res['trade_logs'])
-                df.to_excel(writer, sheet_name='Gann Trades', index=False)
-                _style_sheet(writer.sheets['Gann Trades'])
-            caption = (f"GannBT {days}d | {start_dt.strftime('%Y-%m-%d')}→{end_dt.strftime('%Y-%m-%d')}"
-                       f" | Net: ${round(res['total_prof'],2)} | WR: {wr}% ({total_trades})")
-            await send_tg_document(fname, caption)
-            os.remove(fname)
-        else:
-            await send_tg_msg('⚠️ لا توجد صفقات في نتائج الباكتيست — جرّب تغيير الإعدادات أو زيادة الفترة.')
+        # ── Excel export: ورقة الصفقات + ورقة سجل الدورات ──
+        with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+            # ورقة 1: الصفقات
+            if res['trade_logs']:
+                df_trades = pd.DataFrame(res['trade_logs'])
+                df_trades.to_excel(writer, sheet_name='الصفقات', index=False)
+                _style_sheet(writer.sheets['الصفقات'])
+            else:
+                pd.DataFrame([{'ملاحظة': 'لا توجد صفقات — راجع سجل الدورات'}]).to_excel(writer, sheet_name='الصفقات', index=False)
+
+            # ورقة 2: سجل الدورات (توضيح سبب عدم الصفقات)
+            if cycle_logs:
+                df_cycles = pd.DataFrame(cycle_logs)
+                df_cycles.to_excel(writer, sheet_name='دورات H1', index=False)
+                ws_cyc = writer.sheets['دورات H1']
+                from openpyxl.styles import PatternFill, Font, Alignment
+                hf = PatternFill('solid', fgColor='2E4057'); hft = Font(bold=True, color='FFFFFF')
+                for cell in ws_cyc[1]: cell.fill = hf; cell.font = hft; cell.alignment = Alignment(horizontal='center')
+                green_f = PatternFill('solid', fgColor='C8E6C9'); red_f = PatternFill('solid', fgColor='FFE0E0'); warn_f = PatternFill('solid', fgColor='FFF9C4')
+                trade_col = None
+                for ci, cell in enumerate(ws_cyc[1], 1):
+                    if cell.value == 'الصفقات': trade_col = ci; break
+                for row in ws_cyc.iter_rows(min_row=2):
+                    if trade_col:
+                        v = str(row[trade_col-1].value or '')
+                        fill = green_f if '✅' in v else (warn_f if '⚠️' in v else red_f)
+                        for cell in row: cell.fill = fill
+                for col in ws_cyc.columns:
+                    mx = max((len(str(c.value)) if c.value else 0) for c in col)
+                    ws_cyc.column_dimensions[col[0].column_letter].width = min(mx + 4, 40)
+
+        caption = (f"GannBT {days}d | {_utc_to_dam(start_dt).strftime('%Y-%m-%d')}→{_utc_to_dam(end_dt).strftime('%Y-%m-%d')}"
+                   f" | Net: ${round(res['total_prof'],2)} | WR: {wr}% ({total_trades}T / {len(cycle_logs)}H1)")
+        await send_tg_document(fname, caption)
+        try: os.remove(fname)
+        except Exception: pass
 
     except Exception as e:
         await prog.done(f'❌ خطأ في باكتيست جان: {e}')
@@ -1577,7 +1644,6 @@ async def main() -> None:
     app.router.add_get('/api/backtest/status', api_backtest_status)
     app.router.add_get('/api/backtest/download', api_backtest_download)
     app.router.add_get('/api/report', api_market_report)
-    # app.router.add_post('/api/scanner/start', api_run_scanner)
     app.router.add_get('/ws/stream', ws_stream)
     
     runner = web.AppRunner(app); await runner.setup()
