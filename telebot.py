@@ -1605,25 +1605,46 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
 # ─────────────────────────────────────────────────────────────
 # TELEGRAM POLLING  +  WATCHDOG
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# TELEGRAM POLLING  +  WATCHDOG
+# ─────────────────────────────────────────────────────────────
 _poll_task: asyncio.Task | None = None
 
 async def telegram_polling_loop() -> None:
     c_log('Telegram polling started.'); url = f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates'
-    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, force_close=True); timeout = aiohttp.ClientTimeout(total=30, sock_read=22, connect=8); sess = aiohttp.ClientSession(connector=connector, timeout=timeout); backoff = 1
-    try:
-        while True:
-            try:
-                async with sess.get(url, params={'offset': bot_state['last_update_id'] + 1, 'timeout': 15}) as resp:
-                    if resp.status == 200:
-                        backoff = 1; bot_state['last_poll_ok'] = datetime.now(timezone.utc).timestamp(); data = await resp.json()
-                        for upd in data.get('result', []):
-                            bot_state['last_update_id'] = upd['update_id']; asyncio.create_task(_safe_process(upd))
-                    elif resp.status == 429: retry = int(resp.headers.get('Retry-After', 5)); c_log(f'Polling 429 — waiting {retry}s'); await asyncio.sleep(retry)
-                    else: c_log(f'Polling HTTP {resp.status}'); await asyncio.sleep(backoff); backoff = min(backoff * 2, 30)
-            except asyncio.CancelledError: raise
-            except Exception as e: c_log(f'Polling error: {e} — retry in {backoff}s'); await asyncio.sleep(backoff); backoff = min(backoff * 2, 30)
-    finally:
-        await sess.close(); c_log('Polling session closed.')
+    backoff = 1
+    while True:
+        connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, force_close=True)
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=28)
+        sess = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        try:
+            while True:
+                try:
+                    async with sess.get(url, params={'offset': bot_state['last_update_id'] + 1, 'timeout': 20}) as resp:
+                        if resp.status == 200:
+                            backoff = 1
+                            bot_state['last_poll_ok'] = datetime.now(timezone.utc).timestamp()
+                            data = await resp.json()
+                            for upd in data.get('result', []):
+                                bot_state['last_update_id'] = upd['update_id']
+                                asyncio.create_task(_safe_process(upd))
+                        elif resp.status == 429:
+                            retry = int(resp.headers.get('Retry-After', 5))
+                            c_log(f'Polling 429 — waiting {retry}s'); await asyncio.sleep(retry)
+                        else:
+                            c_log(f'Polling HTTP {resp.status}'); await asyncio.sleep(backoff); backoff = min(backoff * 2, 30)
+                except asyncio.CancelledError: raise
+                except (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError):
+                    # تجاهل بصمت أخطاء التايم أوت العادية وأكمل المحاولة
+                    await asyncio.sleep(0.5); continue
+                except Exception as e:
+                    # في حال انهيار الشبكة تماماً، اكسر الحلقة الداخلية لفتح جلسة جديدة
+                    c_log(f'Polling error: {e} — retry in {backoff}s')
+                    await asyncio.sleep(backoff); backoff = min(backoff * 2, 30); break
+        except asyncio.CancelledError: await sess.close(); raise
+        finally:
+            await sess.close()
+        await asyncio.sleep(1)
 
 async def _safe_process(upd: dict) -> None:
     try: await process_tg_update(upd)
@@ -1636,8 +1657,11 @@ async def telegram_watchdog() -> None:
         await asyncio.sleep(20)
         try:
             last = bot_state.get('last_poll_ok', 0.0); age = datetime.now(timezone.utc).timestamp() - last
-            if age > 60 and _poll_task is not None and not _poll_task.done(): c_log(f'Watchdog: polling silent {age:.0f}s — cancelling task for restart.'); _poll_task.cancel()
-            elif age > 60: c_log(f'Watchdog: polling silent {age:.0f}s — task already dead, supervised will restart.')
+            # تم تغيير الحساسية هنا من 60 إلى 180 ثانية لتناسب الهواتف
+            if age > 180 and _poll_task is not None and not _poll_task.done(): 
+                c_log(f'Watchdog: polling silent {age:.0f}s — cancelling task for restart.'); _poll_task.cancel()
+            elif age > 180: 
+                c_log(f'Watchdog: polling silent {age:.0f}s — task already dead, supervised will restart.')
         except Exception as e: c_log(f'Watchdog error: {e}')
 
 # ─────────────────────────────────────────────────────────────
