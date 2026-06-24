@@ -1,3 +1,4 @@
+
 """
 Gold Scalper Bot — v5.3 (Gann Levels Engine)
 Strategy : Gann H1 Support / Resistance — Touch & Breakout+Retest
@@ -139,8 +140,11 @@ bot_state: dict = {
                                '15m': True, '30m': False, '60m': False, '120m': False},
     'gann_touch_margin_pts':  5,       # tolerance (in points) to count as "touch"
     'gann_tpsl_mode':         'fixed', # 'fixed' | 'atr'
-    'gann_tp_points':         150,
+    'gann_tp_points':         180,
     'gann_sl_points':         100,
+    # TP/SL مخصص لكل فريم — يُستخدم إذا كانت القيمة > 0، وإلا يُرجع للقيمة العامة أعلاه
+    'gann_tp_per_tf': {'1m': 0,'3m': 0,'5m': 0,'10m': 0,'15m': 0,'30m': 0,'60m': 0,'120m': 0},
+    'gann_sl_per_tf': {'1m': 0,'3m': 0,'5m': 0,'10m': 0,'15m': 0,'30m': 0,'60m': 0,'120m': 0},
     'gann_atr_period':        14,
     'gann_atr_sl_mult':       1.5,
     'gann_atr_tp_mult':       2.5,
@@ -420,6 +424,16 @@ async def gann_cycle_manager() -> None:
 # ─────────────────────────────────────────────────────────────
 # GANN ENGINE — ATR helper + TP/SL + trade execution
 # ─────────────────────────────────────────────────────────────
+def _gann_tf_tp(tf: str) -> int:
+    """يرجع TP بالنقاط للفريم المحدد — القيمة الخاصة إذا ضُبطت، وإلا القيمة العامة."""
+    v = bot_state['gann_tp_per_tf'].get(tf, 0)
+    return v if v > 0 else bot_state['gann_tp_points']
+
+def _gann_tf_sl(tf: str) -> int:
+    """يرجع SL بالنقاط للفريم المحدد — القيمة الخاصة إذا ضُبطت، وإلا القيمة العامة."""
+    v = bot_state['gann_sl_per_tf'].get(tf, 0)
+    return v if v > 0 else bot_state['gann_sl_points']
+
 def _gann_atr(candles: list, period: int) -> float | None:
     if len(candles) < period + 1: return None
     df = pd.DataFrame(candles[-(period + 50):])
@@ -432,18 +446,18 @@ def _gann_atr(candles: list, period: int) -> float | None:
     val = tr.rolling(period).mean().iloc[-1]
     return float(val) if not pd.isna(val) else None
 
-def _gann_calc_tpsl(entry: float, is_buy: bool, candles: list) -> tuple[float, float]:
-    """يرجع (tp, sl) — إما نقاط ثابتة (gann_tp_points/gann_sl_points) أو مبنية على ATR."""
+def _gann_calc_tpsl(entry: float, is_buy: bool, candles: list, tf: str = '') -> tuple[float, float]:
+    """يرجع (tp, sl) — يستخدم القيم الخاصة بالفريم إذا وُجدت."""
     pv = bot_state['pip_value']
     if bot_state['gann_tpsl_mode'] == 'atr':
         atr = _gann_atr(candles, bot_state['gann_atr_period'])
-        if not atr:                                   # بيانات غير كافية بعد لـATR — رجوع مؤقت للنقاط الثابتة
-            atr = bot_state['gann_sl_points'] * pv
+        if not atr:
+            atr = _gann_tf_sl(tf) * pv
         sl_dist = atr * bot_state['gann_atr_sl_mult']
         tp_dist = atr * bot_state['gann_atr_tp_mult']
     else:
-        sl_dist = bot_state['gann_sl_points'] * pv
-        tp_dist = bot_state['gann_tp_points'] * pv
+        sl_dist = _gann_tf_sl(tf) * pv
+        tp_dist = _gann_tf_tp(tf) * pv
     if is_buy:
         return round(entry + tp_dist, 2), round(entry - sl_dist, 2)
     return round(entry - tp_dist, 2), round(entry + sl_dist, 2)
@@ -455,11 +469,12 @@ async def _gann_open_trade(is_buy: bool, level: dict, candles: list, reason: str
     except Exception:
         price = float(candles[-1]['close'])
 
-    tp, sl = _gann_calc_tpsl(price, is_buy, candles)
+    tp, sl = _gann_calc_tpsl(price, is_buy, candles, tf=tf)
     lot = bot_state['lot_size']; side = 'BUY' if is_buy else 'SELL'
+    tp_pts = _gann_tf_tp(tf); sl_pts = _gann_tf_sl(tf)
     tpsl_lbl = (f"ATR({bot_state['gann_atr_period']})×{bot_state['gann_atr_sl_mult']}/{bot_state['gann_atr_tp_mult']}"
                 if bot_state['gann_tpsl_mode'] == 'atr'
-                else f"{bot_state['gann_sl_points']}/{bot_state['gann_tp_points']} نقطة")
+                else f"SL:{sl_pts}p TP:{tp_pts}p")
     try:
         if is_buy: res = await bot_state['connection_obj'].create_market_buy_order(bot_state['symbol'], lot, stop_loss=sl, take_profit=tp)
         else:      res = await bot_state['connection_obj'].create_market_sell_order(bot_state['symbol'], lot, stop_loss=sl, take_profit=tp)
@@ -467,9 +482,10 @@ async def _gann_open_trade(is_buy: bool, level: dict, candles: list, reason: str
         bot_state['gann_open_trades'][trade_id]          = tf
         bot_state['gann_level_status'][level['key']]     = 'used'
         await send_tg_msg(
-            f"<b>✅ {side} [جان {tf}]</b>  {reason}\n"
+            f"<b>✅ {'BUY 📈' if is_buy else 'SELL 📉'} [جان {tf}]</b>  {reason}\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {price:.2f}\n"
-            f"TP: {tp}  SL: {sl}  ({tpsl_lbl})  Lot: {lot}"
+            f"TP: {tp} ({tp_pts}p)  SL: {sl} ({sl_pts}p)  Lot: {lot}\n"
+            f"إغلاق H1: {bot_state['gann_close_used']:.2f}"
         )
     except Exception as e:
         bot_state['gann_level_status'][level['key']] = 'used'
@@ -712,6 +728,34 @@ def get_risk_keyboard() -> dict:
         [{'text': '← Back', 'callback_data': 'menu_main'}],
     ]}
 
+def get_gann_tpsl_tf_keyboard(sel_tf: str = '') -> dict:
+    """قائمة تعديل TP/SL لكل فريم بشكل مستقل."""
+    rows = [[{'text': '⚙️ TP/SL مخصص لكل فريم', 'callback_data': 'noop'}],
+            [{'text': '(0 = يرجع للقيمة العامة)', 'callback_data': 'noop'}]]
+    tfs_list = list(bot_state['gann_monitor_tfs'].keys())
+    # صف اختيار الفريم
+    tf_row = []
+    for tfk in tfs_list:
+        icon = '👉' if tfk == sel_tf else ''
+        tf_row.append({'text': f'{icon}{tfk}', 'callback_data': f'gann_tptf_sel_{tfk}'})
+        if len(tf_row) == 4: rows.append(tf_row); tf_row = []
+    if tf_row: rows.append(tf_row)
+    if sel_tf:
+        tp_v = bot_state['gann_tp_per_tf'].get(sel_tf, 0)
+        sl_v = bot_state['gann_sl_per_tf'].get(sel_tf, 0)
+        eff_tp = tp_v if tp_v > 0 else bot_state['gann_tp_points']
+        eff_sl = sl_v if sl_v > 0 else bot_state['gann_sl_points']
+        rows += [
+            [{'text': f'── [{sel_tf}] ──', 'callback_data': 'noop'}],
+            [{'text': f'TP فعلي: {eff_tp}p {"(مخصص)" if tp_v>0 else "(عام)"}', 'callback_data': 'noop'}],
+            [{'text': 'TP −10', 'callback_data': f'gann_tptf_dtp_{sel_tf}'}, {'text': f'TP={tp_v}', 'callback_data': 'noop'}, {'text': 'TP +10', 'callback_data': f'gann_tptf_itp_{sel_tf}'}],
+            [{'text': f'SL فعلي: {eff_sl}p {"(مخصص)" if sl_v>0 else "(عام)"}', 'callback_data': 'noop'}],
+            [{'text': 'SL −10', 'callback_data': f'gann_tptf_dsl_{sel_tf}'}, {'text': f'SL={sl_v}', 'callback_data': 'noop'}, {'text': 'SL +10', 'callback_data': f'gann_tptf_isl_{sel_tf}'}],
+            [{'text': '↺ إعادة ضبط (رجوع للعام)', 'callback_data': f'gann_tptf_rst_{sel_tf}'}],
+        ]
+    rows.append([{'text': '← رجوع', 'callback_data': 'menu_gann'}])
+    return {'inline_keyboard': rows}
+
 def get_gann_keyboard() -> dict:
     zf   = bot_state['gann_zone_filter']
     em   = bot_state['gann_entry_mode']
@@ -762,6 +806,7 @@ def get_gann_keyboard() -> dict:
         ]
     rows += [
         [{'text': '📊 باكتيست جان', 'callback_data': 'menu_gann_bt'}],
+        [{'text': '⚙️ TP/SL مخصص لكل فريم', 'callback_data': 'gann_tpsl_tf'}],
         [{'text': '← رجوع', 'callback_data': 'menu_main'}],
     ]
     return {'inline_keyboard': rows}
@@ -860,9 +905,7 @@ async def run_gann_backtest(days: int) -> None:
         total_h1 = len(h1_in_range)
         await prog.set_tf('H1', total_h1)
 
-        cycle_logs   = []   # لسجل الدورات في إكسل
-        tp_pts_def   = bot_state['gann_tp_points']
-        sl_pts_def   = bot_state['gann_sl_points']
+        cycle_logs   = []
         cs           = bot_state['contract_size']
 
         for idx, h1 in enumerate(h1_in_range):
@@ -894,7 +937,8 @@ async def run_gann_backtest(days: int) -> None:
                 for bar in m_window:
                     bar_close = float(bar['close'])
                     bar_time  = bar['time']
-                    remaining_bars = [b for b in m_window if b['time'] > bar['time']]
+                    # ← الإصلاح: البحث عن TP/SL في كل الشموع اللاحقة — وليس فقط ضمن النافذة
+                    remaining_bars = [b for b in candles_m if b['time'] > bar_time]
 
                     # تتبع أقرب مسافة من السعر لأي مستوى (للتشخيص)
                     for lv in active_lv:
@@ -919,13 +963,15 @@ async def run_gann_backtest(days: int) -> None:
                             if abs(bar_close - lv['price']) > margin: continue
                             is_buy = (cur_status == 'broken_up')
 
-                        entry = lv['price']
+                        entry  = lv['price']
+                        tf_tp  = _gann_tf_tp(btf)
+                        tf_sl  = _gann_tf_sl(btf)
                         if tpsl_mode == 'atr' and atr_val:
                             sl_d = atr_val * bot_state['gann_atr_sl_mult']
                             tp_d = atr_val * bot_state['gann_atr_tp_mult']
                         else:
-                            sl_d = sl_pts_def * pv
-                            tp_d = tp_pts_def * pv
+                            sl_d = tf_sl * pv
+                            tp_d = tf_tp * pv
                         tp_px  = entry + tp_d if is_buy else entry - tp_d
                         sl_px  = entry - sl_d if is_buy else entry + sl_d
                         tp_pts = round(tp_d / pv)
@@ -941,7 +987,7 @@ async def run_gann_backtest(days: int) -> None:
                                 if fl <= tp_px: outcome = 'WIN';  p_usd =  round(tp_d * lot * cs, 2); break
                                 if fh >= sl_px: outcome = 'LOSS'; p_usd = -round(sl_d * lot * cs, 2); break
 
-                        if outcome == 'OPEN': continue
+                        if outcome == 'OPEN': continue   # لا بيانات لاحقة كافية — نتجاوز
 
                         level_used.add(combo_key)
                         cycle_trades += 1
@@ -954,21 +1000,22 @@ async def run_gann_backtest(days: int) -> None:
                         dam_bar = _utc_to_dam(bar_time)
                         res['trade_logs'].append({
                             'وقت الصفقة (DAM)': dam_bar.strftime('%Y-%m-%d %H:%M'),
-                            'TF':           btf,
-                            'اتجاه':        'BUY 📈' if is_buy else 'SELL 📉',
-                            'المستوى':      lv['price'],
-                            'قوي ⭐':        '⭐' if lv['star'] else '',
-                            'الدخول':       entry,
-                            'TP':           round(tp_px, 2),
-                            'SL':           round(sl_px, 2),
-                            'TP (نقطة)':   tp_pts,
-                            'SL (نقطة)':   sl_pts,
-                            'Lot':          lot,
-                            'النتيجة':      '✅ WIN' if outcome == 'WIN' else '❌ LOSS',
-                            'ربح ($)':      p_usd,
-                            'رصيد ($)':     round(res['total_prof'], 2),
+                            'TF':               btf,
+                            'اتجاه':            'BUY 📈' if is_buy else 'SELL 📉',
+                            'إغلاق H1 (المحور)': close,
+                            'المستوى':          lv['price'],
+                            'قوي ⭐':            '⭐' if lv['star'] else '',
+                            'الدخول':           entry,
+                            'TP':               round(tp_px, 2),
+                            'SL':               round(sl_px, 2),
+                            'TP (نقطة)':        tp_pts,
+                            'SL (نقطة)':        sl_pts,
+                            'Lot':              lot,
+                            'النتيجة':          '✅ WIN' if outcome == 'WIN' else '❌ LOSS',
+                            'ربح ($)':          p_usd,
+                            'رصيد ($)':         round(res['total_prof'], 2),
                         })
-                        break  # صفقة واحدة لكل شمعة
+                        break  # صفقة واحدة لكل شمعة لمس
 
             # سجل الدورة
             dam_cycle = _utc_to_dam(t_start)
@@ -1292,8 +1339,33 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         bot_state['gann_entry_mode'] = 'breakout_retest' if bot_state['gann_entry_mode'] == 'touch' else 'touch'
         bot_state['gann_level_status'] = {}   # إعادة ضبط حالات الكسر عند تغيير الوضع
         await _show(chat_id, msg_id, '📐 محرك جان — الإعدادات:', get_gann_keyboard())
-    elif d == 'gann_toggle_tf':
-        pass  # replaced by per-TF buttons below
+    elif d == 'gann_tpsl_tf':
+        await _show(chat_id, msg_id, '⚙️ TP/SL مخصص لكل فريم — اختر الفريم:', get_gann_tpsl_tf_keyboard())
+    elif d.startswith('gann_tptf_sel_'):
+        sel_tf = d[len('gann_tptf_sel_'):]
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{sel_tf}]:', get_gann_tpsl_tf_keyboard(sel_tf))
+    elif d.startswith('gann_tptf_itp_'):
+        tf = d[len('gann_tptf_itp_'):]
+        bot_state['gann_tp_per_tf'][tf] = bot_state['gann_tp_per_tf'].get(tf, 0) + 10
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{tf}]:', get_gann_tpsl_tf_keyboard(tf))
+    elif d.startswith('gann_tptf_dtp_'):
+        tf = d[len('gann_tptf_dtp_'):]
+        bot_state['gann_tp_per_tf'][tf] = max(0, bot_state['gann_tp_per_tf'].get(tf, 0) - 10)
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{tf}]:', get_gann_tpsl_tf_keyboard(tf))
+    elif d.startswith('gann_tptf_isl_'):
+        tf = d[len('gann_tptf_isl_'):]
+        bot_state['gann_sl_per_tf'][tf] = bot_state['gann_sl_per_tf'].get(tf, 0) + 10
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{tf}]:', get_gann_tpsl_tf_keyboard(tf))
+    elif d.startswith('gann_tptf_dsl_'):
+        tf = d[len('gann_tptf_dsl_'):]
+        bot_state['gann_sl_per_tf'][tf] = max(0, bot_state['gann_sl_per_tf'].get(tf, 0) - 10)
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{tf}]:', get_gann_tpsl_tf_keyboard(tf))
+    elif d.startswith('gann_tptf_rst_'):
+        tf = d[len('gann_tptf_rst_'):]
+        bot_state['gann_tp_per_tf'][tf] = 0; bot_state['gann_sl_per_tf'][tf] = 0
+        await _show(chat_id, msg_id, f'⚙️ TP/SL [{tf}] — تمت إعادة الضبط للقيمة العامة:', get_gann_tpsl_tf_keyboard(tf))
+
+
     elif d.startswith('gann_tf_'):
         tfk = d[len('gann_tf_'):]
         if tfk in bot_state['gann_monitor_tfs']:
