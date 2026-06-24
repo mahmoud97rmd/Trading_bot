@@ -1,4 +1,4 @@
-# Gold Scalper Bot — v6.0 (Universal Gann Engine - Multi-Market)
+# Gold Scalper Bot — v5.5 (Gann Levels Engine - Clean Excel & Precise Stats)
 import asyncio
 import aiohttp
 import os
@@ -23,6 +23,7 @@ OANDA_SYMBOL   = 'XAU_USD'
 OANDA_BASE_URL = 'https://api-fxpractice.oanda.com/v3'  
 
 _TFS = ['1m', '2m', '3m', '4m', '5m', '6m', '10m', '12m', '15m', '20m', '30m', '1h']
+DD_LIMIT_PCT = 0.03
 
 # ─────────────────────────────────────────────────────────────
 # GLOBAL HTTP SESSION
@@ -47,6 +48,7 @@ def c_log(msg: str) -> None:
 bot_state: dict = {
     'status':           'RUNNING',
     'symbol':           'XAUUSDm',
+    'live_connected':   False,
     'chat_id':          None,
     'last_update_id':   0,
     'is_backtesting':   False,
@@ -65,6 +67,10 @@ bot_state: dict = {
     'be_pips':           20,
 
     'lot_size':         0.05,
+    'pip_value':        0.1,
+    'spread_pips':      2.2,
+    'use_max_spread':   True,
+    'max_spread_pips':  3.0,
     'tp_pips': {tf: 180 for tf in _TFS},
     'sl_pips': {tf: 100 for tf in _TFS},
 
@@ -75,7 +81,7 @@ bot_state: dict = {
 bot_state['sl_pips']['1m'] = 50
 
 # ─────────────────────────────────────────────────────────────
-# TIME UTILS 
+# TIME UTILS (FIXED FOR PANDAS 3.0)
 # ─────────────────────────────────────────────────────────────
 _BLOCKED_DAMASCUS_HOURS = {13, 18, 21, 22}
 
@@ -83,11 +89,13 @@ def is_blocked_time(dt_utc: datetime) -> bool:
     return (dt_utc.hour + 3) % 24 in _BLOCKED_DAMASCUS_HOURS
 
 def _to_utc(x) -> pd.Timestamp:
-    if isinstance(x, pd.Timestamp): return x.tz_convert('UTC') if x.tzinfo else x.tz_localize('UTC')
+    if isinstance(x, pd.Timestamp):
+        return x.tz_convert('UTC') if x.tzinfo else x.tz_localize('UTC')
     if isinstance(x, datetime):
         if x.tzinfo: return pd.Timestamp(x).tz_convert('UTC')
         return pd.Timestamp(x).tz_localize('UTC')
-    if isinstance(x, (int, float)): return pd.Timestamp(int(x), unit='s').tz_localize('UTC')
+    if isinstance(x, (int, float)):
+        return pd.Timestamp(int(x), unit='s').tz_localize('UTC')
     ts = pd.Timestamp(str(x))
     return ts.tz_convert('UTC') if ts.tzinfo else ts.tz_localize('UTC')
 
@@ -155,40 +163,26 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
     return collected
 
 # ─────────────────────────────────────────────────────────────
-# UNIVERSAL GANN MATH (OTC APP ENGINE)
+# GANN MATH
 # ─────────────────────────────────────────────────────────────
-def get_gann_factor(price: float) -> float:
-    if price < 10: return 100000.0     # Forex e.g. 1.08500 -> 108500
-    if price < 100: return 1000.0      # Indices/Metals e.g. 25.50 -> 25500
-    if price < 1000: return 100.0      # JPY pairs e.g. 150.50 -> 15050
-    if price < 10000: return 10.0      # Gold e.g. 2300.5 -> 23005
-    if price < 100000: return 1.0      # BTC e.g. 65000 -> 65000
-    return 0.1
-
-def calculate_gann_levels_from_close(price: float, is_buy: bool) -> list:
-    f = get_gann_factor(price)
-    P = price * f
+def calculate_gann_levels_from_close(close_price: float, is_buy: bool) -> list:
+    P = close_price
     try:
         sqrt_P = np.sqrt(P)
-        levels = []
-        for i in range(1, 17):  # 16 Levels (45° increments for 2 cycles)
-            ratio = i * 0.125
-            lvl = ((sqrt_P + ratio) ** 2) / f if is_buy else ((sqrt_P - ratio) ** 2) / f
-            levels.append(round(lvl, 5))
-        return levels
+        if is_buy: levels = [(sqrt_P + (i * 0.125)) ** 2 for i in range(1, 17)]
+        else:      levels = [(sqrt_P - (i * 0.125)) ** 2 for i in range(1, 17)]
+        return [round(lvl, 2) for lvl in levels]
     except Exception: return []
 
-def determine_strong_gann_levels(price: float, is_buy: bool) -> list:
-    f = get_gann_factor(price)
-    P = price * f
+def determine_strong_gann_levels(levels: list, close_price: float, is_buy: bool) -> list:
+    P = close_price; strong = []
     try:
         sqrt_P = np.sqrt(P)
-        # الزوايا القوية: 90, 180, 270, 360, 450, 540, 630, 720
-        strong_ratios = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-        strong = []
-        for ratio in strong_ratios:
-            lvl = ((sqrt_P + ratio) ** 2) / f if is_buy else ((sqrt_P - ratio) ** 2) / f
-            strong.append(round(lvl, 5))
+        degrees = [45, 90, 180, 270, 360]
+        for deg in degrees:
+            i = deg / 45.0
+            if is_buy: strong.append(round((sqrt_P + (i * 0.125)) ** 2, 2))
+            else:      strong.append(round((sqrt_P - (i * 0.125)) ** 2, 2))
         return sorted(list(set(strong)))
     except Exception: return []
 
@@ -384,14 +378,14 @@ def get_backtest_keyboard() -> dict:
     ]}
 
 # ─────────────────────────────────────────────────────────────
-# COLORED BACKTEST ENGINE (V6.0 UNIVERSAL MARKET & CLEAN EXCEL)
+# COLORED BACKTEST ENGINE (V5.5 CLEAN REPORT & STATS)
 # ─────────────────────────────────────────────────────────────
 async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
     bot_state['is_backtesting'] = True
     
     enabled_tfs = [tf for tf, on in bot_state['active_tfs'].items() if on] or ['1m']
-    desc = f"جان H1 → [{'+'.join(enabled_tfs)}] | {bot_state['gann_entry_mode']} | {'⭐' if bot_state['gann_zone_filter']=='star' else 'الكل'}"
+    desc = f"جان H1 → [{'+'.join(enabled_tfs)}] | AntiSpam:{'On' if bot_state['gann_anti_spam'] else 'Off'}"
     prog = BtProgress(label=desc, active_tfs=['H1']); _bt_progress = prog
     await prog.start(bot_state['chat_id'])
 
@@ -418,12 +412,6 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         if df_h1.empty:
             await prog.done('❌ لا يوجد بيانات كافية لفريم H1 ضمن التاريخ المحدد.')
             bot_state['is_backtesting'] = False; return
-
-        # ── الاكتشاف التلقائي لقيمة النقطة (Universal Pip Value) ──
-        sample_price = df_h1['close'].iloc[0]
-        if sample_price < 10: pv = 0.0001
-        elif sample_price < 1000: pv = 0.01
-        else: pv = 0.1
             
         df_h1['EMA_200'] = df_h1['close'].ewm(span=200, adjust=False).mean()
         df_h1['EMA_50']  = df_h1['close'].ewm(span=50, adjust=False).mean()
@@ -442,7 +430,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         cycle_starts = df_h1[(df_h1.index >= start_ts) & (df_h1.index < end_ts)].index
         await prog.set_tf('H1 Cycles', len(cycle_starts))
         
-        lot = bot_state['lot_size']; margin_pts = bot_state['gann_touch_margin_pts']
+        pv = bot_state['pip_value']; lot = bot_state['lot_size']; margin_pts = bot_state['gann_touch_margin_pts']
         res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'peak_equity': 0.0, 'max_dd': 0.0, 'win_usd': 0.0, 'loss_usd': 0.0}
 
         for cycle_n, cycle_start in enumerate(cycle_starts):
@@ -471,12 +459,8 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
             cycle_end = c_start_ts + timedelta(hours=1)
             h1_close = df_h1.loc[c_start_ts, 'close']
             
-            if bot_state['gann_zone_filter'] == 'star':
-                buy_list  = determine_strong_gann_levels(h1_close, True)
-                sell_list = determine_strong_gann_levels(h1_close, False)
-            else:
-                buy_list  = calculate_gann_levels_from_close(h1_close, True)
-                sell_list = calculate_gann_levels_from_close(h1_close, False)
+            buy_strong  = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, True), h1_close, True)
+            sell_strong = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, False), h1_close, False)
 
             df_cycle = df_1m[(df_1m.index > c_start_ts) & (df_1m.index <= cycle_end)]
             if df_cycle.empty: continue
@@ -490,12 +474,12 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                     h = float(df_tf.iloc[tf_idx]['high']); l = float(df_tf.iloc[tf_idx]['low'])
                     
                     signals = []
-                    for lvl in buy_list:
+                    for lvl in buy_strong:
                         combo_key = f"{lvl}_{tf}"
                         if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
                         if l <= lvl + (margin_pts * pv) and h >= lvl: signals.append({'type': 'BUY', 'lvl': lvl, 'combo': combo_key})
 
-                    for lvl in sell_list:
+                    for lvl in sell_strong:
                         combo_key = f"{lvl}_{tf}"
                         if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
                         if h >= lvl - (margin_pts * pv) and l <= lvl: signals.append({'type': 'SELL', 'lvl': lvl, 'combo': combo_key})
@@ -510,19 +494,15 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         entry_px = sig['lvl']
                         tp_pts_user = bot_state['tp_pips'].get(tf, 180)
                         sl_pts_user = bot_state['sl_pips'].get(tf, 100)
+                        tp_d = tp_pts_user * pv; sl_d = sl_pts_user * pv
                         
-                        tp_px = entry_px + (tp_pts_user * pv) if is_buy else entry_px - (tp_pts_user * pv)
-                        sl_px = entry_px - (sl_pts_user * pv) if is_buy else entry_px + (sl_pts_user * pv)
+                        tp_px = entry_px + tp_d if is_buy else entry_px - tp_d
+                        sl_px = entry_px - sl_d if is_buy else entry_px + sl_d
                         be_px_target = entry_px + (bot_state['be_pips'] * pv) if is_buy else entry_px - (bot_state['be_pips'] * pv)
 
                         sim_df = df_1m[df_1m.index >= bar_t]
-                        outcome = 'OPEN'; be_activated = False
+                        outcome = 'OPEN'; p_usd = 0.0; be_activated = False
                         
-                        # حساب الأرباح بمعادلة دولية قياسية (الربح بالدولار للوت 1.0 = 10$ لكل نقطة)
-                        win_val  = round(tp_pts_user * lot * 10, 2)
-                        loss_val = -round(sl_pts_user * lot * 10, 2)
-                        p_usd = 0.0
-
                         for _, row in sim_df.iterrows():
                             fh = float(row['high']); fl = float(row['low'])
                             if bot_state['use_be'] and not be_activated:
@@ -530,11 +510,11 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                                     be_activated = True; sl_px = entry_px 
                             
                             if is_buy:
-                                if fl <= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else loss_val; break
-                                if fh >= tp_px: outcome = 'WIN';  p_usd = win_val; break
+                                if fl <= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
+                                if fh >= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
                             else:
-                                if fh >= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else loss_val; break
-                                if fl <= tp_px: outcome = 'WIN';  p_usd = win_val; break
+                                if fh >= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
+                                if fl <= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
 
                         if outcome == 'OPEN': continue
                         
@@ -553,13 +533,14 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         trade_logs.append({
                             'cycle_ts': c_start_ts.timestamp(),
                             'دورة H1 (DAM)': cycle_dam_str,
-                            'إغلاق H1': round(h1_close, 5),
+                            'إغلاق H1': h1_close,
                             'وقت الصفقة (DAM)': _utc_to_dam(bar_t).strftime('%Y-%m-%d %H:%M'),
                             'TF': tf,
                             'اتجاه': 'BUY 📈' if is_buy else 'SELL 📉',
-                            'المستوى (الدخول)': round(entry_px, 5),
-                            'الهدف (TP)': round(tp_px, 5),
-                            'الوقف (SL)': round(sl_px, 5),
+                            'المستوى (الدخول)': entry_px,
+                            'قوي ⭐': '⭐',
+                            'الهدف (TP)': tp_px,
+                            'الوقف (SL)': sl_px,
                             'النتيجة': outcome,
                             'ربح ($)': p_usd,
                             'رصيد تراكمي ($)': round(res['total_prof'], 2)
@@ -572,10 +553,10 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
             })
             await prog.tick(cycle_n + 1, res['win'], res['loss'], res['be'], res['total_prof'])
 
-        await prog.set_phase('إنشاء ملف Excel المنسق...')
+        await prog.set_phase('إنشاء ملف Excel...')
         fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx"
         
-        # ── بناء ملف الإكسل باحترافية والتلوين المطلوب للربح والخسارة ──
+        # ── بناء ملف الإكسل باحترافية وتلوين حسب النتيجة ──
         wb = openpyxl.Workbook()
         ws_trades = wb.active
         ws_trades.title = 'الصفقات'
@@ -589,7 +570,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         align_center = Alignment(horizontal='center', vertical='center')
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
-        headers = ['وقت الصفقة (DAM)', 'TF', 'اتجاه', 'المستوى (الدخول)', 'الهدف (TP)', 'الوقف (SL)', 'النتيجة', 'ربح ($)', 'رصيد تراكمي ($)']
+        headers = ['وقت الصفقة (DAM)', 'TF', 'اتجاه', 'المستوى (الدخول)', 'قوي ⭐', 'الهدف (TP)', 'الوقف (SL)', 'النتيجة', 'ربح ($)', 'رصيد تراكمي ($)']
         ws_trades.append(headers)
         for col in range(1, len(headers) + 1):
             cell = ws_trades.cell(row=1, column=col)
@@ -622,7 +603,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
 
                 trade_row = [
                     row['وقت الصفقة (DAM)'], row['TF'], row['اتجاه'],
-                    row['المستوى (الدخول)'], row['الهدف (TP)'], row['الوقف (SL)'],
+                    row['المستوى (الدخول)'], row['قوي ⭐'], row['الهدف (TP)'], row['الوقف (SL)'],
                     row['النتيجة'], row['ربح ($)'], row['رصيد تراكمي ($)']
                 ]
                 ws_trades.append(trade_row)
@@ -637,7 +618,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         cell.fill = fill_color
 
         for column_cells in ws_trades.columns:
-            ws_trades.column_dimensions[column_cells[0].column_letter].width = 18
+            ws_trades.column_dimensions[column_cells[0].column_letter].width = 16
 
         ws_cycles = wb.create_sheet('دورات H1')
         ws_cycles.sheet_view.rightToLeft = True
@@ -656,7 +637,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
 
         wb.save(fname)
 
-        # ── تشكيل رسالة التيليجرام ──
+        # ── تشكيل رسالة التيليجرام الجديدة ──
         total_trades = res['win'] + res['loss'] + res['be']
         wr = round(res['win'] / max(1, res['win']+res['loss']) * 100, 1) if (res['win']+res['loss']) > 0 else 0
         dd_pct = round(res['max_dd'] / max(1, res['peak_equity']) * 100, 1) if res['peak_equity'] > 0 else 0
@@ -677,7 +658,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         ]
         
         await prog.done('\n'.join(tg_lines))
-        await send_tg_document(fname, 'نتائج الباكتيست (مفرز)')
+        await send_tg_document(fname, 'نتائج الباكتيست')
         try: os.remove(fname)
         except: pass
         bot_state['is_backtesting'] = False
@@ -701,7 +682,7 @@ async def process_tg_update(update: dict) -> None:
             return
 
         if msg == '/start':
-            await send_tg_msg('<b>Gold Scalper Bot v6.0 Universal</b>', get_main_keyboard())
+            await send_tg_msg('<b>Gold Scalper Bot v5.5</b>', get_main_keyboard())
 
         elif msg.lower().startswith('/set'):
             parts = msg.strip().lower().split()
@@ -849,7 +830,7 @@ async def main() -> None:
         asyncio.create_task(supervised(telegram_polling_loop, label='tg_polling')),
         asyncio.create_task(supervised(telegram_watchdog,     label='tg_watchdog')),
     ]
-    c_log('Gold Scalper Bot v6.0 Universal started.')
+    c_log('Gold Scalper Bot v5.5 Advanced started.')
     try: await asyncio.gather(*tasks)
     finally:
         if _http and not _http.closed: await _http.close()
