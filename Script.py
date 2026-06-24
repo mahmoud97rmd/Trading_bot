@@ -1,4 +1,4 @@
-# Gold Scalper Bot — v5.4 (Gann Levels Engine - Advanced Filters & Analytics)
+# Gold Scalper Bot — v5.4.1 (Gann Levels Engine - Advanced Filters & Render Support)
 import asyncio
 import aiohttp
 import os
@@ -21,7 +21,6 @@ OANDA_TOKEN    = os.environ.get('OANDA_TOKEN',   '0e282d5a3e65ad6fdd809e2c195bb1
 OANDA_SYMBOL   = 'XAU_USD'
 OANDA_BASE_URL = 'https://api-fxpractice.oanda.com/v3'  
 
-# الفريمات الجديدة التي طلبتها
 _TFS = ['1m', '2m', '3m', '4m', '5m', '6m', '10m', '12m', '15m', '20m', '30m', '1h']
 DD_LIMIT_PCT = 0.03
 
@@ -60,13 +59,13 @@ bot_state: dict = {
     'gann_zone_filter':      'star',
     'gann_entry_mode':       'touch', 
     'gann_touch_margin_pts': 5.0,     
-    'gann_anti_spam':        True,    # منع التكرار الذي طلبته
+    'gann_anti_spam':        True,    
     
     # ── Protection & Filters ──
-    'use_trend_filter':  False,       # حماية الاتجاه
-    'trend_filter_type': 'EMA_200',   # أو 'EMA_CROSS'
-    'use_be':            False,       # حماية الأرباح
-    'be_pips':           20,          # عدد نقاط حماية الأرباح
+    'use_trend_filter':  False,
+    'trend_filter_type': 'EMA_200',
+    'use_be':            False,
+    'be_pips':           20,
 
     # Risk
     'lot_size':         0.05,
@@ -379,7 +378,7 @@ def get_backtest_keyboard() -> dict:
     ]}
 
 # ─────────────────────────────────────────────────────────────
-# COLORED BACKTEST ENGINE
+# COLORED BACKTEST ENGINE (WITH ERROR HANDLING & PANDAS FIXES)
 # ─────────────────────────────────────────────────────────────
 async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
@@ -390,191 +389,206 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     prog = BtProgress(label=desc, active_tfs=['H1']); _bt_progress = prog
     await prog.start(bot_state['chat_id'])
 
-    warmup_hours = 210 if bot_state['use_trend_filter'] else 5
-    total_min = int((end_dt - start_dt).total_seconds() / 60) + (warmup_hours * 60)
-    
-    await prog.set_phase('جلب البيانات...')
     try:
+        warmup_hours = 210 if bot_state['use_trend_filter'] else 5
+        total_min = int((end_dt - start_dt).total_seconds() / 60) + (warmup_hours * 60)
+        
+        await prog.set_phase('جلب البيانات...')
         candles_1m = await fetch_oanda_candles('1m', count=min(total_min, 120000), end_time=end_dt)
-    except Exception as e:
-        await prog.done(f'❌ خطأ في جلب البيانات: {e}'); bot_state['is_backtesting'] = False; return
-        
-    if not candles_1m:
-        await prog.done('❌ لم يتم العثور على بيانات'); bot_state['is_backtesting'] = False; return
-    
-    await prog.set_phase('حساب المؤشرات وفلاتر الاتجاه...')
-    df_1m = pd.DataFrame(candles_1m).set_index('time')
-    
-    df_h1 = df_1m.resample('1h', closed='right', label='right').agg({'close': 'last'}).dropna()
-    df_h1['EMA_200'] = df_h1['close'].ewm(span=200, adjust=False).mean()
-    df_h1['EMA_50']  = df_h1['close'].ewm(span=50, adjust=False).mean()
-    df_h1['EMA_150'] = df_h1['close'].ewm(span=150, adjust=False).mean()
-    
-    df_1m['EMA_200'] = df_h1['EMA_200'].reindex(df_1m.index, method='ffill')
-    df_1m['EMA_50']  = df_h1['EMA_50'].reindex(df_1m.index, method='ffill')
-    df_1m['EMA_150'] = df_h1['EMA_150'].reindex(df_1m.index, method='ffill')
-
-    trade_logs = []
-    cycles_log = []
-    cycle_colors = ['#FFB3BA', '#FFDFBA', '#FFFFBA', '#BAFFC9', '#BAE1FF', '#E8BAFF', '#FFBAE1', '#E0E0E0', '#D5AAFF', '#B5EAD7']
-    color_index = 0
-    cycle_color_map = {}
-
-    start_ts = _to_ts(start_dt)
-    cycle_starts = df_h1[(df_h1.index >= start_ts) & (df_h1.index < _to_ts(end_dt))].index
-    await prog.set_tf('H1 Cycles', len(cycle_starts))
-    
-    pv = bot_state['pip_value']; lot = bot_state['lot_size']; margin_pts = bot_state['gann_touch_margin_pts']
-    res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'peak_equity': 0.0, 'max_dd': 0.0}
-
-    for cycle_n, cycle_start in enumerate(cycle_starts):
-        if prog.cancelled: break
-        await asyncio.sleep(0)
-        
-        cycle_color = cycle_colors[color_index % len(cycle_colors)]
-        cycle_dam_str = _utc_to_dam(cycle_start).strftime('%Y-%m-%d %H:00')
-        cycle_color_map[cycle_dam_str] = cycle_color
-        color_index += 1
-        
-        trades_in_this_cycle = 0
-        level_used_this_cycle: set[str] = set()
-        
-        trend_allows_buy = True; trend_allows_sell = True
-        
-        if bot_state['use_trend_filter']:
-            try:
-                cycle_row = df_1m.loc[df_1m.index <= cycle_start].iloc[-1]
-                if bot_state['trend_filter_type'] == 'EMA_200':
-                    if cycle_row['close'] > cycle_row['EMA_200']: trend_allows_sell = False
-                    else: trend_allows_buy = False
-                else: 
-                    if cycle_row['EMA_50'] > cycle_row['EMA_150']: trend_allows_sell = False
-                    else: trend_allows_buy = False
-            except: pass
-
-        cycle_end = cycle_start + timedelta(hours=1)
-        h1_close = df_h1.loc[cycle_start, 'close']
-        
-        buy_strong  = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, True), h1_close, True)
-        sell_strong = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, False), h1_close, False)
-
-        df_cycle = df_1m[(df_1m.index > cycle_start) & (df_1m.index <= cycle_end)]
-        if df_cycle.empty: continue
-
-        for tf in enabled_tfs:
-            tf_min = int(tf.replace('m', '')) if 'm' in tf else int(tf.replace('h', '')) * 60
-            df_tf = df_cycle.resample(f'{tf_min}min', closed='right', label='right').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
             
-            for tf_idx in range(len(df_tf)):
-                bar_t = df_tf.index[tf_idx]
-                h = float(df_tf.iloc[tf_idx]['high']); l = float(df_tf.iloc[tf_idx]['low'])
-                
-                signals = []
-                for lvl in buy_strong:
-                    combo_key = f"{lvl}_{tf}"
-                    if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
-                    if l <= lvl + (margin_pts * pv) and h >= lvl: signals.append({'type': 'BUY', 'lvl': lvl, 'combo': combo_key})
-
-                for lvl in sell_strong:
-                    combo_key = f"{lvl}_{tf}"
-                    if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
-                    if h >= lvl - (margin_pts * pv) and l <= lvl: signals.append({'type': 'SELL', 'lvl': lvl, 'combo': combo_key})
-
-                for sig in signals:
-                    is_buy = (sig['type'] == 'BUY')
-                    if is_buy and not trend_allows_buy: continue
-                    if not is_buy and not trend_allows_sell: continue
-
-                    if bot_state['gann_anti_spam']: level_used_this_cycle.add(sig['combo'])
-                    
-                    entry_px = sig['lvl']
-                    tp_pts_user = bot_state['tp_pips'].get(tf, 180)
-                    sl_pts_user = bot_state['sl_pips'].get(tf, 100)
-                    tp_d = tp_pts_user * pv; sl_d = sl_pts_user * pv
-                    
-                    tp_px = entry_px + tp_d if is_buy else entry_px - tp_d
-                    sl_px = entry_px - sl_d if is_buy else entry_px + sl_d
-                    be_px_target = entry_px + (bot_state['be_pips'] * pv) if is_buy else entry_px - (bot_state['be_pips'] * pv)
-
-                    sim_df = df_1m[df_1m.index >= bar_t]
-                    outcome = 'OPEN'; p_usd = 0.0; be_activated = False
-                    
-                    for _, row in sim_df.iterrows():
-                        fh = float(row['high']); fl = float(row['low'])
-                        if bot_state['use_be'] and not be_activated:
-                            if (is_buy and fh >= be_px_target) or (not is_buy and fl <= be_px_target):
-                                be_activated = True; sl_px = entry_px 
-                        
-                        if is_buy:
-                            if fl <= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
-                            if fh >= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
-                        else:
-                            if fh >= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
-                            if fl <= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
-
-                    if outcome == 'OPEN': continue
-                    
-                    trades_in_this_cycle += 1
-                    if outcome == 'WIN': res['win'] += 1
-                    elif outcome == 'LOSS': res['loss'] += 1
-                    elif outcome == 'BREAK-EVEN': res['be'] += 1
-                    
-                    res['total_prof'] += p_usd
-                    res['peak_equity'] = max(res['peak_equity'], res['total_prof'])
-                    res['max_dd'] = max(res['max_dd'], res['peak_equity'] - res['total_prof'])
-
-                    trade_logs.append({
-                        'دورة H1 (DAM)': cycle_dam_str,
-                        'وقت الصفقة (DAM)': _utc_to_dam(bar_t).strftime('%Y-%m-%d %H:%M'),
-                        'TF': tf,
-                        'اتجاه': f"{sig['type']}",
-                        'إغلاق H1': h1_close,
-                        'المستوى': sig['lvl'],
-                        'TP (نقطة)': tp_pts_user, 'SL (نقطة)': sl_pts_user,
-                        'النتيجة': outcome,
-                        'ربح ($)': p_usd
-                    })
-                    
-        cycles_log.append({
-            'الدورة (DAM)': cycle_dam_str,
-            'عدد الصفقات': trades_in_this_cycle,
-            'ملاحظة': 'لم يلمس السعر أي مستوى!' if trades_in_this_cycle == 0 else f'تم تنفيذ {trades_in_this_cycle} صفقة'
-        })
-        await prog.tick(cycle_n + 1, res['win'], res['loss'], res['be'], res['total_prof'])
-
-    await prog.set_phase('إنشاء ملف Excel الملون...')
-    fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx"
-    
-    df_trades = pd.DataFrame(trade_logs)
-    if not df_trades.empty:
-        df_trades['TF_Sort'] = df_trades['TF'].apply(lambda x: int(x.replace('m','')) if 'm' in x else int(x.replace('h',''))*60)
-        df_trades = df_trades.sort_values(by=['TF_Sort', 'دورة H1 (DAM)']).drop(columns=['TF_Sort'])
-
-    with pd.ExcelWriter(fname, engine='openpyxl') as writer:
-        df_trades.to_excel(writer, sheet_name='الصفقات', index=False)
-        pd.DataFrame(cycles_log).to_excel(writer, sheet_name='دورات H1', index=False)
+        if not candles_1m:
+            await prog.done('❌ لم يتم العثور على بيانات')
+            bot_state['is_backtesting'] = False; return
         
+        await prog.set_phase('حساب المؤشرات وفلاتر الاتجاه...')
+        df_1m = pd.DataFrame(candles_1m).set_index('time')
+        
+        # FIX 1: منع التكرار وإجبار الترتيب الزمني لتفادي انهيار الباكتيست (Pandas ffill Index Error)
+        df_1m = df_1m[~df_1m.index.duplicated(keep='first')].sort_index()
+        
+        df_h1 = df_1m.resample('1h', closed='right', label='right').agg({'close': 'last'}).dropna()
+        
+        # FIX 2: إذا لم يكن هناك بيانات كافية لفريم الساعة، أوقف الباكتيست بدلاً من الانهيار
+        if df_h1.empty:
+            await prog.done('❌ لا يوجد بيانات كافية لفريم H1 ضمن التاريخ المحدد.')
+            bot_state['is_backtesting'] = False; return
+            
+        df_h1['EMA_200'] = df_h1['close'].ewm(span=200, adjust=False).mean()
+        df_h1['EMA_50']  = df_h1['close'].ewm(span=50, adjust=False).mean()
+        df_h1['EMA_150'] = df_h1['close'].ewm(span=150, adjust=False).mean()
+        
+        df_1m['EMA_200'] = df_h1['EMA_200'].reindex(df_1m.index, method='ffill')
+        df_1m['EMA_50']  = df_h1['EMA_50'].reindex(df_1m.index, method='ffill')
+        df_1m['EMA_150'] = df_h1['EMA_150'].reindex(df_1m.index, method='ffill')
+
+        trade_logs = []
+        cycles_log = []
+        cycle_colors = ['#FFB3BA', '#FFDFBA', '#FFFFBA', '#BAFFC9', '#BAE1FF', '#E8BAFF', '#FFBAE1', '#E0E0E0', '#D5AAFF', '#B5EAD7']
+        color_index = 0
+        cycle_color_map = {}
+
+        start_ts = _to_ts(start_dt)
+        cycle_starts = df_h1[(df_h1.index >= start_ts) & (df_h1.index < _to_ts(end_dt))].index
+        await prog.set_tf('H1 Cycles', len(cycle_starts))
+        
+        pv = bot_state['pip_value']; lot = bot_state['lot_size']; margin_pts = bot_state['gann_touch_margin_pts']
+        res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'peak_equity': 0.0, 'max_dd': 0.0}
+
+        for cycle_n, cycle_start in enumerate(cycle_starts):
+            if prog.cancelled: break
+            await asyncio.sleep(0)
+            
+            cycle_color = cycle_colors[color_index % len(cycle_colors)]
+            cycle_dam_str = _utc_to_dam(cycle_start).strftime('%Y-%m-%d %H:00')
+            cycle_color_map[cycle_dam_str] = cycle_color
+            color_index += 1
+            
+            trades_in_this_cycle = 0
+            level_used_this_cycle: set[str] = set()
+            
+            trend_allows_buy = True; trend_allows_sell = True
+            
+            if bot_state['use_trend_filter']:
+                try:
+                    cycle_row = df_1m.loc[df_1m.index <= cycle_start].iloc[-1]
+                    if bot_state['trend_filter_type'] == 'EMA_200':
+                        if cycle_row['close'] > cycle_row['EMA_200']: trend_allows_sell = False
+                        else: trend_allows_buy = False
+                    else: 
+                        if cycle_row['EMA_50'] > cycle_row['EMA_150']: trend_allows_sell = False
+                        else: trend_allows_buy = False
+                except: pass
+
+            cycle_end = cycle_start + timedelta(hours=1)
+            h1_close = df_h1.loc[cycle_start, 'close']
+            
+            buy_strong  = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, True), h1_close, True)
+            sell_strong = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, False), h1_close, False)
+
+            df_cycle = df_1m[(df_1m.index > cycle_start) & (df_1m.index <= cycle_end)]
+            if df_cycle.empty: continue
+
+            for tf in enabled_tfs:
+                tf_min = int(tf.replace('m', '')) if 'm' in tf else int(tf.replace('h', '')) * 60
+                df_tf = df_cycle.resample(f'{tf_min}min', closed='right', label='right').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
+                
+                for tf_idx in range(len(df_tf)):
+                    bar_t = df_tf.index[tf_idx]
+                    h = float(df_tf.iloc[tf_idx]['high']); l = float(df_tf.iloc[tf_idx]['low'])
+                    
+                    signals = []
+                    for lvl in buy_strong:
+                        combo_key = f"{lvl}_{tf}"
+                        if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
+                        if l <= lvl + (margin_pts * pv) and h >= lvl: signals.append({'type': 'BUY', 'lvl': lvl, 'combo': combo_key})
+
+                    for lvl in sell_strong:
+                        combo_key = f"{lvl}_{tf}"
+                        if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
+                        if h >= lvl - (margin_pts * pv) and l <= lvl: signals.append({'type': 'SELL', 'lvl': lvl, 'combo': combo_key})
+
+                    for sig in signals:
+                        is_buy = (sig['type'] == 'BUY')
+                        if is_buy and not trend_allows_buy: continue
+                        if not is_buy and not trend_allows_sell: continue
+
+                        if bot_state['gann_anti_spam']: level_used_this_cycle.add(sig['combo'])
+                        
+                        entry_px = sig['lvl']
+                        tp_pts_user = bot_state['tp_pips'].get(tf, 180)
+                        sl_pts_user = bot_state['sl_pips'].get(tf, 100)
+                        tp_d = tp_pts_user * pv; sl_d = sl_pts_user * pv
+                        
+                        tp_px = entry_px + tp_d if is_buy else entry_px - tp_d
+                        sl_px = entry_px - sl_d if is_buy else entry_px + sl_d
+                        be_px_target = entry_px + (bot_state['be_pips'] * pv) if is_buy else entry_px - (bot_state['be_pips'] * pv)
+
+                        sim_df = df_1m[df_1m.index >= bar_t]
+                        outcome = 'OPEN'; p_usd = 0.0; be_activated = False
+                        
+                        for _, row in sim_df.iterrows():
+                            fh = float(row['high']); fl = float(row['low'])
+                            if bot_state['use_be'] and not be_activated:
+                                if (is_buy and fh >= be_px_target) or (not is_buy and fl <= be_px_target):
+                                    be_activated = True; sl_px = entry_px 
+                            
+                            if is_buy:
+                                if fl <= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
+                                if fh >= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
+                            else:
+                                if fh >= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
+                                if fl <= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
+
+                        if outcome == 'OPEN': continue
+                        
+                        trades_in_this_cycle += 1
+                        if outcome == 'WIN': res['win'] += 1
+                        elif outcome == 'LOSS': res['loss'] += 1
+                        elif outcome == 'BREAK-EVEN': res['be'] += 1
+                        
+                        res['total_prof'] += p_usd
+                        res['peak_equity'] = max(res['peak_equity'], res['total_prof'])
+                        res['max_dd'] = max(res['max_dd'], res['peak_equity'] - res['total_prof'])
+
+                        trade_logs.append({
+                            'دورة H1 (DAM)': cycle_dam_str,
+                            'وقت الصفقة (DAM)': _utc_to_dam(bar_t).strftime('%Y-%m-%d %H:%M'),
+                            'TF': tf,
+                            'اتجاه': f"{sig['type']}",
+                            'إغلاق H1': h1_close,
+                            'المستوى': sig['lvl'],
+                            'TP (نقطة)': tp_pts_user, 'SL (نقطة)': sl_pts_user,
+                            'النتيجة': outcome,
+                            'ربح ($)': p_usd
+                        })
+                        
+            cycles_log.append({
+                'الدورة (DAM)': cycle_dam_str,
+                'عدد الصفقات': trades_in_this_cycle,
+                'ملاحظة': 'لم يلمس السعر أي مستوى!' if trades_in_this_cycle == 0 else f'تم تنفيذ {trades_in_this_cycle} صفقة'
+            })
+            await prog.tick(cycle_n + 1, res['win'], res['loss'], res['be'], res['total_prof'])
+
+        await prog.set_phase('إنشاء ملف Excel الملون...')
+        fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx"
+        
+        df_trades = pd.DataFrame(trade_logs)
         if not df_trades.empty:
-            ws_trades = writer.sheets['الصفقات']
-            cycle_col_idx = list(df_trades.columns).index('دورة H1 (DAM)') + 1
-            for row in ws_trades.iter_rows(min_row=2):
-                c_val = row[cycle_col_idx-1].value
+            df_trades['TF_Sort'] = df_trades['TF'].apply(lambda x: int(x.replace('m','')) if 'm' in x else int(x.replace('h',''))*60)
+            df_trades = df_trades.sort_values(by=['TF_Sort', 'دورة H1 (DAM)']).drop(columns=['TF_Sort'])
+
+        with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+            df_trades.to_excel(writer, sheet_name='الصفقات', index=False)
+            pd.DataFrame(cycles_log).to_excel(writer, sheet_name='دورات H1', index=False)
+            
+            if not df_trades.empty:
+                ws_trades = writer.sheets['الصفقات']
+                cycle_col_idx = list(df_trades.columns).index('دورة H1 (DAM)') + 1
+                for row in ws_trades.iter_rows(min_row=2):
+                    c_val = row[cycle_col_idx-1].value
+                    if c_val in cycle_color_map:
+                        fill = PatternFill(start_color=cycle_color_map[c_val].replace('#',''), fill_type='solid')
+                        for cell in row: cell.fill = fill
+                        
+            ws_cycles = writer.sheets['دورات H1']
+            for row in ws_cycles.iter_rows(min_row=2):
+                c_val = row[0].value
                 if c_val in cycle_color_map:
                     fill = PatternFill(start_color=cycle_color_map[c_val].replace('#',''), fill_type='solid')
                     for cell in row: cell.fill = fill
-                    
-        ws_cycles = writer.sheets['دورات H1']
-        for row in ws_cycles.iter_rows(min_row=2):
-            c_val = row[0].value
-            if c_val in cycle_color_map:
-                fill = PatternFill(start_color=cycle_color_map[c_val].replace('#',''), fill_type='solid')
-                for cell in row: cell.fill = fill
 
-    await prog.done(f'باكتيست اكتمل ✅\nالربح: ${res["total_prof"]}')
-    await send_tg_document(fname, 'نتائج الباكتيست (مفرز وملون)')
-    try: os.remove(fname)
-    except: pass
-    bot_state['is_backtesting'] = False
+        await prog.done(f'باكتيست اكتمل ✅\nالربح: ${res["total_prof"]}')
+        await send_tg_document(fname, 'نتائج الباكتيست (مفرز وملون)')
+        try: os.remove(fname)
+        except: pass
+        bot_state['is_backtesting'] = False
+
+    except Exception as e:
+        # FIX 3: منع التعليق الصامت، وعرض الخطأ في تيليجرام لإيقاف المهمة بأمان
+        err_msg = f'❌ حدث خطأ برمجي: {repr(e)}'
+        c_log(err_msg)
+        await prog.done(err_msg)
+        bot_state['is_backtesting'] = False
 
 # ─────────────────────────────────────────────────────────────
 # TELEGRAM COMMANDS & CALLBACKS
@@ -589,17 +603,14 @@ async def process_tg_update(update: dict) -> None:
             return
 
         if msg == '/start':
-            await send_tg_msg('<b>Gold Scalper Bot v5.4</b>', get_main_keyboard())
+            await send_tg_msg('<b>Gold Scalper Bot v5.4.1</b>', get_main_keyboard())
 
-        # التحكم اليدوي السريع في الإعدادات عبر الرسائل (كما طلبت)
         elif msg.lower().startswith('/set'):
             parts = msg.strip().lower().split()
-            # حماية الأرباح /set be 30
             if len(parts) == 3 and parts[1] == 'be':
                 try: bot_state['be_pips'] = int(parts[2]); await send_tg_msg(f'✅ تم تعديل الـ BE إلى {parts[2]} نقطة.')
                 except ValueError: pass
                 return
-            # أوامر الهدف والوقف /set 1m sl 100
             if len(parts) == 4:
                 _, tf, key, val = parts
                 if tf in _TFS and key in ('tp', 'sl'):
@@ -607,16 +618,13 @@ async def process_tg_update(update: dict) -> None:
                     except ValueError: pass
                 return
 
-        # أمر الباكتيست حسب التاريخ
         elif msg.lower().startswith('/backtest'):
             parts = msg.strip().split()
             try:
                 if len(parts) == 2:
-                    # يوم واحد
                     start_dt = _dam_to_utc(f"{parts[1]} 00:00")
                     end_dt = start_dt + timedelta(days=1)
                 elif len(parts) >= 3:
-                    # عدة أيام
                     d1 = _dam_to_utc(f"{parts[1]} 00:00"); d2 = _dam_to_utc(f"{parts[2]} 00:00")
                     start_dt = min(d1, d2); end_dt = max(d1, d2) + timedelta(days=1)
                 else: return
@@ -630,6 +638,13 @@ async def process_tg_update(update: dict) -> None:
             if _http and not _http.closed: await _http.close()
             _http = None; get_http()
             await send_tg_msg('✅ تم التجديد.')
+            
+        elif msg == '/cancel_bt':
+            global _bt_progress
+            if _bt_progress and bot_state['is_backtesting']: 
+                await _bt_progress.cancel()
+                bot_state['is_backtesting'] = False
+                await send_tg_msg('تم الإيقاف.')
         return
 
     if 'callback_query' not in update: return
@@ -648,16 +663,13 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d == 'menu_backtest': await _show(chat_id, msg_id, 'الباكتيست:', get_backtest_keyboard())
     elif d == 'hide_keyboard': bot_state['menu_button_map'] = {}; await _show(chat_id, msg_id, 'مخفية.', {'remove_keyboard': True})
 
-    # أزرار الاستراتيجية (Anti-Spam وحماية الاتجاه)
     elif d == 'toggle_spam': bot_state['gann_anti_spam'] = not bot_state['gann_anti_spam']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'toggle_trend': bot_state['use_trend_filter'] = not bot_state['use_trend_filter']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'cycle_trend_type': bot_state['trend_filter_type'] = 'EMA_CROSS' if bot_state['trend_filter_type'] == 'EMA_200' else 'EMA_200'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
 
-    # أزرار المخاطر (الـ BE)
     elif d == 'toggle_be': bot_state['use_be'] = not bot_state['use_be']; await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
     elif d == 'view_tpsl': await _show(chat_id, msg_id, 'TP/SL:', get_tpsl_overview_keyboard())
 
-    # الفريمات
     elif d.startswith('toggle_tf_'):
         tf = d[len('toggle_tf_'):]
         if tf in bot_state['active_tfs']: bot_state['active_tfs'][tf] = not bot_state['active_tfs'][tf]
@@ -665,7 +677,9 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
 
     elif d == 'cancel_bt':
         global _bt_progress
-        if _bt_progress: await _bt_progress.cancel(); await _show(chat_id, msg_id, 'جاري الإيقاف...', get_main_keyboard())
+        if _bt_progress: await _bt_progress.cancel()
+        bot_state['is_backtesting'] = False
+        await _show(chat_id, msg_id, 'تم الإيقاف.', get_main_keyboard())
 
 # ─────────────────────────────────────────────────────────────
 # TELEGRAM POLLING & WATCHDOG
@@ -716,33 +730,32 @@ async def supervised(coro_fn, *args, label: str = '') -> None:
         except Exception as e: c_log(f'Task {label} crashed: {e}'); await asyncio.sleep(5)
 
 # ─────────────────────────────────────────────────────────────
-# ENTRY POINT & DUMMY WEB SERVER (For Render)
+# ENTRY POINT & RENDER WEB SERVER
 # ─────────────────────────────────────────────────────────────
 async def handle_ping(request):
-    return web.Response(text="Bot is running smoothly!")
+    return web.Response(text="Bot is running smoothly on Render!")
 
 async def main() -> None:
     get_http()
     bot_state['last_poll_ok'] = datetime.now(timezone.utc).timestamp()
     
-    # 🌐 تشغيل خادم ويب بسيط لإرضاء منصة Render
+    # 🌐 تشغيل خادم ويب وهمي لإرضاء منصة Render ومنع خطأ Ports
     app = web.Application()
     app.router.add_get('/', handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 10000))
     await web.TCPSite(runner, '0.0.0.0', port).start()
-    c_log(f'Web server started on port {port}')
+    c_log(f'Render Web server started on port {port}')
 
     tasks = [
         asyncio.create_task(supervised(telegram_polling_loop, label='tg_polling')),
         asyncio.create_task(supervised(telegram_watchdog,     label='tg_watchdog')),
     ]
-    c_log('Gold Scalper Bot v5.4 Advanced started.')
+    c_log('Gold Scalper Bot v5.4.1 Advanced started.')
     try: await asyncio.gather(*tasks)
     finally:
         if _http and not _http.closed: await _http.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
-
