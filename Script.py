@@ -5,7 +5,6 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from metaapi_cloud_sdk import MetaApi
 from aiohttp import web
 from openpyxl.styles import PatternFill
 
@@ -22,6 +21,7 @@ OANDA_TOKEN    = os.environ.get('OANDA_TOKEN',   '0e282d5a3e65ad6fdd809e2c195bb1
 OANDA_SYMBOL   = 'XAU_USD'
 OANDA_BASE_URL = 'https://api-fxpractice.oanda.com/v3'  
 
+# الفريمات الجديدة التي طلبتها
 _TFS = ['1m', '2m', '3m', '4m', '5m', '6m', '10m', '12m', '15m', '20m', '30m', '1h']
 DD_LIMIT_PCT = 0.03
 
@@ -52,8 +52,6 @@ bot_state: dict = {
     'chat_id':          None,
     'last_update_id':   0,
     'is_backtesting':   False,
-    'connection_obj':   None,
-    'account_obj':      None,
     
     'timeframes':       _TFS,
     'active_tfs':       {tf: (True if tf in ['1m', '3m', '5m'] else False) for tf in _TFS},
@@ -62,13 +60,13 @@ bot_state: dict = {
     'gann_zone_filter':      'star',
     'gann_entry_mode':       'touch', 
     'gann_touch_margin_pts': 5.0,     
-    'gann_anti_spam':        True,    
+    'gann_anti_spam':        True,    # منع التكرار الذي طلبته
     
     # ── Protection & Filters ──
-    'use_trend_filter':  False,
-    'trend_filter_type': 'EMA_200',
-    'use_be':            False,
-    'be_pips':           20,
+    'use_trend_filter':  False,       # حماية الاتجاه
+    'trend_filter_type': 'EMA_200',   # أو 'EMA_CROSS'
+    'use_be':            False,       # حماية الأرباح
+    'be_pips':           20,          # عدد نقاط حماية الأرباح
 
     # Risk
     'lot_size':         0.05,
@@ -80,18 +78,8 @@ bot_state: dict = {
     'sl_pips': {tf: 100 for tf in _TFS},
 
     'menu_button_map': {},
-    'sod_balance':  None,
-    'sod_date':     None,
-    'dd_triggered': False,
-    'daily_target_enabled':    False,
-    'daily_target_usd':        100.0,
-    'profit_target_triggered': False,
-    'daily_loss_enabled':      False,
-    'daily_loss_usd':          100.0,
-    'loss_limit_triggered':    False,
-    'use_danger_filter': True,
-    'market_data':      {tf: 'Waiting...' for tf in _TFS},
     'last_poll_ok': 0.0,
+    'use_danger_filter': True,
 }
 bot_state['sl_pips']['1m'] = 50
 
@@ -103,23 +91,14 @@ _BLOCKED_DAMASCUS_HOURS = {13, 18, 21, 22}
 def is_blocked_time(dt_utc: datetime) -> bool:
     return (dt_utc.hour + 3) % 24 in _BLOCKED_DAMASCUS_HOURS
 
-def blocked_time_label(dt_utc: datetime) -> str:
-    h = (dt_utc.hour + 3) % 24
-    return f'Danger Zone ({h}:xx DAM)' if h in _BLOCKED_DAMASCUS_HOURS else ''
-
 def _to_utc(x) -> pd.Timestamp:
-    if isinstance(x, pd.Timestamp):
-        if x.tzinfo is not None: return x.tz_convert('UTC')
-        return x.tz_localize('UTC')
+    if isinstance(x, pd.Timestamp): return x.tz_convert('UTC') if x.tzinfo else x.tz_localize('UTC')
     if isinstance(x, datetime):
-        if x.tzinfo is not None:
-            utc_dt = x.astimezone(timezone.utc)
-            return pd.Timestamp(utc_dt.year, utc_dt.month, utc_dt.day, utc_dt.hour, utc_dt.minute, utc_dt.second, utc_dt.microsecond, tz='UTC')
+        if x.tzinfo: return pd.Timestamp(x.astimezone(timezone.utc)).tz_localize('UTC')
         return pd.Timestamp(x).tz_localize('UTC')
     if isinstance(x, (int, float)): return pd.Timestamp(int(x), unit='s').tz_localize('UTC')
     ts = pd.Timestamp(str(x))
-    if ts.tzinfo is not None: return ts.tz_convert('UTC')
-    return ts.tz_localize('UTC')
+    return ts.tz_convert('UTC') if ts.tzinfo else ts.tz_localize('UTC')
 
 _to_ts = _to_utc
 DAM_OFF = timedelta(hours=3)
@@ -183,8 +162,6 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
             if len(complete) < chunk: break
             await asyncio.sleep(0.2)
     return collected
-
-fetch_candles = fetch_oanda_candles
 
 # ─────────────────────────────────────────────────────────────
 # GANN MATH
@@ -270,7 +247,6 @@ class BtProgress:
     async def set_phase(self, phase: str) -> None: self.phase = phase; await self._edit()
     async def set_tf(self, tf: str, bars_total: int) -> None: self.current_tf = tf; self.bars_done = 0; self.bars_total = bars_total; self.phase = f'Scanning [{tf}]'; await self._edit(force=True)
     async def tick(self, bar_n: int, win: int, loss: int, be: int, profit: float) -> None: self.bars_done = bar_n; self.win = win; self.loss = loss; self.be = be; self.profit = profit; await self._edit()
-    async def finish_tf(self) -> None: self.tf_done += 1; self.bars_done = self.bars_total; await self._edit(force=True)
     async def done(self, final_text: str) -> None:
         if self._hb_task: self._hb_task.cancel()
         if not self.msg_id or not self.chat_id: return
@@ -319,10 +295,8 @@ async def _show(chat_id, msg_id, text: str, reply_markup: dict = None) -> None:
     if msg_id: await edit_tg_msg(chat_id, msg_id, text, reply_markup)
     else: await send_tg_msg(text, reply_markup)
 
-async def answer_callback(cbq_id: str, text: str = None) -> None:
-    payload = {'callback_query_id': cbq_id}
-    if text: payload['text'] = text
-    await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery', json=payload)
+async def answer_callback(cbq_id: str) -> None:
+    await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery', json={'callback_query_id': cbq_id})
 
 async def send_tg_document(file_path: str, caption: str) -> None:
     if not bot_state['chat_id']: return
@@ -339,49 +313,38 @@ async def send_tg_document(file_path: str, caption: str) -> None:
 # KEYBOARDS
 # ─────────────────────────────────────────────────────────────
 def get_main_keyboard() -> dict:
-    live = '🟢 متصل' if bot_state['live_connected'] else '🔴 مفصول'
-    st   = '▶ يعمل'   if bot_state['status'] == 'RUNNING' else '⏸ متوقف'
-    bt   = '⏳ فحص...' if bot_state['is_backtesting'] else '📊 باكتيست'
+    st = '▶ يعمل' if bot_state['status'] == 'RUNNING' else '⏸ متوقف'
+    bt = '⏳ فحص...' if bot_state['is_backtesting'] else '📊 باكتيست'
     return {'inline_keyboard': [
-        [{'text': f'السيرفر: {live}',    'callback_data': 'toggle_live_conn'}],
-        [{'text': f'البوت: {st}',         'callback_data': 'toggle_status'}, {'text': '❌ إغلاق الكل',       'callback_data': 'close_all'}],
-        [{'text': '⚙️ الاستراتيجية',        'callback_data': 'menu_strategy'}, {'text': '💰 المخاطر',            'callback_data': 'menu_risk'}],
-        [{'text': '⏱ الفريمات النشطة', 'callback_data': 'menu_tfs'}, {'text': '🔍 ماسح الإشارات',         'callback_data': 'menu_scanner'}],
-        [{'text': bt,                   'callback_data': 'menu_backtest'}, {'text': '❌ إخفاء',      'callback_data': 'hide_keyboard'}],
+        [{'text': f'البوت: {st}', 'callback_data': 'toggle_status'}],
+        [{'text': '⚙️ الاستراتيجية (فلاتر و Anti-Spam)', 'callback_data': 'menu_strategy'}],
+        [{'text': '💰 المخاطر (تعديل الأهداف و BE)', 'callback_data': 'menu_risk'}],
+        [{'text': '⏱ الفريمات النشطة', 'callback_data': 'menu_tfs'}],
+        [{'text': bt, 'callback_data': 'menu_backtest'}, {'text': '❌ إخفاء', 'callback_data': 'hide_keyboard'}],
     ]}
 
 def get_strategy_keyboard() -> dict:
-    zf = 'كل المستويات' if bot_state['gann_zone_filter'] == 'all' else 'القوية فقط ⭐'
-    em = 'ملامسة (Touch)' if bot_state['gann_entry_mode'] == 'touch' else 'اختراق+إعادة اختبار'
     spam_i = '✅' if bot_state['gann_anti_spam'] else '⬜'
     trnd_i = '✅' if bot_state['use_trend_filter'] else '⬜'
     t_type = '200 EMA' if bot_state['trend_filter_type'] == 'EMA_200' else '50/150 Cross'
-    dng_i  = '✅' if bot_state['use_danger_filter'] else '⬜'
     
     return {'inline_keyboard': [
-        [{'text': '── 📐 مستويات جان H1 ──', 'callback_data': 'noop'}],
-        [{'text': f'الفلترة: {zf} ↻', 'callback_data': 'cycle_zone_filter'}],
-        [{'text': f'الدخول: {em} ↻', 'callback_data': 'cycle_entry_mode'}],
-        [{'text': '−H', 'callback_data': 'dec_margin'}, {'text': f'هامش الملامسة = {bot_state["gann_touch_margin_pts"]}p', 'callback_data': 'noop'}, {'text': '+H', 'callback_data': 'inc_margin'}],
+        [{'text': '── 📐 مستويات جان ──', 'callback_data': 'noop'}],
         [{'text': f'Anti-Spam (منع التكرار): {spam_i}', 'callback_data': 'toggle_spam'}],
-        [{'text': '🛡️ ── فلتر الاتجاه ── 🛡️', 'callback_data': 'noop'}],
-        [{'text': f'الحماية مفعلة: {trnd_i}', 'callback_data': 'toggle_trend'}],
+        [{'text': '🛡️ ── حماية الاتجاه ── 🛡️', 'callback_data': 'noop'}],
+        [{'text': f'الفلتر مفعل: {trnd_i}', 'callback_data': 'toggle_trend'}],
         [{'text': f'نوع الفلتر: {t_type} ↻', 'callback_data': 'cycle_trend_type'}],
-        [{'text': '── أخرى ──', 'callback_data': 'noop'}],
-        [{'text': f'أوقات الخطر (Danger): {dng_i}', 'callback_data': 'toggle_danger'}],
-        [{'text': '← رجوع', 'callback_data': 'menu_main'}],
+        [{'text': '← رجوع للقائمة', 'callback_data': 'menu_main'}],
     ]}
 
 def get_risk_keyboard() -> dict:
     be_i  = '✅' if bot_state['use_be'] else '⬜'
     be_p  = bot_state['be_pips']
-    spr_i = '✅' if bot_state['use_max_spread'] else '⬜'
     return {'inline_keyboard': [
-        [{'text': f'حماية الأرباح (BE): {be_i} ({be_p}p)', 'callback_data': 'toggle_be'}],
-        [{'text': '/set be VALUE — e.g. /set be 30', 'callback_data': 'noop'}],
-        [{'text': f'أقصى سبريد {bot_state["max_spread_pips"]}p: {spr_i}', 'callback_data': 'toggle_spread'}],
-        [{'text': '−', 'callback_data': 'dec_lot'}, {'text': f'اللوت: {bot_state["lot_size"]:.2f}', 'callback_data': 'noop'}, {'text': '+', 'callback_data': 'inc_lot'}],
-        [{'text': '📋 تعديل الأهداف والوقف (TP/SL)', 'callback_data': 'view_tpsl'}],
+        [{'text': f'حماية الأرباح (Break-Even): {be_i}', 'callback_data': 'toggle_be'}],
+        [{'text': f'نقاط الحماية: {be_p}p', 'callback_data': 'noop'}],
+        [{'text': '/set be 30 (أرسلها كرسالة لتغيير النقاط)', 'callback_data': 'noop'}],
+        [{'text': '📋 تعديل TP/SL للفريمات', 'callback_data': 'view_tpsl'}],
         [{'text': '← رجوع', 'callback_data': 'menu_main'}],
     ]}
 
@@ -398,29 +361,22 @@ def get_tf_keyboard() -> dict:
     return {'inline_keyboard': rows}
 
 def get_tpsl_overview_keyboard() -> dict:
-    rows = [[{'text': '── اضغط للتعديل ──', 'callback_data': 'noop'}]]
+    rows = [[{'text': 'السهولة: أرسل رسالة مثلاً: /set 1m tp 150', 'callback_data': 'noop'}]]
     for tf in bot_state['timeframes']:
         if bot_state['active_tfs'][tf]:
             tp = bot_state['tp_pips'][tf]; sl = bot_state['sl_pips'][tf]
-            rows.append([{'text': f'{tf}  TP:{tp} SL:{sl}', 'callback_data': f'tpsl_edit_{tf}'}])
+            rows.append([{'text': f'{tf} | TP: {tp} | SL: {sl}', 'callback_data': f'noop'}])
     rows.append([{'text': '← رجوع', 'callback_data': 'menu_risk'}])
     return {'inline_keyboard': rows}
 
-def get_tpsl_edit_keyboard(tf: str) -> dict:
-    tp = bot_state['tp_pips'][tf]; sl = bot_state['sl_pips'][tf]; rr = round(tp / sl, 2) if sl else 0
-    return {'inline_keyboard': [
-        [{'text': f'[{tf}]  TP:{tp}p  SL:{sl}p  RR:1:{rr}', 'callback_data': 'noop'}],
-        [{'text': 'Take Profit', 'callback_data': 'noop'}],
-        [{'text': f'-10({tp-10})', 'callback_data': f'dec_tp10_{tf}'}, {'text': f'TP={tp}', 'callback_data': 'noop'}, {'text': f'+10({tp+10})', 'callback_data': f'inc_tp10_{tf}'}],
-        [{'text': 'Stop Loss', 'callback_data': 'noop'}],
-        [{'text': f'-10({sl-10})', 'callback_data': f'dec_sl10_{tf}'}, {'text': f'SL={sl}', 'callback_data': 'noop'}, {'text': f'+10({sl+10})', 'callback_data': f'inc_sl10_{tf}'}],
-        [{'text': f'/set {tf} tp VALUE  or  /set {tf} sl VALUE', 'callback_data': 'noop'}],
-        [{'text': '← رجوع', 'callback_data': 'view_tpsl'}],
-    ]}
-
 def get_backtest_keyboard() -> dict:
-    if bot_state['is_backtesting']: return {'inline_keyboard': [[{'text': 'الباكتيست يعمل...', 'callback_data': 'bt_show_progress'}], [{'text': '⏹ إيقاف', 'callback_data': 'cancel_bt'}], [{'text': '← رجوع', 'callback_data': 'menu_main'}]]}
-    return {'inline_keyboard': [[{'text': 'اليوم', 'callback_data': 'bto_0'}, {'text': '1 يوم', 'callback_data': 'bto_1'}, {'text': '3 أيام', 'callback_data': 'bto_3'}, {'text': '7 أيام', 'callback_data': 'bto_7'}], [{'text': '← رجوع', 'callback_data': 'menu_main'}]]}
+    if bot_state['is_backtesting']: return {'inline_keyboard': [[{'text': 'الباكتيست يعمل...', 'callback_data': 'bt_show_progress'}], [{'text': '⏹ إيقاف', 'callback_data': 'cancel_bt'}]]}
+    return {'inline_keyboard': [
+        [{'text': 'أوامر الباكتيست (أرسل كرسالة):', 'callback_data': 'noop'}],
+        [{'text': '/backtest 2026-06-24 (ليوم واحد)', 'callback_data': 'noop'}],
+        [{'text': '/backtest 2026-06-20 2026-06-24 (عدة أيام)', 'callback_data': 'noop'}],
+        [{'text': '← رجوع', 'callback_data': 'menu_main'}],
+    ]}
 
 # ─────────────────────────────────────────────────────────────
 # COLORED BACKTEST ENGINE
@@ -429,25 +385,22 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
     bot_state['is_backtesting'] = True
     
-    enabled_tfs = [tf for tf, on in bot_state['active_tfs'].items() if on] or ['5m']
-    tfs_label   = '+'.join(enabled_tfs)
-    desc     = f"جان H1→[{tfs_label}] | {bot_state['gann_entry_mode']} | {'⭐' if bot_state['gann_zone_filter']=='star' else 'الكل'}"
-    prog     = BtProgress(label=desc, active_tfs=['H1']); _bt_progress = prog
+    enabled_tfs = [tf for tf, on in bot_state['active_tfs'].items() if on] or ['1m']
+    desc = f"جان H1 → [{'+'.join(enabled_tfs)}] | AntiSpam:{'On' if bot_state['gann_anti_spam'] else 'Off'}"
+    prog = BtProgress(label=desc, active_tfs=['H1']); _bt_progress = prog
     await prog.start(bot_state['chat_id'])
 
     warmup_hours = 210 if bot_state['use_trend_filter'] else 5
     total_min = int((end_dt - start_dt).total_seconds() / 60) + (warmup_hours * 60)
     
-    await prog.set_phase('جلب البيانات من OANDA...')
+    await prog.set_phase('جلب البيانات...')
     try:
-        candles_1m = await fetch_candles('1m', count=min(total_min, 120000), end_time=end_dt)
+        candles_1m = await fetch_oanda_candles('1m', count=min(total_min, 120000), end_time=end_dt)
     except Exception as e:
-        await prog.done(f'❌ خطأ في جلب البيانات: {e}')
-        bot_state['is_backtesting'] = False; return
+        await prog.done(f'❌ خطأ في جلب البيانات: {e}'); bot_state['is_backtesting'] = False; return
         
     if not candles_1m:
-        await prog.done('❌ لم يتم العثور على بيانات 1m')
-        bot_state['is_backtesting'] = False; return
+        await prog.done('❌ لم يتم العثور على بيانات'); bot_state['is_backtesting'] = False; return
     
     await prog.set_phase('حساب المؤشرات وفلاتر الاتجاه...')
     df_1m = pd.DataFrame(candles_1m).set_index('time')
@@ -471,9 +424,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     cycle_starts = df_h1[(df_h1.index >= start_ts) & (df_h1.index < _to_ts(end_dt))].index
     await prog.set_tf('H1 Cycles', len(cycle_starts))
     
-    pv = bot_state['pip_value']
-    lot = bot_state['lot_size']
-    margin_pts = bot_state['gann_touch_margin_pts']
+    pv = bot_state['pip_value']; lot = bot_state['lot_size']; margin_pts = bot_state['gann_touch_margin_pts']
     res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'peak_equity': 0.0, 'max_dd': 0.0}
 
     for cycle_n, cycle_start in enumerate(cycle_starts):
@@ -488,37 +439,24 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         trades_in_this_cycle = 0
         level_used_this_cycle: set[str] = set()
         
-        trend_status = "محايد"
-        trend_allows_buy = True
-        trend_allows_sell = True
+        trend_allows_buy = True; trend_allows_sell = True
         
         if bot_state['use_trend_filter']:
             try:
                 cycle_row = df_1m.loc[df_1m.index <= cycle_start].iloc[-1]
                 if bot_state['trend_filter_type'] == 'EMA_200':
-                    if cycle_row['close'] > cycle_row['EMA_200']:
-                        trend_allows_sell = False; trend_status = "صاعد (EMA 200)"
-                    else:
-                        trend_allows_buy = False; trend_status = "هابط (EMA 200)"
+                    if cycle_row['close'] > cycle_row['EMA_200']: trend_allows_sell = False
+                    else: trend_allows_buy = False
                 else: 
-                    if cycle_row['EMA_50'] > cycle_row['EMA_150']:
-                        trend_allows_sell = False; trend_status = "صاعد (50>150)"
-                    else:
-                        trend_allows_buy = False; trend_status = "هابط (50<150)"
+                    if cycle_row['EMA_50'] > cycle_row['EMA_150']: trend_allows_sell = False
+                    else: trend_allows_buy = False
             except: pass
 
         cycle_end = cycle_start + timedelta(hours=1)
         h1_close = df_h1.loc[cycle_start, 'close']
         
-        buy_levels_all  = calculate_gann_levels_from_close(h1_close, True)
-        sell_levels_all = calculate_gann_levels_from_close(h1_close, False)
-        buy_strong      = determine_strong_gann_levels(buy_levels_all, h1_close, True)
-        sell_strong     = determine_strong_gann_levels(sell_levels_all, h1_close, False)
-
-        if bot_state['gann_zone_filter'] == 'star':
-            b_list, s_list = buy_strong, sell_strong
-        else:
-            b_list, s_list = buy_levels_all, sell_levels_all
+        buy_strong  = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, True), h1_close, True)
+        sell_strong = determine_strong_gann_levels(calculate_gann_levels_from_close(h1_close, False), h1_close, False)
 
         df_cycle = df_1m[(df_1m.index > cycle_start) & (df_1m.index <= cycle_end)]
         if df_cycle.empty: continue
@@ -529,32 +467,18 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
             
             for tf_idx in range(len(df_tf)):
                 bar_t = df_tf.index[tf_idx]
-                if bot_state['use_danger_filter'] and is_blocked_time(bar_t.to_pydatetime()): continue
-                
                 h = float(df_tf.iloc[tf_idx]['high']); l = float(df_tf.iloc[tf_idx]['low'])
                 
                 signals = []
-                for lvl in b_list:
+                for lvl in buy_strong:
                     combo_key = f"{lvl}_{tf}"
                     if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
-                    is_star = '⭐' if lvl in buy_strong else ''
-                    if bot_state['gann_entry_mode'] == 'touch':
-                        if l <= lvl + (margin_pts * pv) and h >= lvl: signals.append({'type': 'BUY', 'lvl': lvl, 'star': is_star, 'combo': combo_key})
-                    else:
-                        if tf_idx > 0:
-                            prev_c = float(df_tf.iloc[tf_idx-1]['close'])
-                            if prev_c < lvl and h >= lvl + (2.0 * pv): signals.append({'type': 'BUY', 'lvl': lvl, 'star': is_star, 'combo': combo_key})
+                    if l <= lvl + (margin_pts * pv) and h >= lvl: signals.append({'type': 'BUY', 'lvl': lvl, 'combo': combo_key})
 
-                for lvl in s_list:
+                for lvl in sell_strong:
                     combo_key = f"{lvl}_{tf}"
                     if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
-                    is_star = '⭐' if lvl in sell_strong else ''
-                    if bot_state['gann_entry_mode'] == 'touch':
-                        if h >= lvl - (margin_pts * pv) and l <= lvl: signals.append({'type': 'SELL', 'lvl': lvl, 'star': is_star, 'combo': combo_key})
-                    else:
-                        if tf_idx > 0:
-                            prev_c = float(df_tf.iloc[tf_idx-1]['close'])
-                            if prev_c > lvl and l <= lvl - (2.0 * pv): signals.append({'type': 'SELL', 'lvl': lvl, 'star': is_star, 'combo': combo_key})
+                    if h >= lvl - (margin_pts * pv) and l <= lvl: signals.append({'type': 'SELL', 'lvl': lvl, 'combo': combo_key})
 
                 for sig in signals:
                     is_buy = (sig['type'] == 'BUY')
@@ -579,8 +503,8 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         fh = float(row['high']); fl = float(row['low'])
                         if bot_state['use_be'] and not be_activated:
                             if (is_buy and fh >= be_px_target) or (not is_buy and fl <= be_px_target):
-                                be_activated = True
-                                sl_px = entry_px 
+                                be_activated = True; sl_px = entry_px 
+                        
                         if is_buy:
                             if fl <= sl_px: outcome = 'BREAK-EVEN' if be_activated else 'LOSS'; p_usd = 0.0 if be_activated else -round(sl_d * lot * 100, 2); break
                             if fh >= tp_px: outcome = 'WIN';  p_usd = round(tp_d * lot * 100, 2); break
@@ -603,25 +527,22 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         'دورة H1 (DAM)': cycle_dam_str,
                         'وقت الصفقة (DAM)': _utc_to_dam(bar_t).strftime('%Y-%m-%d %H:%M'),
                         'TF': tf,
-                        'اتجاه': f"{sig['type']} {'📈' if is_buy else '📉'}",
+                        'اتجاه': f"{sig['type']}",
                         'إغلاق H1': h1_close,
                         'المستوى': sig['lvl'],
-                        'قوي ⭐': sig['star'],
                         'TP (نقطة)': tp_pts_user, 'SL (نقطة)': sl_pts_user,
-                        'النتيجة': f"✅ WIN" if outcome=='WIN' else (f"❌ LOSS" if outcome=='LOSS' else "🔒 BE"),
-                        'ربح ($)': p_usd,
-                        'رصيد تراكمي ($)': round(res['total_prof'], 2)
+                        'النتيجة': outcome,
+                        'ربح ($)': p_usd
                     })
                     
         cycles_log.append({
             'الدورة (DAM)': cycle_dam_str,
-            'حالة الترند': trend_status,
             'عدد الصفقات': trades_in_this_cycle,
             'ملاحظة': 'لم يلمس السعر أي مستوى!' if trades_in_this_cycle == 0 else f'تم تنفيذ {trades_in_this_cycle} صفقة'
         })
         await prog.tick(cycle_n + 1, res['win'], res['loss'], res['be'], res['total_prof'])
 
-    await prog.set_phase('إنشاء ملف Excel...')
+    await prog.set_phase('إنشاء ملف Excel الملون...')
     fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx"
     
     df_trades = pd.DataFrame(trade_logs)
@@ -633,8 +554,8 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         df_trades.to_excel(writer, sheet_name='الصفقات', index=False)
         pd.DataFrame(cycles_log).to_excel(writer, sheet_name='دورات H1', index=False)
         
-        ws_trades = writer.sheets['الصفقات']
         if not df_trades.empty:
+            ws_trades = writer.sheets['الصفقات']
             cycle_col_idx = list(df_trades.columns).index('دورة H1 (DAM)') + 1
             for row in ws_trades.iter_rows(min_row=2):
                 c_val = row[cycle_col_idx-1].value
@@ -649,27 +570,14 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                 fill = PatternFill(start_color=cycle_color_map[c_val].replace('#',''), fill_type='solid')
                 for cell in row: cell.fill = fill
 
-    total_trades = res['win'] + res['loss'] + res['be']
-    wr = round(res['win'] / max(1, res['win']+res['loss']) * 100, 1) if (res['win']+res['loss']) > 0 else 0
-    dd_pct = round(res['max_dd'] / max(1, res['peak_equity']) * 100, 1) if res['peak_equity'] > 0 else 0
-    
-    tg_lines = [
-        '<b>باكتيست جان اكتمل ✅</b>', desc, f"{_fmt_dam(start_dt).split()[0]} → {_fmt_dam(end_dt).split()[0]}",
-        '',
-        f'Net: <b>{"PROFIT ▲" if res["total_prof"]>=0 else "LOSS ▼"} ${round(res["total_prof"], 2)}</b>',
-        f'Win:  {res["win"]} | Loss: {res["loss"]} | BE: {res["be"]}',
-        f'WR: {wr}% ({total_trades} صفقة)', f'Max DD: ${round(res["max_dd"],2)} ({dd_pct}%)',
-        '',
-        'إرسال ملف Excel الملون...'
-    ]
-    await prog.done('\n'.join(tg_lines))
-    await send_tg_document(fname, 'نتائج الباكتيست (ملون ومفرز)')
+    await prog.done(f'باكتيست اكتمل ✅\nالربح: ${res["total_prof"]}')
+    await send_tg_document(fname, 'نتائج الباكتيست (مفرز وملون)')
     try: os.remove(fname)
     except: pass
     bot_state['is_backtesting'] = False
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM UPDATES HANDLER
+# TELEGRAM COMMANDS & CALLBACKS
 # ─────────────────────────────────────────────────────────────
 async def process_tg_update(update: dict) -> None:
     if 'message' in update and 'text' in update['message']:
@@ -681,122 +589,80 @@ async def process_tg_update(update: dict) -> None:
             return
 
         if msg == '/start':
-            await send_tg_msg('<b>Gold Scalper Bot v5.4</b>\nمحرك مستويات جان + فلاتر الاتجاه المتقدمة\n\nأرسل /set لضبط النقاط، أو استخدم القائمة بالأسفل:')
-            await send_tg_msg('Main Menu:', get_main_keyboard())
+            await send_tg_msg('<b>Gold Scalper Bot v5.4</b>', get_main_keyboard())
 
+        # التحكم اليدوي السريع في الإعدادات عبر الرسائل (كما طلبت)
         elif msg.lower().startswith('/set'):
             parts = msg.strip().lower().split()
+            # حماية الأرباح /set be 30
             if len(parts) == 3 and parts[1] == 'be':
-                try:
-                    v = int(parts[2])
-                    if v >= 1: 
-                        bot_state['be_pips'] = v
-                        await send_tg_msg(f'✅ تم تعيين نقطة التعادل (BE) إلى: {v} نقطة.')
+                try: bot_state['be_pips'] = int(parts[2]); await send_tg_msg(f'✅ تم تعديل الـ BE إلى {parts[2]} نقطة.')
                 except ValueError: pass
                 return
-            
+            # أوامر الهدف والوقف /set 1m sl 100
             if len(parts) == 4:
                 _, tf, key, val = parts
                 if tf in _TFS and key in ('tp', 'sl'):
-                    try:
-                        v = int(val)
-                        if v >= 1:
-                            bot_state[f'{key}_pips'][tf] = v
-                            await send_tg_msg(f'✅ [{tf}]: {key.upper()}={v}p')
+                    try: bot_state[f'{key}_pips'][tf] = int(val); await send_tg_msg(f'✅ تم تحديث [{tf}]: {key.upper()} = {val}')
                     except ValueError: pass
                 return
-            await send_tg_msg('❌ خطأ.\nالصيغة المدعومة:\n/set TF tp VALUE\n/set TF sl VALUE\n/set be VALUE')
 
+        # أمر الباكتيست حسب التاريخ
         elif msg.lower().startswith('/backtest'):
             parts = msg.strip().split()
             try:
                 if len(parts) == 2:
+                    # يوم واحد
                     start_dt = _dam_to_utc(f"{parts[1]} 00:00")
                     end_dt = start_dt + timedelta(days=1)
                 elif len(parts) >= 3:
-                    date1 = _dam_to_utc(f"{parts[1]} 00:00")
-                    date2 = _dam_to_utc(f"{parts[2]} 00:00")
-                    start_dt = min(date1, date2)
-                    end_dt = max(date1, date2) + timedelta(days=1)
-                else:
-                    await send_tg_msg('الاستخدام:\n/backtest YYYY-MM-DD\n/backtest 2026-06-24 2026-06-26')
-                    return
+                    # عدة أيام
+                    d1 = _dam_to_utc(f"{parts[1]} 00:00"); d2 = _dam_to_utc(f"{parts[2]} 00:00")
+                    start_dt = min(d1, d2); end_dt = max(d1, d2) + timedelta(days=1)
+                else: return
                 
-                if bot_state['is_backtesting']: await send_tg_msg('يوجد باكتيست يعمل حالياً.')
-                else: asyncio.create_task(run_gann_backtest_dates(start_dt, end_dt))
-            except Exception as e: await send_tg_msg(f'❌ خطأ في التاريخ: {e}\nالصيغة المطلوبة: YYYY-MM-DD')
-
-        elif msg == '/cancel_bt':
-            global _bt_progress
-            if _bt_progress and bot_state['is_backtesting']: await _bt_progress.cancel(); await send_tg_msg('إرسال إشارة الإيقاف...')
-            else: await send_tg_msg('لا يوجد باكتيست يعمل.')
+                if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest_dates(start_dt, end_dt))
+            except Exception: pass
             
         elif msg == '/restart_sessions':
             global _http, _poll_task
             if _poll_task and not _poll_task.done(): _poll_task.cancel()
             if _http and not _http.closed: await _http.close()
             _http = None; get_http()
-            await send_tg_msg('✅ تم تجديد الجلسات.')
+            await send_tg_msg('✅ تم التجديد.')
         return
 
     if 'callback_query' not in update: return
     q = update['callback_query']; d = q['data']; chat_id = q['message']['chat']['id']; msg_id = q['message']['message_id']
     bot_state['chat_id'] = chat_id
     try: await _handle_callback(d, chat_id, msg_id)
-    except Exception as e: c_log(f'CB error [{d}]: {e}')
+    except Exception as e: c_log(f'CB error: {e}')
     finally: await answer_callback(q['id'])
 
 async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     if d == 'noop': pass
     elif d == 'menu_main': await _show(chat_id, msg_id, 'Main Menu:', get_main_keyboard())
-    elif d == 'menu_strategy': await _show(chat_id, msg_id, 'إعدادات جان والاتجاه:', get_strategy_keyboard())
-    elif d == 'menu_risk': await _show(chat_id, msg_id, 'إدارة المخاطر والـ BE:', get_risk_keyboard())
+    elif d == 'menu_strategy': await _show(chat_id, msg_id, 'إعدادات الاستراتيجية:', get_strategy_keyboard())
+    elif d == 'menu_risk': await _show(chat_id, msg_id, 'المخاطر:', get_risk_keyboard())
     elif d == 'menu_tfs': await _show(chat_id, msg_id, 'الفريمات النشطة:', get_tf_keyboard())
-    elif d == 'menu_backtest': await _show(chat_id, msg_id, 'تشغيل باكتيست سريع:', get_backtest_keyboard())
-    elif d == 'hide_keyboard':
-        bot_state['menu_button_map'] = {}
-        await _show(chat_id, msg_id, 'تم إخفاء اللوحة.', {'remove_keyboard': True})
+    elif d == 'menu_backtest': await _show(chat_id, msg_id, 'الباكتيست:', get_backtest_keyboard())
+    elif d == 'hide_keyboard': bot_state['menu_button_map'] = {}; await _show(chat_id, msg_id, 'مخفية.', {'remove_keyboard': True})
 
-    elif d == 'cycle_zone_filter': bot_state['gann_zone_filter'] = 'all' if bot_state['gann_zone_filter'] == 'star' else 'star'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
-    elif d == 'cycle_entry_mode': bot_state['gann_entry_mode'] = 'breakout' if bot_state['gann_entry_mode'] == 'touch' else 'touch'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
-    elif d == 'inc_margin': bot_state['gann_touch_margin_pts'] += 1.0; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
-    elif d == 'dec_margin': bot_state['gann_touch_margin_pts'] = max(0.0, bot_state['gann_touch_margin_pts'] - 1.0); await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
+    # أزرار الاستراتيجية (Anti-Spam وحماية الاتجاه)
     elif d == 'toggle_spam': bot_state['gann_anti_spam'] = not bot_state['gann_anti_spam']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'toggle_trend': bot_state['use_trend_filter'] = not bot_state['use_trend_filter']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'cycle_trend_type': bot_state['trend_filter_type'] = 'EMA_CROSS' if bot_state['trend_filter_type'] == 'EMA_200' else 'EMA_200'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
-    elif d == 'toggle_danger': bot_state['use_danger_filter'] = not bot_state['use_danger_filter']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
 
+    # أزرار المخاطر (الـ BE)
     elif d == 'toggle_be': bot_state['use_be'] = not bot_state['use_be']; await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
-    elif d == 'toggle_spread': bot_state['use_max_spread'] = not bot_state['use_max_spread']; await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
-    elif d == 'inc_lot': bot_state['lot_size'] = round(bot_state['lot_size'] + 0.01, 2); await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
-    elif d == 'dec_lot': bot_state['lot_size'] = max(0.01, round(bot_state['lot_size'] - 0.01, 2)); await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
-    elif d == 'view_tpsl': await _show(chat_id, msg_id, 'تعديل TP/SL:', get_tpsl_overview_keyboard())
+    elif d == 'view_tpsl': await _show(chat_id, msg_id, 'TP/SL:', get_tpsl_overview_keyboard())
 
+    # الفريمات
     elif d.startswith('toggle_tf_'):
         tf = d[len('toggle_tf_'):]
         if tf in bot_state['active_tfs']: bot_state['active_tfs'][tf] = not bot_state['active_tfs'][tf]
         await _show(chat_id, msg_id, 'الفريمات:', get_tf_keyboard())
 
-    elif d.startswith('tpsl_edit_'):
-        tf = d[len('tpsl_edit_'):]
-        if tf in _TFS: await _show(chat_id, msg_id, f'Edit [{tf}]:', get_tpsl_edit_keyboard(tf))
-    elif any(d.startswith(p) for p in ('inc_tp10_','dec_tp10_')):
-        tf = d.split('_')[2]; st = 10; dr = 'i' if 'inc' in d else 'd'
-        if tf in _TFS: bot_state['tp_pips'][tf] = bot_state['tp_pips'][tf] + st if dr == 'i' else max(5, bot_state['tp_pips'][tf] - st); await _show(chat_id, msg_id, f'Edit [{tf}]:', get_tpsl_edit_keyboard(tf))
-    elif any(d.startswith(p) for p in ('inc_sl10_','dec_sl10_')):
-        tf = d.split('_')[2]; st = 10; dr = 'i' if 'inc' in d else 'd'
-        if tf in _TFS: bot_state['sl_pips'][tf] = bot_state['sl_pips'][tf] + st if dr == 'i' else max(5, bot_state['sl_pips'][tf] - st); await _show(chat_id, msg_id, f'Edit [{tf}]:', get_tpsl_edit_keyboard(tf))
-
-    elif d.startswith('bto_'):
-        if bot_state['is_backtesting']: await _show(chat_id, msg_id, 'يعمل مسبقاً', get_backtest_keyboard())
-        else:
-            days = int(d.split('_')[1])
-            now_dam = _now_dam()
-            end_dt = _dam_to_utc(datetime(now_dam.year, now_dam.month, now_dam.day))
-            start_dt = end_dt - timedelta(days=max(0, days))
-            if days == 0: end_dt = end_dt + timedelta(days=1)
-            asyncio.create_task(run_gann_backtest_dates(start_dt, end_dt))
-            await edit_tg_msg(chat_id, msg_id, f'⏳ بدء باكتيست...\n{_fmt_dam(start_dt).split()[0]}', get_backtest_keyboard())
     elif d == 'cancel_bt':
         global _bt_progress
         if _bt_progress: await _bt_progress.cancel(); await _show(chat_id, msg_id, 'جاري الإيقاف...', get_main_keyboard())
@@ -821,20 +687,13 @@ async def telegram_polling_loop() -> None:
                             backoff = 1; bot_state['last_poll_ok'] = datetime.now(timezone.utc).timestamp()
                             data = await resp.json()
                             for upd in data.get('result', []):
-                                bot_state['last_update_id'] = upd['update_id']; asyncio.create_task(_safe_process(upd))
-                        elif resp.status == 429:
-                            retry = int(resp.headers.get('Retry-After', 5)); await asyncio.sleep(retry)
+                                bot_state['last_update_id'] = upd['update_id']; asyncio.create_task(process_tg_update(upd))
                         else: await asyncio.sleep(backoff); backoff = min(backoff * 2, 30)
                 except asyncio.CancelledError: raise
-                except (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError): await asyncio.sleep(0.5); continue
                 except Exception: await asyncio.sleep(backoff); backoff = min(backoff * 2, 30); break
         except asyncio.CancelledError: await sess.close(); raise
         finally: await sess.close()
         await asyncio.sleep(1)
-
-async def _safe_process(upd: dict) -> None:
-    try: await process_tg_update(upd)
-    except Exception as e: c_log(f'Update error: {e}')
 
 async def telegram_watchdog() -> None:
     global _poll_task
