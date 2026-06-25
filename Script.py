@@ -901,7 +901,7 @@ async def run_gann_backtest(days: int, start_dt: datetime = None, end_dt: dateti
     enabled_tfs = [tf for tf, on in bot_state['gann_monitor_tfs'].items() if on] or ['5m']
     tfs_label   = '+'.join(enabled_tfs)
     desc     = f"جان H1→[{tfs_label}] | {bot_state['gann_entry_mode']} | {'⭐' if bot_state['gann_zone_filter']=='star' else 'كل المستويات'}"
-    prog     = BtProgress(label=desc, active_tfs=['H1']); _bt_progress = prog
+    prog     = BtProgress(label=desc); _bt_progress = prog
     await prog.start(bot_state['chat_id'])
 
     res = {'win': 0, 'loss': 0, 'be': 0,
@@ -1188,8 +1188,15 @@ async def run_gann_backtest(days: int, start_dt: datetime = None, end_dt: dateti
         except Exception: pass
 
     except Exception as e:
-        await prog.done(f'❌ خطأ في باكتيست جان: {e}')
-        c_log(f'Gann backtest error: {e}')
+        import traceback
+        tb = traceback.format_exc()
+        c_log(f'Gann backtest error:\n{tb}')
+        msg = f'❌ خطأ في باكتيست جان:\n<code>{type(e).__name__}: {e}</code>'
+        if _bt_progress:
+            try: await _bt_progress.done(msg)
+            except Exception: await send_tg_msg(msg)
+        else:
+            await send_tg_msg(msg)
     finally:
         bot_state['is_backtesting'] = False; _bt_progress = None
 
