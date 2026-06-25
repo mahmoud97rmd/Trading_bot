@@ -123,11 +123,15 @@ bot_state: dict = {
     'gann_atr_tp_mult': 2.5,
 
     # ── Trend filter ──
-    'gann_trend_filter': 'off',    # 'off' | 'ema200' | 'ema_dual'
-    'gann_trend_tf':     '60m',    # TF used to compute EMA
+    'gann_trend_filter': 'off',
+    'gann_trend_tf':     '60m',
     'gann_ema_single':   200,
     'gann_ema_fast':     50,
     'gann_ema_slow':     150,
+    # فلتر اتجاه الدخول: حصر شراء عند الدعوم وبيع عند المقاومات فقط
+    'gann_dir_filter':   False,
+    # مستويات مروحة جان الإضافية (3× و8×)
+    'gann_use_fan':      True,
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -267,10 +271,23 @@ def _fmt_utc(t) -> str:
 # DERIV WEBSOCKET FETCHER (OANDA)
 # ─────────────────────────────────────────────────────────────
 _OANDA_GRAN = {
-    '1m': 'M1',  '2m': 'M2',  '3m': 'M3',  '4m': 'M4', '5m': 'M5',  '6m': 'M6',  '8m': 'M8',  '10m': 'M10',
-    '12m': 'M12','15m': 'M15','20m': 'M20','30m': 'M30', '45m': 'M45','48m': 'M30',  
-    '1h': 'H1',  '2h': 'H2',  '3h': 'H3',  '4h': 'H4', '6h': 'H6',  '8h': 'H8',  '12h': 'H12','1d': 'D', '90m': 'H1',   
+    # دقيقية مدعومة مباشرة
+    '1m': 'M1', '2m': 'M2', '4m': 'M4', '5m': 'M5', '10m': 'M10',
+    '15m': 'M15', '30m': 'M30',
+    # دقيقية غير مدعومة → أقرب مدعوم
+    '3m': 'M4',   # M3 غير مدعوم → M4
+    '6m': 'M5',   # M6 غير مدعوم → M5
+    '8m': 'M10',  # M8 غير مدعوم → M10
+    '12m': 'M15', # M12 غير مدعوم → M15
+    '20m': 'M15', # M20 غير مدعوم → M15
+    '45m': 'M30', '48m': 'M30',
+    # ساعية
+    '1h': 'H1', '60m': 'H1', '90m': 'H1', '2h': 'H2', '120m': 'H2',
+    '3h': 'H3', '4h': 'H4', '6h': 'H6', '8h': 'H8', '12h': 'H12',
+    '1d': 'D',
 }
+# الفريمات التي تعود لأقرب بديل مدعوم (للإعلام في الباكتيست)
+_OANDA_REMAP = {'3m': '4m', '6m': '5m', '8m': '10m', '12m': '15m', '20m': '15m', '45m': '30m'}
 _oanda_sem: asyncio.Semaphore | None = None
 def _get_oanda_sem() -> asyncio.Semaphore:
     global _oanda_sem
@@ -288,12 +305,14 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
     async with sem:
         while remaining > 0:
             chunk = min(remaining, 5000)
-            params = {'granularity': gran_str, 'count': chunk, 'to': current_end.strftime('%Y-%m-%dT%H:%M:%S.000000000Z'), 'price': 'M'}
+            params = {'granularity': gran_str, 'count': chunk, 'to': current_end.strftime('%Y-%m-%dT%H:%M:%S.000000000Z'), 'price': 'B'}
             candles = []
             for attempt in range(3):
                 try:
                     async with get_http().get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                        if resp.status != 200: break
+                        if resp.status != 200:
+                            err = await resp.text()
+                            c_log(f'OANDA {resp.status} {gran_str}: {err[:120]}'); break
                         data = await resp.json(); candles = data.get('candles', []); break
                 except Exception: await asyncio.sleep(1)
 
@@ -301,7 +320,10 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
             complete = [c for c in candles if c.get('complete', True)]
             if not complete: break
 
-            formatted = [{'time': pd.Timestamp(c['time']).tz_convert('UTC'), 'open': float(c['mid']['o']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l']), 'close': float(c['mid']['c'])} for c in complete]
+            price_field = 'bid' if 'bid' in complete[0] else 'mid'
+            formatted = [{'time': pd.Timestamp(c['time']).tz_convert('UTC'),
+                          'open':  float(c[price_field]['o']), 'high':  float(c[price_field]['h']),
+                          'low':   float(c[price_field]['l']), 'close': float(c[price_field]['c'])} for c in complete]
             collected = formatted + collected; remaining -= len(complete)
             earliest = pd.Timestamp(complete[0]['time']).tz_convert('UTC')
             current_end = earliest.to_pydatetime() - timedelta(seconds=1)
@@ -314,47 +336,57 @@ fetch_candles = fetch_oanda_candles
 # ─────────────────────────────────────────────────────────────
 # GANN LEVELS ENGINE  (replaces TEMA/MTF strategy engine)
 # ─────────────────────────────────────────────────────────────
-GANN_ACOEF  = [0.0208, 0.0417, 0.0625, 0.0833, 0.125, 0.25, 0.333, 0.5, 1, 2, 4]
-GANN_AIMP   = [False,  False,  False,  True,   False, False, False, True, True, False, False]
-GANN_TFC_H1 = 0.02   # نفس معامل الفريم الساعي من حاسبة index.html (TFC['H1'])
+GANN_ACOEF      = [0.0208, 0.0417, 0.0625, 0.0833, 0.125, 0.25, 0.333, 0.5, 1, 2, 4]
+GANN_AIMP       = [False,  False,  False,  True,   False, False, False, True, True, False, False]
+GANN_FAN_EXTRA  = [3, 8]   # نسب مروحة جان الإضافية (3× و8×) — ⭐ تلقائياً
+GANN_TFC_H1     = 0.02
 
 def gann_calc_levels(close: float) -> list[dict]:
-    """يولّد سلّم الدعوم/المقاومات حول إغلاق H1 — منفذ مباشر لمعادلة index.html (ACOEF × TFC)."""
     levels = []
     for i, coef in enumerate(GANN_ACOEF):
         offset = close * coef * GANN_TFC_H1
-        up = round(close + offset, 2)
-        dn = round(close - offset, 2)
+        up = round(close + offset, 2); dn = round(close - offset, 2)
         star = GANN_AIMP[i]
-        levels.append({'key': f'up_{i}', 'price': up, 'dir': 'up', 'star': star})
+        levels.append({'key': f'up_{i}', 'price': up, 'dir': 'up', 'star': star, 'fan': False})
         if dn > 0:
-            levels.append({'key': f'dn_{i}', 'price': dn, 'dir': 'dn', 'star': star})
-    levels.append({'key': 'ref', 'price': round(close, 2), 'dir': 'ref', 'star': False})
+            levels.append({'key': f'dn_{i}', 'price': dn, 'dir': 'dn', 'star': star, 'fan': False})
+    if bot_state.get('gann_use_fan', True):
+        for j, coef in enumerate(GANN_FAN_EXTRA):
+            offset = close * coef * GANN_TFC_H1
+            up = round(close + offset, 2); dn = round(close - offset, 2)
+            levels.append({'key': f'fan_up_{j}', 'price': up, 'dir': 'up', 'star': True, 'fan': True})
+            if dn > 0:
+                levels.append({'key': f'fan_dn_{j}', 'price': dn, 'dir': 'dn', 'star': True, 'fan': True})
+    levels.append({'key': 'ref', 'price': round(close, 2), 'dir': 'ref', 'star': False, 'fan': False})
     levels.sort(key=lambda x: x['price'], reverse=True)
     return levels
 
 def gann_active_levels() -> list[dict]:
-    """يرجع المستويات القابلة للتداول حسب فلتر القوة الحالي (⭐ فقط أو الكل)، بدون خط الإغلاق المرجعي."""
     lv = [l for l in bot_state['gann_levels'] if l['dir'] != 'ref']
     if bot_state['gann_zone_filter'] == 'star':
         return [l for l in lv if l['star']]
     return lv
 
-def _gann_fmt_levels_msg(close: float) -> str:
+def _gann_fmt_levels_msg(close: float, h1_time=None) -> str:
     lines = []
+    dam_time = _utc_to_dam(h1_time).strftime('%Y-%m-%d %H:%M') if h1_time else '—'
     for l in bot_state['gann_levels']:
         if l['dir'] == 'ref':
-            lines.append(f"➖ <b>{l['price']:.2f}</b>  (إغلاق H1)")
+            lines.append(f"➖ <b>{l['price']:.2f}</b>  (إغلاق H1 — {dam_time} DAM)")
             continue
         role = 'مقاومة' if l['dir'] == 'up' else 'دعم'
         star = ' ⭐' if l['star'] else ''
+        fan  = ' 🌀' if l.get('fan') else ''
         icon = '🔴' if l['dir'] == 'up' else '🟢'
-        lines.append(f"{icon} {l['price']:.2f}  {role}{star}")
+        lines.append(f"{icon} {l['price']:.2f}  {role}{star}{fan}")
     filt = '⭐ القوية فقط' if bot_state['gann_zone_filter'] == 'star' else 'كل المستويات'
-    mode = 'لمس (ارتداد)' if bot_state['gann_entry_mode'] == 'touch' else 'كسر + ريتيست (استمرار)'
-    return (f"📐 <b>سلّم جان — دورة جديدة</b>\n"
-            f"إغلاق H1: <b>{close:.2f}</b>\n"
-            f"مدة المراقبة: {bot_state['gann_cycle_hours']}س  |  فلتر: {filt}  |  وضع الدخول: {mode}\n\n"
+    mode = 'لمس (ارتداد)' if bot_state['gann_entry_mode'] == 'touch' else 'كسر + ريتيست'
+    fan_lbl = '✅ مروحة جان مُدمجة' if bot_state.get('gann_use_fan') else '⬜ بدون مروحة'
+    dir_lbl = '✅ حصر الاتجاه (دعم=شراء / مقاومة=بيع)' if bot_state.get('gann_dir_filter') else '⬜ اتجاه مفتوح'
+    return (f"📐 <b>سلّم جان — إغلاق H1: {close:.2f}</b>\n"
+            f"⏰ {dam_time} DAM\n"
+            f"مراقبة: {bot_state['gann_cycle_hours']}س  |  فلتر: {filt}  |  {mode}\n"
+            f"{fan_lbl}  |  {dir_lbl}\n\n"
             + '\n'.join(lines))
 
 async def _gann_fetch_last_closed_h1() -> dict | None:
@@ -410,7 +442,7 @@ async def gann_cycle_manager() -> None:
                 bot_state['gann_cycle_end_flag']    = None
                 bot_state['gann_level_status']     = {}
                 bot_state['gann_open_trades']       = {}
-                await send_tg_msg(_gann_fmt_levels_msg(h1_close))
+                await send_tg_msg(_gann_fmt_levels_msg(h1_close, h1_time=h1_time))
 
         except Exception as e:
             c_log(f'Gann cycle manager error: {e}')
@@ -524,13 +556,15 @@ async def gann_monitor_scanner() -> None:
 
                 if bot_state['gann_entry_mode'] == 'touch':
                     for lv in levels:
-                        # Anti-spam: True → блок на уровне, False → блок на уровне+TF
                         used_key = lv['key'] if bot_state['gann_anti_spam'] else f"{lv['key']}_{tf}"
-                        if bot_state['gann_level_status'].get(lv['key']) == 'used' and bot_state['gann_anti_spam']: continue
+                        if bot_state['gann_anti_spam'] and bot_state['gann_level_status'].get(lv['key']) == 'used': continue
                         if not bot_state['gann_anti_spam'] and bot_state['gann_level_status'].get(used_key) == 'used': continue
                         if abs(live_px - lv['price']) > margin: continue
                         is_buy = (lv['dir'] == 'dn')
-                        # فلتر الاتجاه
+                        # فلتر الاتجاه المقيّد
+                        if bot_state.get('gann_dir_filter'):
+                            if lv['dir'] == 'up' and is_buy: continue    # مقاومة → بيع فقط
+                            if lv['dir'] == 'dn' and not is_buy: continue # دعم → شراء فقط
                         if trend_dir == 'bull' and not is_buy: continue
                         if trend_dir == 'bear' and is_buy: continue
                         await _gann_open_trade(is_buy, lv, candles,
@@ -806,9 +840,13 @@ def get_gann_keyboard() -> dict:
     ap  = bot_state['gann_atr_period']
     spam_lbl  = '🔇 Anti-Spam: ON (مستوى واحد لكل TF)' if bot_state['gann_anti_spam'] else '🔊 Anti-Spam: OFF (عدة TF على نفس المستوى)'
     trend_lbl = {'off':'🔍 فلتر الاتجاه: OFF','ema200':f'🔍 EMA {bot_state["gann_ema_single"]}','ema_dual':f'🔍 EMA {bot_state["gann_ema_fast"]}/{bot_state["gann_ema_slow"]}'}[bot_state['gann_trend_filter']]
+    dir_lbl  = '🎯 حصر الاتجاه: ON (دعم=شراء / مقاومة=بيع)' if bot_state.get('gann_dir_filter') else '🎯 حصر الاتجاه: OFF (مفتوح)'
+    fan_lbl  = '🌀 مستويات المروحة: ON' if bot_state.get('gann_use_fan') else '🌀 مستويات المروحة: OFF'
     rows = [
         [{'text': f'📐 محرك جان  — دورة: {cyc}  |  صفقات: {open_n}', 'callback_data': 'noop'}],
         [{'text': '🔄 عرض الدعوم والمقاومات الآن', 'callback_data': 'gann_show_levels'}],
+        [{'text': dir_lbl, 'callback_data': 'gann_toggle_dir'}],
+        [{'text': fan_lbl, 'callback_data': 'gann_toggle_fan'}],
         [{'text': spam_lbl, 'callback_data': 'gann_toggle_spam'}],
         [{'text': trend_lbl, 'callback_data': 'menu_trend_filter'}],
         [{'text': '── الفلتر ──', 'callback_data': 'noop'}],
@@ -1568,6 +1606,15 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d == 'trend_inc_sl': bot_state['gann_ema_slow']   = min(500,bot_state['gann_ema_slow']+5);   await _show(chat_id, msg_id, '🔍 فلتر الاتجاه:', get_trend_filter_keyboard())
 
     # ── Anti-spam ──
+    elif d == 'gann_toggle_dir':
+        bot_state['gann_dir_filter'] = not bot_state.get('gann_dir_filter', False)
+        await _show(chat_id, msg_id, '📐 محرك جان — الإعدادات:', get_gann_keyboard())
+    elif d == 'gann_toggle_fan':
+        bot_state['gann_use_fan'] = not bot_state.get('gann_use_fan', True)
+        # أعد توليد السلّم إذا كانت هناك دورة نشطة
+        if bot_state['gann_cycle_active'] and bot_state['gann_close_used']:
+            bot_state['gann_levels'] = gann_calc_levels(bot_state['gann_close_used'])
+        await _show(chat_id, msg_id, '📐 محرك جان — الإعدادات:', get_gann_keyboard())
     elif d == 'gann_toggle_spam':
         bot_state['gann_anti_spam'] = not bot_state['gann_anti_spam']
         await _show(chat_id, msg_id, '📐 محرك جان — الإعدادات:', get_gann_keyboard())
@@ -1657,6 +1704,20 @@ _poll_task: asyncio.Task | None = None
 async def telegram_polling_loop() -> None:
     c_log('Telegram polling started.'); url = f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates'
     backoff = 1
+
+    # ── تصفية التحديثات القديمة عند الإقلاع (تمنع cancel_bt القديم من التنفيذ) ──
+    try:
+        drain_timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        async with aiohttp.ClientSession(timeout=drain_timeout) as drain_sess:
+            async with drain_sess.get(url, params={'offset': -1, 'timeout': 0}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for upd in data.get('result', []):
+                        bot_state['last_update_id'] = upd['update_id']
+                    c_log(f'Startup drain: skipped up to update_id={bot_state["last_update_id"]}')
+    except Exception as e:
+        c_log(f'Startup drain error (non-fatal): {e}')
+
     while True:
         # نفتح session جديدة في كل دورة — يمنع تراكم الاتصالات المعلّقة
         connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, force_close=True)
