@@ -1,4 +1,4 @@
-# Gold Scalper Bot — v6.1 (Universal Gann Engine + Full Strategy/Risk Restored)
+# Gold Scalper Bot — v6.2 (Exact Match: App Angles Screen Engine H1)
 import asyncio
 import aiohttp
 import os
@@ -16,7 +16,6 @@ METAAPI_TOKEN = os.environ.get('METAAPI_TOKEN', 'YOUR_METAAPI_TOKEN')
 ACCOUNT_ID    = os.environ.get('ACCOUNT_ID',    'YOUR_ACCOUNT_ID')
 TG_TOKEN      = os.environ.get('TG_TOKEN',      '8876071259:AAEfZ0Cw4zpMgUp35ob8CKeCnmySe4ALRq8')
 
-# OANDA REST API
 OANDA_ACCOUNT  = os.environ.get('OANDA_ACCOUNT', '101-004-28533521-003')
 OANDA_TOKEN    = os.environ.get('OANDA_TOKEN',   '0e282d5a3e65ad6fdd809e2c195bb1cd-9e2158e12fa13840e030ee3081b36fab')
 OANDA_SYMBOL   = 'XAU_USD'
@@ -54,17 +53,14 @@ bot_state: dict = {
     'timeframes':       _TFS,
     'active_tfs':       {tf: (True if tf in ['1m', '3m', '5m'] else False) for tf in _TFS},
     
-    # ── Gann Strategy (Restored) ──
     'gann_zone_filter':      'star',
     'gann_entry_mode':       'touch', 
     'gann_touch_margin_pts': 5.0,     
     'gann_anti_spam':        True,    
     
-    # ── Protection & Filters ──
     'use_trend_filter':  False,
     'trend_filter_type': 'EMA_200',
     
-    # ── Risk & Trailing (Restored) ──
     'use_be':            False,
     'be_pips':           20,
     'use_trailing':      False,
@@ -101,7 +97,6 @@ def _to_utc(x) -> pd.Timestamp:
 _to_ts = _to_utc
 DAM_OFF = timedelta(hours=3)
 
-def _now_dam() -> datetime: return datetime.now(timezone.utc) + DAM_OFF
 def _utc_to_dam(dt) -> datetime:
     if isinstance(dt, pd.Timestamp): dt = dt.to_pydatetime()
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
@@ -119,10 +114,7 @@ def _fmt_dam(t) -> str:
 # ─────────────────────────────────────────────────────────────
 # OANDA WEBSOCKET FETCHER
 # ─────────────────────────────────────────────────────────────
-_OANDA_GRAN = {
-    '1m': 'M1',  '2m': 'M2',  '3m': 'M3',  '4m': 'M4', '5m': 'M5',  '6m': 'M6',  '10m': 'M10',
-    '12m': 'M12','15m': 'M15','20m': 'M20','30m': 'M30', '1h': 'H1'
-}
+_OANDA_GRAN = {'1m': 'M1', '2m': 'M2', '3m': 'M3', '4m': 'M4', '5m': 'M5', '6m': 'M6', '10m': 'M10', '12m': 'M12', '15m': 'M15', '20m': 'M20', '30m': 'M30', '1h': 'H1'}
 _oanda_sem: asyncio.Semaphore | None = None
 def _get_oanda_sem() -> asyncio.Semaphore:
     global _oanda_sem
@@ -135,7 +127,6 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
     headers = {'Authorization': f'Bearer {OANDA_TOKEN}', 'Content-Type':  'application/json'}
     url = f'{OANDA_BASE_URL}/instruments/{OANDA_SYMBOL}/candles'
     current_end = end_time if end_time else datetime.now(timezone.utc)
-
     sem = _get_oanda_sem()
     async with sem:
         while remaining > 0:
@@ -148,11 +139,9 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
                         if resp.status != 200: break
                         data = await resp.json(); candles = data.get('candles', []); break
                 except Exception: await asyncio.sleep(1)
-
             if not candles: break
             complete = [c for c in candles if c.get('complete', True)]
             if not complete: break
-
             formatted = [{'time': pd.Timestamp(c['time']).tz_convert('UTC'), 'open': float(c['mid']['o']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l']), 'close': float(c['mid']['c'])} for c in complete]
             collected = formatted + collected; remaining -= len(complete)
             earliest = pd.Timestamp(complete[0]['time']).tz_convert('UTC')
@@ -162,41 +151,29 @@ async def fetch_oanda_candles(granularity_str: str, count: int = 5000, end_time:
     return collected
 
 # ─────────────────────────────────────────────────────────────
-# UNIVERSAL GANN MATH (OTC APP ENGINE)
+# EXACT APP MATH ENGINE (Angles Screen - H1)
 # ─────────────────────────────────────────────────────────────
-def get_gann_factor(price: float) -> float:
-    if price < 10: return 100000.0     
-    if price < 100: return 1000.0      
-    if price < 1000: return 100.0      
-    if price < 10000: return 10.0      
-    if price < 100000: return 1.0      
-    return 0.1
+# استخراج مباشر للمصفوفات من كود index.html
+GANN_ACOEF  = [0.0208, 0.0417, 0.0625, 0.0833, 0.125, 0.25, 0.333, 0.5, 1, 2, 4]
+GANN_AIMP   = [False,  False,  False,  True,   False, False, False, True, True, False, False]
+GANN_TFC_H1 = 0.02   # هذا هو معامل فريم الـ H1 الثابت في التطبيق
 
 def calculate_gann_levels_from_close(price: float, is_buy: bool) -> list:
-    f = get_gann_factor(price)
-    P = price * f
-    try:
-        sqrt_P = np.sqrt(P)
-        levels = []
-        for i in range(1, 17):
-            ratio = i * 0.125
-            lvl = ((sqrt_P + ratio) ** 2) / f if is_buy else ((sqrt_P - ratio) ** 2) / f
-            levels.append(round(lvl, 5))
-        return levels
-    except Exception: return []
+    levels = []
+    for i, coef in enumerate(GANN_ACOEF):
+        offset = price * coef * GANN_TFC_H1
+        lvl = price + offset if is_buy else price - offset
+        if lvl > 0: levels.append(round(lvl, 5))
+    return sorted(list(set(levels)))
 
 def determine_strong_gann_levels(price: float, is_buy: bool) -> list:
-    f = get_gann_factor(price)
-    P = price * f
-    try:
-        sqrt_P = np.sqrt(P)
-        strong_ratios = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-        strong = []
-        for ratio in strong_ratios:
-            lvl = ((sqrt_P + ratio) ** 2) / f if is_buy else ((sqrt_P - ratio) ** 2) / f
-            strong.append(round(lvl, 5))
-        return sorted(list(set(strong)))
-    except Exception: return []
+    strong = []
+    for i, coef in enumerate(GANN_ACOEF):
+        if GANN_AIMP[i]:
+            offset = price * coef * GANN_TFC_H1
+            lvl = price + offset if is_buy else price - offset
+            if lvl > 0: strong.append(round(lvl, 5))
+    return sorted(list(set(strong)))
 
 # ─────────────────────────────────────────────────────────────
 # BACKTEST PROGRESS TRACKER
@@ -213,7 +190,6 @@ class BtProgress:
         if total == 0: return chr(9617) * self.BAR_LEN
         filled = round(done / total * self.BAR_LEN)
         return chr(9608) * filled + chr(9617) * (self.BAR_LEN - filled)
-
     def _elapsed(self) -> str:
         secs = int(datetime.now(timezone.utc).timestamp() - self._start_ts); m, s = divmod(secs, 60); return f'{m}m {s:02d}s'
 
@@ -231,7 +207,6 @@ class BtProgress:
         return '\n'.join(lines)
 
     def _cancel_kbd(self) -> dict: return {'inline_keyboard': [[{'text': '⏹ Cancel', 'callback_data': 'cancel_bt'}]]}
-
     async def start(self, chat_id: int) -> None:
         self.chat_id = chat_id; self._start_ts = datetime.now(timezone.utc).timestamp(); self._last_edit = self._start_ts
         payload = {'chat_id': chat_id, 'text': self._build_text(), 'parse_mode': 'HTML', 'reply_markup': self._cancel_kbd()}
@@ -241,10 +216,8 @@ class BtProgress:
                     if resp.status == 200: self.msg_id = (await resp.json())['result']['message_id']
         except Exception: pass
         self._hb_task = asyncio.create_task(self._heartbeat())
-
     async def _heartbeat(self) -> None:
         while not self.cancelled: await asyncio.sleep(self.HEARTBEAT); await self._edit(force=True)
-
     async def _edit(self, force: bool = False) -> None:
         now = datetime.now(timezone.utc).timestamp()
         if not force and (now - self._last_edit) < 3: return
@@ -254,7 +227,6 @@ class BtProgress:
             if not self.cancelled: payload['reply_markup'] = self._cancel_kbd()
             try: await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/editMessageText', json=payload)
             except Exception: pass
-
     async def set_phase(self, phase: str) -> None: self.phase = phase; await self._edit()
     async def set_tf(self, tf: str, bars_total: int) -> None: self.current_tf = tf; self.bars_done = 0; self.bars_total = bars_total; self.phase = f'Scanning [{tf}]'; await self._edit(force=True)
     async def tick(self, bar_n: int, win: int, loss: int, be: int, profit: float) -> None: self.bars_done = bar_n; self.win = win; self.loss = loss; self.be = be; self.profit = profit; await self._edit()
@@ -264,21 +236,16 @@ class BtProgress:
         try: await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/editMessageText', json={'chat_id': self.chat_id, 'message_id': self.msg_id, 'text': final_text, 'parse_mode': 'HTML'})
         except Exception: pass
     async def cancel(self) -> None:
-        self.cancelled = True; self.phase = 'Cancelling...'
-        if self._hb_task: self._hb_task.cancel()
-        await self._edit(force=True)
-
-_bt_progress: BtProgress | None = None
+        self.cancelled = True; self.phase = 'Cancelling...'; if self._hb_task: self._hb_task.cancel(); await self._edit(force=True)
 
 # ─────────────────────────────────────────────────────────────
-# TELEGRAM HELPERS
+# TELEGRAM HELPERS & KEYBOARDS
 # ─────────────────────────────────────────────────────────────
 async def _tg_post(url: str, **kwargs) -> bool:
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True), timeout=aiohttp.ClientTimeout(total=12, connect=5)) as sess:
             async with sess.post(url, **kwargs) as resp: return resp.status == 200
     except Exception: return False
-
 def _to_reply_kbd(inline_kbd: dict):
     rows = []; bmap = {}
     for row in inline_kbd.get('inline_keyboard', []):
@@ -288,7 +255,6 @@ def _to_reply_kbd(inline_kbd: dict):
             new_row.append({'text': text}); bmap[text] = cb
         rows.append(new_row)
     return {'keyboard': rows, 'resize_keyboard': True, 'is_persistent': True, 'input_field_placeholder': 'اختر من القائمة...'}, bmap
-
 async def send_tg_msg(text: str, reply_markup: dict = None) -> None:
     if not bot_state['chat_id']: return
     if reply_markup and 'inline_keyboard' in reply_markup:
@@ -296,19 +262,15 @@ async def send_tg_msg(text: str, reply_markup: dict = None) -> None:
     payload = {'chat_id': bot_state['chat_id'], 'text': text, 'parse_mode': 'HTML'}
     if reply_markup: payload['reply_markup'] = reply_markup
     await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage', json=payload)
-
 async def edit_tg_msg(chat_id, message_id, text, reply_markup=None) -> None:
     payload = {'chat_id': chat_id, 'message_id': message_id, 'text': text, 'parse_mode': 'HTML'}
     if reply_markup: payload['reply_markup'] = reply_markup
     await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/editMessageText', json=payload)
-
 async def _show(chat_id, msg_id, text: str, reply_markup: dict = None) -> None:
     if msg_id: await edit_tg_msg(chat_id, msg_id, text, reply_markup)
     else: await send_tg_msg(text, reply_markup)
-
 async def answer_callback(cbq_id: str) -> None:
     await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery', json={'callback_query_id': cbq_id})
-
 async def send_tg_document(file_path: str, caption: str) -> None:
     if not bot_state['chat_id']: return
     try:
@@ -320,9 +282,6 @@ async def send_tg_document(file_path: str, caption: str) -> None:
             await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument', data=data)
     except Exception: pass
 
-# ─────────────────────────────────────────────────────────────
-# KEYBOARDS (RESTORED ENTRY, MARGIN, TRAILING)
-# ─────────────────────────────────────────────────────────────
 def get_main_keyboard() -> dict:
     st = '▶ يعمل' if bot_state['status'] == 'RUNNING' else '⏸ متوقف'
     bt = '⏳ فحص...' if bot_state['is_backtesting'] else '📊 باكتيست'
@@ -333,14 +292,12 @@ def get_main_keyboard() -> dict:
         [{'text': '⏱ الفريمات النشطة', 'callback_data': 'menu_tfs'}],
         [{'text': bt, 'callback_data': 'menu_backtest'}, {'text': '❌ إخفاء', 'callback_data': 'hide_keyboard'}],
     ]}
-
 def get_strategy_keyboard() -> dict:
     zf = 'كل المستويات' if bot_state['gann_zone_filter'] == 'all' else 'القوية فقط ⭐'
     em = 'ملامسة (Touch)' if bot_state['gann_entry_mode'] == 'touch' else 'اختراق وإعادة اختبار'
     spam_i = '✅' if bot_state['gann_anti_spam'] else '⬜'
     trnd_i = '✅' if bot_state['use_trend_filter'] else '⬜'
     t_type = '200 EMA' if bot_state['trend_filter_type'] == 'EMA_200' else '50/150 Cross'
-    
     return {'inline_keyboard': [
         [{'text': '── 📐 مستويات جان ──', 'callback_data': 'noop'}],
         [{'text': f'الفلترة: {zf} ↻', 'callback_data': 'cycle_zone_filter'}],
@@ -352,13 +309,9 @@ def get_strategy_keyboard() -> dict:
         [{'text': f'نوع الفلتر: {t_type} ↻', 'callback_data': 'cycle_trend_type'}],
         [{'text': '← رجوع للقائمة', 'callback_data': 'menu_main'}],
     ]}
-
 def get_risk_keyboard() -> dict:
-    be_i  = '✅' if bot_state['use_be'] else '⬜'
-    be_p  = bot_state['be_pips']
-    trl_i = '✅' if bot_state['use_trailing'] else '⬜'
-    trl_p = bot_state['trail_points']
-    
+    be_i  = '✅' if bot_state['use_be'] else '⬜'; be_p  = bot_state['be_pips']
+    trl_i = '✅' if bot_state['use_trailing'] else '⬜'; trl_p = bot_state['trail_points']
     return {'inline_keyboard': [
         [{'text': f'Trailing (تزحيل الحجز): {trl_i}', 'callback_data': 'toggle_trail'}],
         [{'text': '-10', 'callback_data': 'dec_trail'}, {'text': f'Trail Pts: {trl_p}p', 'callback_data': 'noop'}, {'text': '+10', 'callback_data': 'inc_trail'}],
@@ -367,7 +320,6 @@ def get_risk_keyboard() -> dict:
         [{'text': '📋 تعديل TP/SL للفريمات', 'callback_data': 'view_tpsl'}],
         [{'text': '← رجوع', 'callback_data': 'menu_main'}],
     ]}
-
 def get_tf_keyboard() -> dict:
     rows = [[{'text': 'حدد الفريمات المطلوبة:', 'callback_data': 'noop'}]]
     row_tfs = []
@@ -375,11 +327,9 @@ def get_tf_keyboard() -> dict:
         icon = '✅' if bot_state['active_tfs'][tf] else '⬜'
         row_tfs.append({'text': f'{icon} {tf}', 'callback_data': f'toggle_tf_{tf}'})
         if len(row_tfs) == 3 or i == len(bot_state['timeframes']) - 1:
-            rows.append(row_tfs)
-            row_tfs = []
+            rows.append(row_tfs); row_tfs = []
     rows.append([{'text': '← رجوع', 'callback_data': 'menu_main'}])
     return {'inline_keyboard': rows}
-
 def get_tpsl_overview_keyboard() -> dict:
     rows = [[{'text': 'السهولة: أرسل رسالة مثلاً: /set 1m tp 150', 'callback_data': 'noop'}]]
     for tf in bot_state['timeframes']:
@@ -388,7 +338,6 @@ def get_tpsl_overview_keyboard() -> dict:
             rows.append([{'text': f'{tf} | TP: {tp} | SL: {sl}', 'callback_data': f'noop'}])
     rows.append([{'text': '← رجوع', 'callback_data': 'menu_risk'}])
     return {'inline_keyboard': rows}
-
 def get_backtest_keyboard() -> dict:
     if bot_state['is_backtesting']: return {'inline_keyboard': [[{'text': 'الباكتيست يعمل...', 'callback_data': 'bt_show_progress'}], [{'text': '⏹ إيقاف', 'callback_data': 'cancel_bt'}]]}
     return {'inline_keyboard': [
@@ -399,7 +348,7 @@ def get_backtest_keyboard() -> dict:
     ]}
 
 # ─────────────────────────────────────────────────────────────
-# COLORED BACKTEST ENGINE (V6.1 RESTORED ENTRY + TRAILING LOGIC)
+# COLORED BACKTEST ENGINE
 # ─────────────────────────────────────────────────────────────
 async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
@@ -423,7 +372,6 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
         
         await prog.set_phase('حساب المؤشرات وفلاتر الاتجاه...')
         df_1m = pd.DataFrame(candles_1m).set_index('time')
-        
         df_1m = df_1m[~df_1m.index.duplicated(keep='first')].sort_index()
         df_1m.index = df_1m.index.tz_convert('UTC')
         
@@ -504,7 +452,6 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                     h = float(df_tf.iloc[tf_idx]['high']); l = float(df_tf.iloc[tf_idx]['low'])
                     
                     signals = []
-                    # استعادة منطق الدخول (Touch vs Breakout)
                     for lvl in buy_list:
                         combo_key = f"{lvl}_{tf}"
                         if bot_state['gann_anti_spam'] and combo_key in level_used_this_cycle: continue
@@ -538,19 +485,16 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         
                         tp_px = entry_px + (tp_pts_user * pv) if is_buy else entry_px - (tp_pts_user * pv)
                         sl_px = entry_px - (sl_pts_user * pv) if is_buy else entry_px + (sl_pts_user * pv)
-                        
                         be_px_target = entry_px + (bot_state['be_pips'] * pv) if is_buy else entry_px - (bot_state['be_pips'] * pv)
 
                         sim_df = df_1m[df_1m.index >= bar_t]
                         outcome = 'OPEN'; be_activated = False
-                        
                         win_val  = round(tp_pts_user * lot * 10, 2)
                         p_usd = 0.0
 
                         for _, row in sim_df.iterrows():
                             fh = float(row['high']); fl = float(row['low'])
                             
-                            # استعادة منطق الـ Trailing Stop بشكل سليم
                             if bot_state['use_trailing']:
                                 if is_buy:
                                     if fh - entry_px >= bot_state['trail_offset'] * pv:
@@ -611,6 +555,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                         
             cycles_log.append({
                 'الدورة (DAM)': cycle_dam_str,
+                'إغلاق H1': round(h1_close, 5),
                 'عدد الصفقات': trades_in_this_cycle,
                 'ملاحظة': 'لم يلمس السعر أي مستوى!' if trades_in_this_cycle == 0 else f'تم تنفيذ {trades_in_this_cycle} صفقة'
             })
@@ -676,8 +621,7 @@ async def run_gann_backtest_dates(start_dt: datetime, end_dt: datetime) -> None:
                 for col in range(1, len(headers) + 1):
                     cell = ws_trades.cell(row=current_row, column=col)
                     cell.alignment = Alignment(horizontal='center')
-                    if fill_color:
-                        cell.fill = fill_color
+                    if fill_color: cell.fill = fill_color
 
         for column_cells in ws_trades.columns:
             ws_trades.column_dimensions[column_cells[0].column_letter].width = 18
@@ -743,7 +687,7 @@ async def process_tg_update(update: dict) -> None:
             return
 
         if msg == '/start':
-            await send_tg_msg('<b>Gold Scalper Bot v6.1 Universal</b>', get_main_keyboard())
+            await send_tg_msg('<b>Gold Scalper Bot v6.2</b>', get_main_keyboard())
 
         elif msg.lower().startswith('/set'):
             parts = msg.strip().lower().split()
@@ -803,7 +747,6 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d == 'menu_backtest': await _show(chat_id, msg_id, 'الباكتيست:', get_backtest_keyboard())
     elif d == 'hide_keyboard': bot_state['menu_button_map'] = {}; await _show(chat_id, msg_id, 'مخفية.', {'remove_keyboard': True})
 
-    # Strategy restored callbacks
     elif d == 'cycle_zone_filter': bot_state['gann_zone_filter'] = 'all' if bot_state['gann_zone_filter'] == 'star' else 'star'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'cycle_entry_mode': bot_state['gann_entry_mode'] = 'breakout' if bot_state['gann_entry_mode'] == 'touch' else 'touch'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'inc_margin': bot_state['gann_touch_margin_pts'] += 1.0; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
@@ -812,7 +755,6 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d == 'toggle_trend': bot_state['use_trend_filter'] = not bot_state['use_trend_filter']; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
     elif d == 'cycle_trend_type': bot_state['trend_filter_type'] = 'EMA_CROSS' if bot_state['trend_filter_type'] == 'EMA_200' else 'EMA_200'; await _show(chat_id, msg_id, 'Strategy:', get_strategy_keyboard())
 
-    # Risk & Trailing restored callbacks
     elif d == 'toggle_trail': bot_state['use_trailing'] = not bot_state['use_trailing']; await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
     elif d == 'inc_trail': bot_state['trail_points'] += 10; await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
     elif d == 'dec_trail': bot_state['trail_points'] = max(10, bot_state['trail_points'] - 10); await _show(chat_id, msg_id, 'Risk:', get_risk_keyboard())
@@ -900,7 +842,7 @@ async def main() -> None:
         asyncio.create_task(supervised(telegram_polling_loop, label='tg_polling')),
         asyncio.create_task(supervised(telegram_watchdog,     label='tg_watchdog')),
     ]
-    c_log('Gold Scalper Bot v6.1 Universal started.')
+    c_log('Gold Scalper Bot v6.2 (Exact Angles Match) started.')
     try: await asyncio.gather(*tasks)
     finally:
         if _http and not _http.closed: await _http.close()
