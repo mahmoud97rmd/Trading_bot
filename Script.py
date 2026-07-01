@@ -941,16 +941,6 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                 floating_pl = 0.0
                 for tr in open_trades:
                     lp = latest_price.get(tr['symbol'], tr['entry'])
-                    if tr['is_buy']:
-                        floating_pl += round(((lp - tr['entry']) / tr['sl_d']) * tr['risk_usd'] if tr['sl_d'] else 0, 2)
-                    else:
-                        floating_pl += round(((tr['entry'] - lp) / tr['sl_d']) * tr['risk_usd'] if tr['sl_d'] else 0, 2)
-                
-                # Wait, I need a standard PnL calculation!
-                # PnL USD = price_diff * lot * contract_size * quote_conv
-                floating_pl = 0.0
-                for tr in open_trades:
-                    lp = latest_price.get(tr['symbol'], tr['entry'])
                     diff = (lp - tr['entry']) if tr['is_buy'] else (tr['entry'] - lp)
                     floating_pl += round(diff * tr['lot'] * tr['cs'] * tr['quote_conv'], 2)
                     
