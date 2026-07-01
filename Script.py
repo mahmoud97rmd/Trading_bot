@@ -289,17 +289,20 @@ def gann_calc_levels(symbol: str, close: float) -> list[dict]:
     return levels
 
 def gann_active_levels(symbol: str) -> list[dict]:
+    sym_state = bot_state['symbol_state'][symbol]
     lv = [l for l in bot_state['symbol_state'][symbol]['gann_levels'] if l['dir'] != 'ref']
     f = sym_state['gann_zone_filter']
     if f == 'star': return [l for l in lv if l['star']]
     elif f == 'star_fan': return [l for l in lv if l['star'] or l['fan']]
     return lv
 
-def _gann_tf_tp(tf: str) -> int:
+def _gann_tf_tp(symbol: str, tf: str) -> int:
+    sym_state = bot_state['symbol_state'][symbol]
     v = sym_state['gann_tp_per_tf'].get(tf, 0)
     return v if v > 0 else sym_state['gann_tp_points']
 
-def _gann_tf_sl(tf: str) -> int:
+def _gann_tf_sl(symbol: str, tf: str) -> int:
+    sym_state = bot_state['symbol_state'][symbol]
     v = sym_state['gann_sl_per_tf'].get(tf, 0)
     return v if v > 0 else sym_state['gann_sl_points']
 
@@ -316,16 +319,17 @@ def _gann_atr(candles: list, period: int) -> float | None:
     return float(val) if not pd.isna(val) else None
 
 def _gann_calc_tpsl(symbol: str, entry: float, is_buy: bool, candles: list, tf: str = '') -> tuple[float, float]:
+    sym_state = bot_state['symbol_state'][symbol]
     pv = SYMBOL_INFO[symbol]['pip_value']
     prec = SYMBOL_INFO[symbol]['prec']
     if sym_state['gann_tpsl_mode'] == 'atr':
         atr = _gann_atr(candles, sym_state['gann_atr_period'])
-        if not atr: atr = _gann_tf_sl(tf) * pv
+        if not atr: atr = _gann_tf_sl(symbol, tf) * pv
         sl_dist = atr * sym_state['gann_atr_sl_mult']
         tp_dist = atr * sym_state['gann_atr_tp_mult']
     else:
-        sl_dist = _gann_tf_sl(tf) * pv
-        tp_dist = _gann_tf_tp(tf) * pv
+        sl_dist = _gann_tf_sl(symbol, tf) * pv
+        tp_dist = _gann_tf_tp(symbol, tf) * pv
     if is_buy: return round(entry + tp_dist, prec), round(entry - sl_dist, prec)
     return round(entry - tp_dist, prec), round(entry + sl_dist, prec)
 
@@ -336,6 +340,7 @@ async def _gann_fetch_last_closed_h1(symbol: str) -> dict | None:
     return candles[-1]
 
 def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
+    sym_state = bot_state['symbol_state'][symbol]
     lines = []
     for l in bot_state['symbol_state'][symbol]['gann_levels']:
         if l['dir'] == 'ref':
@@ -360,11 +365,12 @@ def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
             + '\n'.join(lines))
 
 async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list, reason: str, tf: str) -> None:
+    sym_state = bot_state['symbol_state'][symbol]
     try:
         price = float(candles[-1]['close'])
         tp, sl = _gann_calc_tpsl(symbol, price, is_buy, candles, tf=tf)
         lot = sym_state['lot_size']; side = 'BUY' if is_buy else 'SELL'
-        tp_pts = _gann_tf_tp(tf); sl_pts = _gann_tf_sl(tf)
+        tp_pts = _gann_tf_tp(symbol, tf); sl_pts = _gann_tf_sl(symbol, tf)
         
         tpsl_lbl = (f"ATR({sym_state['gann_atr_period']})×{sym_state['gann_atr_sl_mult']}/{sym_state['gann_atr_tp_mult']}"
                     if sym_state['gann_tpsl_mode'] == 'atr' else f"SL:{sl_pts}p TP:{tp_pts}p")
@@ -606,6 +612,7 @@ def get_gann_keyboard() -> dict:
     return {'inline_keyboard': rows}
 
 def get_gann_tpsl_tf_keyboard(sel_tf: str = '') -> dict:
+    sym_state = bot_state['symbol_state'][bot_state['ui_selected_symbol']]
     rows = [[{'text': '⚙️ TP/SL مخصص لكل فريم', 'callback_data': 'noop'}],
             [{'text': '(0 = يرجع للقيمة العامة)', 'callback_data': 'noop'}]]
     tfs_list = list(sym_state['gann_monitor_tfs'].keys())
@@ -651,14 +658,14 @@ async def gann_monitor_scanner() -> None:
             if bot_state['status'] != 'RUNNING':
                 await asyncio.sleep(10); continue
 
-            flt_type = sym_state['trend_filter_type']
-            ttf = sym_state['trend_timeframe']
-            
-            enabled_tfs = [tf for tf, on in sym_state['gann_monitor_tfs'].items() if on]
             active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
 
             for symbol in active_symbols:
                 sym_state = bot_state['symbol_state'][symbol]
+                
+                flt_type = sym_state['trend_filter_type']
+                ttf = sym_state['trend_timeframe']
+                enabled_tfs = [tf for tf, on in sym_state['gann_monitor_tfs'].items() if on]
                 if not sym_state['gann_cycle_active'] or not sym_state['gann_levels']:
                     continue
 
@@ -894,7 +901,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                                     lower_levels = [l['price'] for l in levels if l['price'] < entry]
                                     if lower_levels: be_trigger_px = max(lower_levels)
 
-                            tf_tp = _gann_tf_tp(btf); tf_sl = _gann_tf_sl(btf)
+                            tf_tp = _gann_tf_tp(symbol, btf); tf_sl = _gann_tf_sl(symbol, btf)
                             if tpsl_mode == 'atr' and atr_val:
                                 sl_d = atr_val * sym_state['gann_atr_sl_mult']
                                 tp_d = atr_val * sym_state['gann_atr_tp_mult']
