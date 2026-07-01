@@ -742,7 +742,7 @@ async def gann_monitor_scanner() -> None:
 async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
     bot_state['is_backtesting'] = True
-    fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx\n"
+    fname = f"GannBT_{datetime.now(timezone.utc).strftime('%H%M%S')}.xlsx"
     
     active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
     if not active_symbols:
