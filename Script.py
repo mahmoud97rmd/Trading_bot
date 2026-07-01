@@ -910,7 +910,9 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
         
         # PHASE 2: Chronological Event-Driven Simulation
         await prog.set_phase('محاكاة الصفقات الزمنية (تقييم الأرباح العائمة)...')
+        c_log(f'BT: Sorting {len(all_signals)} signals')
         all_signals.sort(key=lambda x: x['time'])
+        c_log(f'BT: Sorting {len(all_candles_events)} events')
         all_candles_events.sort(key=lambda x: x['time'])
         
         open_trades = []
@@ -1026,6 +1028,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             await prog.tick(i, res['win'], res['loss'], res['be'], res['total_prof'])
             
         # Post-process closed trades to match old format
+        c_log(f'BT: Post-processing {len(closed_trades)} closed trades')
         for tr in closed_trades:
             if tr['outcome'] == 'WIN': res['win'] += 1; res['total_win_usd'] += tr['p_usd']
             elif tr['outcome'] == 'LOSS': res['loss'] += 1; res['total_loss_usd'] += abs(tr['p_usd'])
@@ -1061,6 +1064,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
 
         await prog.set_phase('إنشاء ملف Excel المنسق...')
         
+        c_log('BT: Generating Excel')
         df_trades = pd.DataFrame(res['trade_logs'])
         if 'cycle_ts' in df_trades.columns: df_trades.drop(columns=['cycle_ts'], inplace=True)
         
@@ -1111,7 +1115,8 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
     except Exception as e:
         c_log(f'BT Error: {e}'); bot_state['is_backtesting'] = False
         if _bt_progress:
-            try: await _bt_progress.done(f'❌ خطأ داخلي في الباكتيست:\n{e}')
+            import html
+            try: await _bt_progress.done(f'❌ خطأ داخلي في الباكتيست:\n{html.escape(str(e))}')
             except: pass
     finally:
         bot_state['is_backtesting'] = False
