@@ -886,7 +886,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                 f_mode = sym_state['gann_zone_filter']
                 active_lv = [l for l in levels if l['dir'] != 'ref' and (f_mode == 'all' or (f_mode == 'star' and l['star']) or (f_mode == 'star_fan' and (l['star'] or l['fan'])))]
                 
-                res['cycle_logs'].append({'symbol': symbol, 'time': h1['time'].strftime('%Y-%m-%d %H:%M'), 'close': close, 'levels': len(active_lv)})
+                res['cycle_logs'].append({'symbol': symbol, 'time_ts': h1['time'].timestamp(), 'time_dt': h1['time'], 'close': close, 'levels': len(active_lv)})
                 
                 level_used = set()
                 for btf, candles_m in monitor_tfs_data.items():
@@ -940,7 +940,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                                 'time': bar_time, 'symbol': symbol, 'is_buy': is_buy, 'entry': entry,
                                 'tp_px': tp_px, 'sl_px': sl_px, 'sl_d': sl_d, 'tp_d': tp_d, 'be_trigger_px': be_trigger_px,
                                 'lot': lot, 'cs': cs, 'quote_conv': quote_conv, 'tf': btf, 'combo_key': combo_key,
-                                'cycle_time': h1['time']
+                                'cycle_time': h1['time'], 'cycle_close': close, 'level_key': k
                             })
                             level_used.add(combo_key)
         
@@ -1071,12 +1071,20 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             elif tr['outcome'] == 'BREAK_EVEN': res['be'] += 1
             
             res['total_prof'] += tr['p_usd']
-            dir_str = 'شراء 📈' if tr['is_buy'] else 'بيع 📉'
+            dir_str = 'BUY 📈' if tr['is_buy'] else 'SELL 📉'
             res['trade_logs'].append({
-                'الرمز': tr['symbol'], 'وقت الصفقة (DAM)': _utc_to_dam(tr['time']).strftime('%Y-%m-%d %H:%M'),
-                'الفريم': tr['tf'], 'الاتجاه': dir_str, 'السعر': tr['entry'],
-                'النتيجة': tr['outcome'], 'ربح ($)': tr['p_usd'],
-                'cycle_ts': tr['cycle_time'].timestamp()
+                'الزوج': tr['symbol'], 
+                'وقت الصفقة (DAM)': _utc_to_dam(tr['time']).strftime('%Y-%m-%d %H:%M'),
+                'TF': tr['tf'], 
+                'اتجاه': dir_str, 
+                'المستوى (الدخول)': f"{tr['entry']:.2f} ({tr['level_key']})",
+                'الهدف (TP)': round(tr['tp_px'], 2),
+                'الوقف (SL)': round(tr['sl_px'], 2),
+                'النتيجة': tr['outcome'], 
+                'ربح ($)': tr['p_usd'],
+                'cycle_ts': tr['cycle_time'].timestamp(),
+                'cycle_time_str': _utc_to_dam(tr['cycle_time']).strftime('%Y-%m-%d %H:%M'),
+                'cycle_close': tr['cycle_close']
             })
             
         res['trade_logs'].sort(key=lambda x: x['وقت الصفقة (DAM)'])
@@ -1095,14 +1103,12 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
         res['max_dd'] = max_dd
 
         if not res['trade_logs']:
-            await prog.done('<b>باكتيست اكتمل ✅</b>\\nلا توجد صفقات في هذا النطاق.')
+            await prog.done('<b>باكتيست اكتمل ✅</b>\nلا توجد صفقات في هذا النطاق.')
             bot_state['is_backtesting'] = False; return
 
         await prog.set_phase('إنشاء ملف Excel المنسق...')
         
         c_log('BT: Generating Excel')
-        df_trades = pd.DataFrame(res['trade_logs'])
-        if 'cycle_ts' in df_trades.columns: df_trades.drop(columns=['cycle_ts'], inplace=True)
         
         sum_text = (
             f"جان {syms_label} | {desc_mode} | {desc_star}\n"
@@ -1122,26 +1128,69 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                 
         sum_text += f"\nدورات H1: {len(res['cycle_logs'])}  |  TP/SL: {str('ATR' if tpsl_mode=='atr' else 'نقاط ثابتة')} | Lot: {lot}"
 
-        df_trades.to_excel(fname, index=False, engine='openpyxl')
+        wb = openpyxl.Workbook()
+        ws_trades = wb.active
+        ws_trades.title = "الصفقات"
         
-        wb = openpyxl.load_workbook(fname)
-        ws = wb.active
-        red_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-        green_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+        headers = ["الزوج", "وقت الصفقة (DAM)", "TF", "اتجاه", "المستوى (الدخول)", "الهدف (TP)", "الوقف (SL)", "النتيجة", "ربح ($)", "رصيد تراكمي ($)"]
+        ws_trades.append(headers)
+        
+        gray_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+        header_fill = PatternFill(start_color="E2E3E5", end_color="E2E3E5", fill_type="solid")
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
         be_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
-        limit_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
         
-        for row in range(2, ws.max_row + 1):
-            outcome_cell = ws.cell(row=row, column=6).value
-            if outcome_cell == 'WIN': fill = green_fill
-            elif outcome_cell == 'LOSS': fill = red_fill
-            elif outcome_cell == 'BREAK_EVEN': fill = be_fill
-            elif outcome_cell == 'DAILY_LIMIT': fill = limit_fill
-            else: continue
-            for col in range(1, ws.max_column + 1):
-                ws.cell(row=row, column=col).fill = fill
+        for cell in ws_trades[1]:
+            cell.fill = gray_fill
+            cell.font = Font(bold=True)
+            
+        current_cycle = None
+        for tr in res['trade_logs']:
+            if tr['cycle_ts'] != current_cycle:
+                current_cycle = tr['cycle_ts']
+                ws_trades.append([f"دورة H1: {tr['cycle_time_str']}  |  إغلاق H1: {tr['cycle_close']:.2f}"] + [""]*9)
+                row_idx = ws_trades.max_row
+                ws_trades.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=10)
+                ws_trades.cell(row=row_idx, column=1).fill = header_fill
+                ws_trades.cell(row=row_idx, column=1).font = Font(bold=True)
                 
-        ws.column_dimensions['B'].width = 20
+            row_data = [
+                tr['الزوج'], tr['وقت الصفقة (DAM)'], tr['TF'], tr['اتجاه'], tr['المستوى (الدخول)'],
+                tr['الهدف (TP)'], tr['الوقف (SL)'], tr['النتيجة'], tr['ربح ($)'], tr['رصيد تراكمي ($)']
+            ]
+            ws_trades.append(row_data)
+            row_idx = ws_trades.max_row
+            
+            fill = None
+            if tr['النتيجة'] == 'WIN': fill = green_fill
+            elif tr['النتيجة'] == 'LOSS': fill = red_fill
+            elif tr['النتيجة'] == 'BREAK_EVEN': fill = be_fill
+            
+            if fill:
+                for col in range(1, 11):
+                    ws_trades.cell(row=row_idx, column=col).fill = fill
+
+        ws_trades.column_dimensions['B'].width = 20
+        ws_trades.column_dimensions['E'].width = 25
+        
+        ws_cycles = wb.create_sheet("دورات H1")
+        ws_cycles.append(["الزوج", "الدورة (DAM)", "إغلاق H1", "عدد الصفقات", "ملاحظة"])
+        for cell in ws_cycles[1]: cell.fill = gray_fill; cell.font = Font(bold=True)
+        
+        for cycle in res['cycle_logs']:
+            num_trades = len([t for t in res['trade_logs'] if t['cycle_ts'] == cycle['time_ts']])
+            note = f"تم تنفيذ {num_trades} صفقة" if num_trades > 0 else "لم يلمس السعر أي مستوى"
+            ws_cycles.append([cycle['symbol'], _utc_to_dam(cycle['time_dt']).strftime('%Y-%m-%d %H:%M'), cycle['close'], num_trades, note])
+        ws_cycles.column_dimensions['B'].width = 20
+        ws_cycles.column_dimensions['E'].width = 30
+            
+        ws_susp = wb.create_sheet("أيام الإيقاف")
+        ws_susp.append(["التاريخ", "السبب (النتيجة)"])
+        for cell in ws_susp[1]: cell.fill = gray_fill; cell.font = Font(bold=True)
+        for d_str, rsn in suspended_days.items():
+            ws_susp.append([d_str, rsn])
+            
         wb.save(fname)
         
         await prog.done(f'<b>باكتيست جان اكتمل ✅</b>\n{syms_label} H1→[{desc_tfs}] | {desc_mode} | {desc_star}{desc_be}\n{start_dt.strftime("%Y-%m-%d")} → {end_dt.strftime("%Y-%m-%d")}\n\nNet: {"PROFIT ▲" if res["total_prof"]>=0 else "LOSS ▼"} ${round(res["total_prof"], 2)}\nWin:  +${round(res["total_win_usd"], 2)} ({res["win"]})\nLoss: -${round(res["total_loss_usd"], 2)} ({res["loss"]})\nBreak-Even: $0.0 ({res["be"]})\nWR: {round(res["win"]/max(1, res["win"]+res["loss"])*100)}% ({len(res["trade_logs"])} صفقة)\nMax DD: ${round(res["max_dd"],2)} ({round((res["max_dd"]/max(1,res["peak_equity"]))*100)}%)\nدورات H1: {len(res["cycle_logs"])}  |  TP/SL: {"ATR" if tpsl_mode=="atr" else "نقاط ثابتة"} | Lot: {lot}\n\nإرسال ملف Excel...')
