@@ -82,6 +82,7 @@ bot_state: dict = {
         'gann_cycle_active': False,
         'gann_cycle_started_at': None,
         'gann_open_trades': {},
+        'auto_trade': False,
         'lot_size': 0.05,
         'gann_cycle_hours': 1,
         'gann_zone_filter': 'star',  
@@ -378,15 +379,45 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         
         be_lbl = " | 🛡️ BE Active" if sym_state['break_even_enabled'] else ""
         
-        trade_id = f"sim_{int(datetime.now().timestamp())}_{tf}\n"
-        bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = tf
+        is_real = sym_state.get('auto_trade', False)
+        trade_id = f"sim_{int(datetime.now().timestamp())}_{tf}"
+        real_msg = ""
+        
+        if is_real:
+            if not METAAPI_TOKEN or METAAPI_TOKEN == 'YOUR_METAAPI_TOKEN' or not ACCOUNT_ID or ACCOUNT_ID == 'YOUR_ACCOUNT_ID':
+                real_msg = "\n⚠️ التداول الآلي مفعل ولكن بيانات MetaAPI غير صحيحة! تم تسجيلها وهمياً."
+                is_real = False
+            else:
+                try:
+                    api = MetaApi(METAAPI_TOKEN)
+                    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+                    conn = account.get_rpc_connection()
+                    await conn.connect()
+                    await conn.wait_synchronized()
+                    
+                    if is_buy:
+                        res = await conn.create_market_buy_order(symbol, lot, stop_loss=sl, take_profit=tp)
+                    else:
+                        res = await conn.create_market_sell_order(symbol, lot, stop_loss=sl, take_profit=tp)
+                        
+                    trade_id = str(res.get('orderId', res.get('positionId', trade_id)))
+                    real_msg = "\n🚀 <b>تم فتح الصفقة حقيقياً على حسابك!</b>"
+                except Exception as ex:
+                    real_msg = f"\n❌ <b>فشل فتح الصفقة حقيقياً:</b> {ex}"
+                    is_real = False
+        
+        bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
+            'tf': tf, 'is_buy': is_buy, 'entry': price, 'is_real': is_real, 'sl': sl, 'tp': tp,
+            'be_trigger': (price + (tp - price)/2) if is_buy else (price - (price - tp)/2) # simplified BE trigger
+        }
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
         
         await send_tg_msg(
             f"<b>✅ {'BUY 📈' if is_buy else 'SELL 📉'} [{symbol} - جان {tf}]</b>  {reason}\n\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {price:.2f}\n\n"
-            f"TP: {tp}  SL: {sl}  |  {tpsl_lbl}{be_lbl}\n\n"
+            f"TP: {tp}  SL: {sl}  |  {tpsl_lbl}{be_lbl}\n"
             f"إغلاق H1: {bot_state['symbol_state'][symbol]['gann_close_used']:.5f}\n"
+            f"{real_msg}"
         )
     except Exception as e:
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
@@ -531,7 +562,10 @@ def get_gann_keyboard() -> dict:
     ap  = sym_state['gann_atr_period']
     be_lbl = "🟢 مفعل" if sym_state['break_even_enabled'] else "⚫ معطل"
     
+    auto_t = '🟢 مفعل' if sym_state.get('auto_trade', False) else '🔴 معطل'
+    
     rows = [
+        [{'text': f'🤖 التداول الآلي (MetaAPI): {auto_t}', 'callback_data': 'gann_toggle_auto_trade'}],
         [{'text': f'📐 {sym} — دورة: {cyc}  |  صفقات: {open_n}', 'callback_data': 'noop'}],
         [{'text': '🔄 عرض الدعوم والمقاومات الحالية', 'callback_data': 'gann_show_levels'}],
     ]
@@ -701,7 +735,7 @@ async def gann_monitor_scanner() -> None:
                 margin      = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
 
                 for tf in enabled_tfs:
-                    if tf in sym_state['gann_open_trades'].values(): continue 
+                    if any(isinstance(v, dict) and v.get('tf') == tf for v in sym_state['gann_open_trades'].values()) or tf in sym_state['gann_open_trades'].values(): continue 
 
                     need = sym_state['gann_atr_period'] + 50
                     candles = await fetch_candles(symbol, tf, count=need)
@@ -1202,7 +1236,7 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
                 for s_name, s_data in data[f'preset_{p_num}'].items():
                     if s_name in bot_state['symbol_state']:
                         for k, v in s_data.items():
-                            if k not in ['gann_levels', 'gann_level_status', 'gann_cycle_active', 'gann_open_trades', 'gann_last_h1_time', 'gann_cycle_started_at']:
+                            if k not in ['gann_levels', 'gann_level_status', 'gann_cycle_active', 'gann_open_trades', 'gann_last_h1_time', 'gann_cycle_started_at', 'auto_trade']:
                                 bot_state['symbol_state'][s_name][k] = v
                 await send_tg_msg(f"✅ تم تحميل الإعدادات من Preset {p_num} بنجاح!")
             else:
@@ -1257,6 +1291,9 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         current = sym_state['trend_filter_type']
         if current == 'vwap': sym_state['trend_filter_type'] = 'ema'
         else: sym_state['trend_filter_type'] = 'vwap'
+        await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
+    elif d == 'gann_toggle_auto_trade':
+        sym_state['auto_trade'] = not sym_state.get('auto_trade', False)
         await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
     elif d == 'gann_toggle_ttf':
         sym_state['trend_timeframe'] = '30m' if sym_state['trend_timeframe'] == '1h' else '1h'
