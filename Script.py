@@ -76,6 +76,38 @@ async def init_metaapi():
             c_log("✅ MetaAPI Persistent Connection established.")
     except Exception as e:
         c_log(f"MetaAPI Init Error: {e}")
+    load_bot_persistence()
+
+import json
+def save_bot_persistence():
+    try:
+        data = {
+            'live_daily_realized': bot_state.get('live_daily_realized', 0.0),
+            'live_daily_date': str(bot_state.get('live_daily_date')),
+            'live_daily_hit': bot_state.get('live_daily_hit', False),
+            'gann_open_trades': {sym: bot_state['symbol_state'][sym]['gann_open_trades'] for sym in bot_state['active_symbols']}
+        }
+        with open('/root/tr/bot_persistence.json', 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        c_log(f"Persistence Save Error: {e}")
+
+def load_bot_persistence():
+    try:
+        with open('/root/tr/bot_persistence.json', 'r') as f:
+            data = json.load(f)
+        bot_state['live_daily_realized'] = data.get('live_daily_realized', 0.0)
+        bot_state['live_daily_hit'] = data.get('live_daily_hit', False)
+        saved_date = data.get('live_daily_date')
+        if saved_date and saved_date != 'None':
+            from datetime import datetime
+            bot_state['live_daily_date'] = datetime.strptime(saved_date, '%Y-%m-%d').date()
+        for sym, trades in data.get('gann_open_trades', {}).items():
+            if sym in bot_state['symbol_state']:
+                bot_state['symbol_state'][sym]['gann_open_trades'] = trades
+        c_log("✅ Bot State Restored Successfully from Persistence File.")
+    except Exception as e:
+        c_log(f"Persistence Load Notice (Starting fresh): {e}")
 
 bot_state: dict = {
     'status':           'RUNNING',
@@ -453,6 +485,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
             'be_trigger': (price + (tp - price)/2) if is_buy else (price - (price - tp)/2) # simplified BE trigger
         }
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+        save_bot_persistence()
         
         await send_tg_msg(
             f"<b>✅ {'BUY 📈' if is_buy else 'SELL 📉'} [{symbol} - جان {tf}]</b>  {reason}\n\n"
@@ -749,9 +782,17 @@ async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict):
     if not _metaapi_conn: return
     try:
         await _metaapi_conn.close_position(tid)
-        await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>")
-        if tid in sym_state['gann_open_trades']:
-            del sym_state['gann_open_trades'][tid]
+        # State-Machine Polling for confirmation
+        for _ in range(25):
+            positions = await _metaapi_conn.get_positions()
+            if not any(str(p.get('id')) == str(tid) for p in positions):
+                await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>")
+                if tid in sym_state['gann_open_trades']:
+                    del sym_state['gann_open_trades'][tid]
+                    save_bot_persistence()
+                return
+            await asyncio.sleep(0.2)
+        c_log(f"Timeout waiting for {tid} to disappear from MT5.")
     except Exception as e:
         import traceback
         c_log("Closure failed for " + str(tid) + " : " + traceback.format_exc())
@@ -839,12 +880,7 @@ async def gann_monitor_scanner() -> None:
                     if not oanda_failed:
                         live_px = float(mc[-1]['close'])
                     else:
-                        c_log(f"Oanda failed or stale for {symbol}. Falling back strictly to MetaAPI unrealizedProfit for Drawdown Evaluation.")
-                        # We cannot evaluate WIN/LOSS outcomes accurately without live_px, but we MUST calculate total_floating.
-                        for tid, tr in sym_state['gann_open_trades'].items():
-                            if tid in actual_positions:
-                                total_floating += float(actual_positions[tid].get('unrealizedProfit', 0.0))
-                        continue # Skip outcome evaluation, but total_floating is now updated!
+                        c_log(f"Oanda failed for {symbol}. Decoupled Mode: using MT5 currentPrice for open trade management.")
                         
 
 
@@ -869,7 +905,13 @@ async def gann_monitor_scanner() -> None:
                         tf = tr.get('tf')
                         is_real = tr.get('is_real')
                         
-                        diff = (live_px - entry) if is_buy else (entry - live_px)
+                        active_px = live_px
+                        if active_px is None:
+                            if tid in actual_positions:
+                                active_px = float(actual_positions[tid].get('currentPrice', entry))
+                            else:
+                                active_px = entry # Trade might be missing
+                        diff = (active_px - entry) if is_buy else (entry - active_px)
                         cs = SYMBOL_INFO[symbol]['contract_size']
                         trade_pl = round(diff * sym_state['lot_size'] * cs, 2)
                         
@@ -898,16 +940,16 @@ async def gann_monitor_scanner() -> None:
                         
                         outcome = None
                         if is_buy:
-                            if live_px >= tp: outcome = 'WIN ✅'
-                            elif live_px <= sl: outcome = 'LOSS ❌'
+                            if active_px >= tp: outcome = 'WIN ✅'
+                            elif active_px <= sl: outcome = 'LOSS ❌'
                         else:
-                            if live_px <= tp: outcome = 'WIN ✅'
-                            elif live_px >= sl: outcome = 'LOSS ❌'
+                            if active_px <= tp: outcome = 'WIN ✅'
+                            elif active_px >= sl: outcome = 'LOSS ❌'
                             
                         if bot_state.get('prot_cost_be', True) and sym_state.get('break_even_enabled') and not tr.get('be_activated'):
                             be_pts = sym_state.get('gann_be_trigger_points', 40)
                             be_dist = be_pts * SYMBOL_INFO[symbol]['pip_value']
-                            if (is_buy and live_px >= entry + be_dist) or (not is_buy and live_px <= entry - be_dist):
+                            if (is_buy and active_px >= entry + be_dist) or (not is_buy and active_px <= entry - be_dist):
                                 be_margin = sym_state.get('gann_atr_period', 14) * 0.1 * SYMBOL_INFO[symbol]['pip_value']
                                 net_be = (entry + be_margin) if is_buy else (entry - be_margin)
                                 if is_real and _metaapi_conn:
@@ -915,12 +957,14 @@ async def gann_monitor_scanner() -> None:
                                         await _metaapi_conn.modify_position(tid, stop_loss=net_be)
                                         tr['sl'] = net_be
                                         tr['be_activated'] = True # Only set if successful!
+                                        save_bot_persistence()
                                         await send_tg_msg(f"🛡️ تم تفعيل Break-Even لـ {symbol}!")
                                     except Exception as e:
                                         c_log(f"BE modify failed: {e}")
                                 else:
                                     tr['sl'] = net_be
                                     tr['be_activated'] = True
+                                    save_bot_persistence()
 
                         if outcome:
                             closed_ids.append(tid)
@@ -933,6 +977,7 @@ async def gann_monitor_scanner() -> None:
                     for tid in closed_ids:
                         if tid in sym_state['gann_open_trades']:
                             del sym_state['gann_open_trades'][tid]
+                            save_bot_persistence()
 
             # --- Evaluate Daily Limits ---
             total_daily = bot_state['live_daily_realized'] + total_floating
@@ -944,15 +989,15 @@ async def gann_monitor_scanner() -> None:
                 limit_type = '🛑 تراجع عائم' if total_daily <= dd_limit else '✅ هدف يومي عائم'
                 await send_tg_msg(f"{limit_type} تم الوصول إليه! ({total_daily:.2f}$)\nسيتم إغلاق جميع الصفقات المفتوحة بالتسلسل.")
                 
-                # Serial MT5 Closure to avoid race conditions
+                # State-Machine Closure to avoid race conditions (Dynamic Polling)
                 for symbol in active_symbols:
                     sym_state = bot_state['symbol_state'][symbol]
                     for tid, tr in list(sym_state['gann_open_trades'].items()):
                         if tr.get('is_real') and _metaapi_conn:
                             await _close_metaapi_trade(symbol, tid, sym_state)
-                            await asyncio.sleep(0.5) # Micro-delay for MT5
                         else:
                             del sym_state['gann_open_trades'][tid]
+                            save_bot_persistence()
                 continue
 
             for symbol in active_symbols:
