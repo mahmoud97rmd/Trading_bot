@@ -336,11 +336,12 @@ def _gann_calc_tpsl(symbol: str, entry: float, is_buy: bool, candles: list, tf: 
     return round(entry - tp_dist, prec), round(entry + sl_dist, prec)
 
 async def _gann_fetch_last_closed_h1(symbol: str) -> dict | None:
-    candles = await fetch_candles(symbol, '1h', count=3)
-    if not candles or len(candles) < 2: return None
+    candles = await fetch_candles(symbol, '1h', count=2)
+    if not candles: return None
     candles = sorted(candles, key=lambda c: c['time'])
-    # candles[-1] is the current open candle, candles[-2] is the last fully closed candle.
-    return candles[-2]
+    # fetch_candles already filters out incomplete (currently forming) candles!
+    # So candles[-1] is exactly the LAST CLOSED candle.
+    return candles[-1]
 
 def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
     sym_state = bot_state['symbol_state'][symbol]
@@ -820,17 +821,15 @@ async def gann_cycle_manager() -> None:
                 if not sym_state['gann_cycle_active']:
                     continue
                     
-                started_at = sym_state['gann_cycle_started_at']
-                if not started_at: continue
-                
                 cycle_h = sym_state['gann_cycle_hours']
-                elapsed_hours = (now_utc - started_at).total_seconds() / 3600.0
+                last_h1 = await _gann_fetch_last_closed_h1(symbol)
                 
-                if elapsed_hours >= cycle_h:
-                    last_h1 = await _gann_fetch_last_closed_h1(symbol)
-                    if last_h1:
-                        h1_time = last_h1['time']
-                        if not sym_state['gann_last_h1_time'] or h1_time > sym_state['gann_last_h1_time']:
+                if last_h1:
+                    h1_time = last_h1['time']
+                    # Check if this new H1 candle is newer than our currently tracked one
+                    if not sym_state['gann_last_h1_time'] or h1_time > sym_state['gann_last_h1_time']:
+                        # Only trigger if the difference in hours is >= cycle_h
+                        if not sym_state['gann_last_h1_time'] or (h1_time - sym_state['gann_last_h1_time']).total_seconds() / 3600.0 >= cycle_h:
                             h1_close = float(last_h1['close'])
                             sym_state['gann_levels'] = gann_calc_levels(symbol, h1_close)
                             sym_state['gann_close_used'] = h1_close
