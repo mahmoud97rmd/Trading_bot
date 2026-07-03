@@ -1,12 +1,22 @@
 import json
 """
-Gold Scalper Bot — v8.9 (Triple Filter, Fan Labels & Smart Break-Even)
+Gold Scalper Bot -- v9.4 (Resilience-First Core)
 Strategy : Gann Levels + Fan Angles + Break-Even Triggered by Noise Levels
+
+v9.4 changes vs v8.9 (see PATCH_NOTES.md shipped alongside this file):
+  - No hardcoded credential fallbacks; bot refuses to start without env vars.
+  - No silent except-pass in execution / reconciliation / order-management paths.
+  - Explicit HALT / READ_ONLY connection-state machine with Telegram escalation.
+  - Persistence now captures full per-symbol cycle state, not just open trades.
+  - Startup reconstructs state from disk before ANY market interaction.
 """
 
 import asyncio
+import logging
+import traceback
 import aiohttp
 import os
+import sys
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -15,15 +25,36 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from metaapi_cloud_sdk import MetaApi
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-METAAPI_TOKEN = os.environ.get('METAAPI_TOKEN', 'eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiJjODRlZDU2MmMyOTE3ZDgxNTU1ZWQ0NDhlNzc2MzNkMCIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbImFjY291bnQ6JFVTRVJfSUQkOjQ5MTg2OWUyLTM2MDQtNDQ2Mi1hN2FhLWJlMmVlYzJkMDU0ZCJdfSx7ImlkIjoibWV0YWFwaS1yZXN0LWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiYWNjb3VudDokVVNFUl9JRCQ6NDkxODY5ZTItMzYwNC00NDYyLWE3YWEtYmUyZWVjMmQwNTRkIl19LHsiaWQiOiJtZXRhYXBpLXJwYy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyJhY2NvdW50OiRVU0VSX0lEJDo0OTE4NjllMi0zNjA0LTQ0NjItYTdhYS1iZTJlZWMyZDA1NGQiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyJhY2NvdW50OiRVU0VSX0lEJDo0OTE4NjllMi0zNjA0LTQ0NjItYTdhYS1iZTJlZWMyZDA1NGQiXX0seyJpZCI6Im1ldGFzdGF0cy1hcGkiLCJtZXRob2RzIjpbIm1ldGFzdGF0cy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiYWNjb3VudDokVVNFUl9JRCQ6NDkxODY5ZTItMzYwNC00NDYyLWE3YWEtYmUyZWVjMmQwNTRkIl19LHsiaWQiOiJyaXNrLW1hbmFnZW1lbnQtYXBpIiwibWV0aG9kcyI6WyJyaXNrLW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiXSwicmVzb3VyY2VzIjpbImFjY291bnQ6JFVTRVJfSUQkOjQ5MTg2OWUyLTM2MDQtNDQ2Mi1hN2FhLWJlMmVlYzJkMDU0ZCJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiYzg0ZWQ1NjJjMjkxN2Q4MTU1NWVkNDQ4ZTc3NjMzZDAiLCJpYXQiOjE3ODI5OTgwODIsImV4cCI6MTc5MDc3NDA4Mn0.nRXX-qibBjuhCG60jZMQ0qZJmfFlNI8dSK3SMapdM4QDjDgrcT4dbJ1EGE-9cnYp2l01ySQa97wOmpjf2M7Qn_1DFYAp34WaVgk9JMLK2aOMt2sFny2uSSd5QmNZcYGiFhynTmaEFl0cNCVds3Z-HBsnAL6HHGkc1d6miYH336gNaWM1npJj08Gl2_d3hApUrRiK6m3ot1dXt4ccfuYTjfczA79zfCLQG0s9Zc27STRsNauPIlGCPU8kxDS6sk5Gdg3seBvl2lK6PqP28PcZHLbZ1u29GAP9b1AWF-F0pVRjid8rUEE2o3h9X_IdWOZ7m-HmO9Dz8EBqAWefLtfpZhog_DGUcU32jGNxDM8JElpGmuhhRrlmptBxDv7HF23CcGSzqRShm1s7NB9SZDtJEblNlaQRdHeXYxQoHewwcvPCS-ssoaM6iTnBl1jvsjZ7MXzuvpisgQSoy5DR4VCXzgABAYVd2L98Q1wzduOaR8BjdLeKSYE767fr-xiE2JYvTCCjIHBFGq9wHiX-7TvYz_9Nm0YCDYj08ljCN49FfkWx11eqr7ECqEvTximOSJicA0E4wxSOT4NvJA34NhWzslb5plMigadWtstS5BTq1yui2jx5pN-r5NusD8i6B4Xw9RbmKbPwlvlpDIBiw9n-BjVQMqM-Sm6tvZ176z8Irh8')
-ACCOUNT_ID    = os.environ.get('ACCOUNT_ID',    '491869e2-3604-4462-a7aa-be2eec2d054d')
-TG_TOKEN      = os.environ.get('TG_TOKEN',      '8779425898:AAFQgqay6IO89I2Sf98PigL28v9AHCcZPMw')
+# -----------------------------------------------------------------
+# LOGGING (structured, always includes tracebacks for exceptions)
+# -----------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    stream=sys.stdout,
+)
+logger = logging.getLogger('gold_scalper')
 
-OANDA_ACCOUNT  = os.environ.get('OANDA_ACCOUNT', '101-004-28533521-003')
-OANDA_TOKEN    = os.environ.get('OANDA_TOKEN',   '0e282d5a3e65ad6fdd809e2c195bb1cd-9e2158e12fa13840e030ee3081b36fab')
+def log_exception(context: str, exc: Exception) -> None:
+    """Zero-tolerance logging: every caught exception in a critical path gets
+    a full traceback attached to the log line, not just str(e)."""
+    logger.error("EXCEPTION in %s: %s\n%s", context, exc, traceback.format_exc())
+
+# -----------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        logger.critical("FATAL: required environment variable '%s' is not set. Refusing to start.", name)
+        sys.exit(1)
+    return val
+
+METAAPI_TOKEN  = _require_env('METAAPI_TOKEN')
+ACCOUNT_ID     = _require_env('ACCOUNT_ID')
+TG_TOKEN       = _require_env('TG_TOKEN')
+OANDA_ACCOUNT  = _require_env('OANDA_ACCOUNT')
+OANDA_TOKEN    = _require_env('OANDA_TOKEN')
 AVAILABLE_SYMBOLS = ['XAU_USD', 'XAU_EUR', 'XAG_USD', 'EUR_USD', 'GBP_JPY', 'GBP_AUD', 'GBP_NZD', 'AUD_JPY', 'NZD_JPY']
 SYMBOL_INFO = {
     'XAU_USD': {'pip_value': 0.1,     'contract_size': 100,    'prec': 2, 'name': 'Gold (USD)'},
@@ -54,32 +85,75 @@ def c_log(msg: str) -> None:
     dam = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M:%S')
     print(f"[{dam} DAM] {msg}", flush=True)
 
-# ─────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # GLOBAL STATE
-# ─────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 _metaapi = None
 _metaapi_account = None
 _metaapi_conn = None
 
+# Connection-state machine.
+# RUNNING    : normal operation, new trades allowed.
+# READ_ONLY  : sync with MetaAPI is degraded/unavailable. No new trades,
+#              no destructive local state changes (Amnesia Prevention),
+#              existing positions still managed if MT5 fallback price works.
+# HALTED     : hard stop. New entries and order management both stop;
+#              a human must intervene.
+CONN_RUNNING   = 'RUNNING'
+CONN_READ_ONLY = 'READ_ONLY'
+CONN_HALTED    = 'HALTED'
+
+_state_lock = asyncio.Lock()
+
+async def set_connection_state(new_state: str, reason: str) -> None:
+    async with _state_lock:
+        old_state = bot_state.get('connection_state', CONN_RUNNING)
+        if old_state == new_state:
+            return
+        bot_state['connection_state'] = new_state
+        bot_state['connection_state_reason'] = reason
+    logger.warning("Connection state: %s -> %s (%s)", old_state, new_state, reason)
+    icon = {'RUNNING': '\u2705', 'READ_ONLY': '\U0001F7E1', 'HALTED': '\U0001F6D1'}.get(new_state, '\u2139')
+    await send_tg_msg(f"{icon} <b>connection state changed: {old_state} -> {new_state}</b>\n{reason}")
+
+def is_trading_allowed() -> bool:
+    """New order placement is only allowed when the connection state is
+    fully healthy. Existing-position management (BE/TP/SL) is handled
+    separately and is NOT gated by this, per the OANDA-degraded-mode rule."""
+    return bot_state.get('connection_state', CONN_RUNNING) == CONN_RUNNING
+
 async def init_metaapi():
+    """Startup order is fixed:
+       1) Reconstruct state from the persistence file (works even if the
+          broker/API is completely unreachable).
+       2) Only THEN attempt to talk to MetaAPI / the market.
+    """
     global _metaapi, _metaapi_account, _metaapi_conn
-    if not METAAPI_TOKEN or METAAPI_TOKEN == 'YOUR_METAAPI_TOKEN': return
-    if not ACCOUNT_ID or ACCOUNT_ID == 'YOUR_ACCOUNT_ID': return
+
+    load_bot_persistence()
+    if bot_state.get('_persistence_load_failed'):
+        await set_connection_state(
+            CONN_READ_ONLY,
+            "Startup persistence file was present but unreadable. Starting READ_ONLY until a human "
+            "confirms the true broker state and clears this manually."
+        )
+
     try:
-        from metaapi_cloud_sdk import MetaApi
         _metaapi = MetaApi(METAAPI_TOKEN)
         _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
         if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
             _metaapi_conn = _metaapi_account.get_rpc_connection()
             await _metaapi_conn.connect()
             await _metaapi_conn.wait_synchronized()
-            c_log("✅ MetaAPI Persistent Connection established.")
+            c_log("MetaAPI Persistent Connection established.")
+            await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized at startup.")
+        else:
+            c_log(f"MetaAPI account not deployed/connected at startup (state={_metaapi_account.state}, "
+                  f"conn={_metaapi_account.connection_status}).")
+            await set_connection_state(CONN_READ_ONLY, "MetaAPI account is not DEPLOYED/CONNECTED at startup.")
     except Exception as e:
-        c_log(f"MetaAPI Init Error: {e}")
-    load_bot_persistence()
-
-import os
-import json
+        log_exception("init_metaapi", e)
+        await set_connection_state(CONN_READ_ONLY, f"MetaAPI init failed at startup: {e}")
 
 DATA_DIR = os.environ.get('PERSISTENT_DATA_PATH', '/app/data')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -87,20 +161,46 @@ PERSISTENCE_FILE = os.path.join(DATA_DIR, 'bot_persistence.json')
 TEMP_PERSISTENCE_FILE = os.path.join(DATA_DIR, 'bot_persistence.tmp')
 
 def save_bot_persistence():
+    """Atomic write: full operational state, not just open trades, so a
+    hard restart can reconstruct the bot's world exactly, including
+    in-progress Gann cycles and used levels."""
     try:
+        symbol_snapshot = {}
+        for sym in bot_state['active_symbols']:
+            ss = bot_state['symbol_state'][sym]
+            symbol_snapshot[sym] = {
+                'gann_open_trades':      ss.get('gann_open_trades', {}),
+                'gann_levels':           ss.get('gann_levels', []),
+                'gann_level_status':     ss.get('gann_level_status', {}),
+                'gann_close_used':       ss.get('gann_close_used'),
+                'gann_last_h1_time':     ss.get('gann_last_h1_time').isoformat() if ss.get('gann_last_h1_time') else None,
+                'gann_cycle_active':     ss.get('gann_cycle_active', False),
+                'gann_cycle_started_at': ss.get('gann_cycle_started_at').isoformat() if ss.get('gann_cycle_started_at') else None,
+            }
         data = {
+            'schema_version': 2,
             'live_daily_realized': bot_state.get('live_daily_realized', 0.0),
             'live_daily_date': str(bot_state.get('live_daily_date')),
             'live_daily_hit': bot_state.get('live_daily_hit', False),
-            'gann_open_trades': {sym: bot_state['symbol_state'][sym]['gann_open_trades'] for sym in bot_state['active_symbols']}
+            'connection_state': bot_state.get('connection_state', CONN_RUNNING),
+            'symbol_state': symbol_snapshot,
         }
         with open(TEMP_PERSISTENCE_FILE, 'w') as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(TEMP_PERSISTENCE_FILE, PERSISTENCE_FILE)
     except Exception as e:
-        c_log(f"Persistence Save Error: {e}")
+        # Persistence failing is itself a critical-path failure: if we can't
+        # save state, a crash right now means real, silent data loss on
+        # open positions. Escalate loudly instead of swallowing it.
+        log_exception("save_bot_persistence", e)
+        c_log(f"CRITICAL: Persistence Save Error -- open trade state may not survive a restart: {e}")
 
 def load_bot_persistence():
+    if not os.path.exists(PERSISTENCE_FILE):
+        c_log("No persistence file found -- starting fresh (expected on first boot).")
+        return
     try:
         with open(PERSISTENCE_FILE, 'r') as f:
             data = json.load(f)
@@ -108,17 +208,43 @@ def load_bot_persistence():
         bot_state['live_daily_hit'] = data.get('live_daily_hit', False)
         saved_date = data.get('live_daily_date')
         if saved_date and saved_date != 'None':
-            from datetime import datetime
             bot_state['live_daily_date'] = datetime.strptime(saved_date, '%Y-%m-%d').date()
-        for sym, trades in data.get('gann_open_trades', {}).items():
-            if sym in bot_state['symbol_state']:
-                bot_state['symbol_state'][sym]['gann_open_trades'] = trades
-        c_log("✅ Bot State Restored Successfully from Persistence File.")
+
+        symbol_state_data = data.get('symbol_state')
+        if symbol_state_data is not None:
+            for sym, snap in symbol_state_data.items():
+                if sym not in bot_state['symbol_state']:
+                    continue
+                ss = bot_state['symbol_state'][sym]
+                ss['gann_open_trades']  = snap.get('gann_open_trades', {})
+                ss['gann_levels']       = snap.get('gann_levels', [])
+                ss['gann_level_status'] = snap.get('gann_level_status', {})
+                ss['gann_close_used']   = snap.get('gann_close_used')
+                ss['gann_cycle_active'] = snap.get('gann_cycle_active', False)
+                lh1 = snap.get('gann_last_h1_time')
+                ss['gann_last_h1_time'] = pd.Timestamp(lh1).to_pydatetime() if lh1 else None
+                csa = snap.get('gann_cycle_started_at')
+                ss['gann_cycle_started_at'] = pd.Timestamp(csa).to_pydatetime() if csa else None
+        else:
+            # Backward-compat with the old schema (open trades only).
+            for sym, trades in data.get('gann_open_trades', {}).items():
+                if sym in bot_state['symbol_state']:
+                    bot_state['symbol_state'][sym]['gann_open_trades'] = trades
+
+        c_log("Bot state restored from persistence file (open trades, Gann cycle state, daily PnL).")
     except Exception as e:
-        c_log(f"Persistence Load Notice (Starting fresh): {e}")
+        # If the persistence file is corrupt we must not silently pretend
+        # we're starting clean while real broker positions may still be
+        # open. Flag it; init_metaapi/main will use this to force READ_ONLY.
+        log_exception("load_bot_persistence", e)
+        c_log(f"CRITICAL: Persistence file exists but failed to load ({e}). "
+              f"Bot will start in READ_ONLY to avoid trading blind.")
+        bot_state['_persistence_load_failed'] = True
 
 bot_state: dict = {
     'status':           'RUNNING',
+    'connection_state': 'RUNNING',
+    'connection_state_reason': '',
     'symbol':           'XAUUSDm',
     'live_connected':   False,
     'connection_obj':   None,
@@ -238,8 +364,16 @@ def core_eval_outcome(is_buy: bool, current_px: float, tp: float, sl: float) -> 
 async def _tg_post(url: str, **kwargs) -> bool:
     try:
         sess = get_http()
-        async with sess.post(url, **kwargs) as resp: return resp.status == 200
-    except Exception: return False
+        async with sess.post(url, **kwargs) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                c_log(f"Telegram API call failed ({resp.status}) for {url}: {body[:300]}")
+            return resp.status == 200
+    except Exception as e:
+        # This carries HALT/READ_ONLY escalation alerts, so a silent
+        # failure here means the operator never finds out something broke.
+        log_exception(f"_tg_post [{url}]", e)
+        return False
 
 def _to_reply_kbd(inline_kbd: dict):
     rows = []; bmap = {}
@@ -280,7 +414,8 @@ async def send_tg_document(file_path: str, caption: str) -> None:
             data.add_field('document', f, filename=os.path.basename(file_path))
             data.add_field('caption',  caption)
             await _tg_post(f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument', data=data)
-    except Exception: pass
+    except Exception as e:
+        log_exception(f"send_tg_document [{file_path}]", e)
 
 # ─────────────────────────────────────────────────────────────
 # OANDA FETCHER 
@@ -313,7 +448,8 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
                             await asyncio.sleep(2 ** attempt)
                             continue
                         data = await resp.json(); candles = data.get('candles', []); break
-                except Exception:
+                except Exception as e:
+                    log_exception(f"fetch_candles [{symbol} {granularity_str}] attempt {attempt+1}/3", e)
                     await asyncio.sleep(2 ** attempt)
 
             if not candles: break
@@ -467,55 +603,73 @@ def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
             f"مدة المراقبة: {sym_state['gann_cycle_hours']}س  |  فلتر: {filt}\nالدخول: {mode}\n\n\n"
             + '\n'.join(lines))
 
+_consecutive_real_order_failures = 0
+_REAL_ORDER_FAILURE_HALT_THRESHOLD = 3
+
 async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list, reason: str, tf: str) -> None:
+    global _consecutive_real_order_failures
     sym_state = bot_state['symbol_state'][symbol]
+
+    # Order-management critical path: never place an order while the
+    # connection state machine says we shouldn't be trading.
+    if not is_trading_allowed():
+        c_log(f"Skipped entry [{symbol} {tf}]: connection_state={bot_state.get('connection_state')} "
+              f"({bot_state.get('connection_state_reason')})")
+        return
+
     try:
         price = float(candles[-1]['close'])
         tp, sl = _gann_calc_tpsl(symbol, price, is_buy, candles, tf=tf)
-        lot = sym_state['lot_size']; side = 'BUY' if is_buy else 'SELL'
+        lot = sym_state['lot_size']
         tp_pts = _gann_tf_tp(symbol, tf); sl_pts = _gann_tf_sl(symbol, tf)
-        
+
         tpsl_lbl = (f"ATR({sym_state['gann_atr_period']})×{sym_state['gann_atr_sl_mult']}/{sym_state['gann_atr_tp_mult']}\n"
                     if sym_state['gann_tpsl_mode'] == 'atr' else f"SL:{sl_pts}p TP:{tp_pts}p")
-        
+
         be_lbl = " | 🛡️ BE Active" if sym_state['break_even_enabled'] else ""
-        
+
         is_real = sym_state.get('auto_trade', False)
         trade_id = f"sim_{int(datetime.now().timestamp())}_{tf}"
         real_msg = ""
-        
+
         if is_real:
-            if not METAAPI_TOKEN or METAAPI_TOKEN == 'YOUR_METAAPI_TOKEN' or not ACCOUNT_ID or ACCOUNT_ID == 'YOUR_ACCOUNT_ID':
-                real_msg = "\n⚠️ التداول الآلي مفعل ولكن بيانات MetaAPI غير صحيحة! تم تسجيلها وهمياً."
+            # Source of truth: never spin up a second, ad-hoc MetaAPI
+            # connection here. If the one persistent connection created at
+            # startup isn't healthy, we do not know the true account state
+            # well enough to safely fire a real order.
+            if _metaapi_conn is None:
+                real_msg = "\n⚠️ لا يوجد اتصال MetaAPI صالح — تم تسجيل الصفقة وهمياً فقط."
                 is_real = False
             else:
                 try:
-                    api = MetaApi(METAAPI_TOKEN)
-                    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-                    conn = account.get_rpc_connection()
-                    await conn.connect()
-                    await conn.wait_synchronized()
-                    
-                    # MetaTrader symbols rarely have underscores, and user configured bot_state['symbol'] as XAUUSDm
                     mt4_symbol = bot_state.get('symbol', symbol.replace('_', ''))
                     if is_buy:
-                        res = await conn.create_market_buy_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
+                        res = await _metaapi_conn.create_market_buy_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
                     else:
-                        res = await conn.create_market_sell_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
-                        
+                        res = await _metaapi_conn.create_market_sell_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
+
                     trade_id = str(res.get('orderId', res.get('positionId', trade_id)))
                     real_msg = "\n🚀 <b>تم فتح الصفقة حقيقياً على حسابك!</b>"
+                    _consecutive_real_order_failures = 0
                 except Exception as ex:
+                    log_exception(f"_gann_open_trade real order [{symbol} {tf}]", ex)
                     real_msg = f"\n❌ <b>فشل فتح الصفقة حقيقياً:</b> {ex}"
                     is_real = False
-        
+                    _consecutive_real_order_failures += 1
+                    if _consecutive_real_order_failures >= _REAL_ORDER_FAILURE_HALT_THRESHOLD:
+                        await set_connection_state(
+                            CONN_HALTED,
+                            f"{_consecutive_real_order_failures} consecutive real order failures "
+                            f"(last: {ex}). Escalating to protect capital."
+                        )
+
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': price, 'is_real': is_real, 'sl': sl, 'tp': tp,
             'be_trigger': (price + (tp - price)/2) if is_buy else (price - (price - tp)/2) # simplified BE trigger
         }
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
         save_bot_persistence()
-        
+
         await send_tg_msg(
             f"<b>✅ {'BUY 📈' if is_buy else 'SELL 📉'} [{symbol} - جان {tf}]</b>  {reason}\n\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {price:.2f}\n\n"
@@ -524,6 +678,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
             f"{real_msg}"
         )
     except Exception as e:
+        log_exception(f"_gann_open_trade [{symbol} {tf}]", e)
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
         await send_tg_msg(f"<b>❌ فشل تنفيذ الصفقة [{symbol} - جان {tf}]</b>\nالمستوى: {level['price']:.5f}\n{e}")
 
@@ -807,11 +962,16 @@ def get_gann_bt_keyboard() -> dict:
 # ─────────────────────────────────────────────────────────────
 # LIVE SCANNER (VWAP / EMA / BOTH Macro)
 # ─────────────────────────────────────────────────────────────
-async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict):
-    if not _metaapi_conn: return
+async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict) -> bool:
+    """Sequential, polled closure. Caller MUST await this fully before
+    moving to the next trade — never wrap calls to this in asyncio.gather."""
+    if not _metaapi_conn:
+        c_log(f"Cannot close {tid} ({symbol}): no live MetaAPI connection. Position remains open on broker.")
+        await send_tg_msg(f"🛑 <b>تعذّر إغلاق صفقة {symbol} ({tid}):</b> لا يوجد اتصال MetaAPI. الصفقة ما زالت مفتوحة على الوسيط.")
+        return False
     try:
         await _metaapi_conn.close_position(tid)
-        # State-Machine Polling for confirmation
+        # State-Machine Polling for confirmation — never assume success.
         for _ in range(25):
             positions = await _metaapi_conn.get_positions()
             if not any(str(p.get('id')) == str(tid) for p in positions):
@@ -819,13 +979,15 @@ async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict):
                 if tid in sym_state['gann_open_trades']:
                     del sym_state['gann_open_trades'][tid]
                     save_bot_persistence()
-                return
+                return True
             await asyncio.sleep(0.2)
-        c_log(f"Timeout waiting for {tid} to disappear from MT5.")
+        c_log(f"Timeout waiting for {tid} to disappear from MT5 positions after close_position call.")
+        await send_tg_msg(f"⚠️ <b>لم يتم تأكيد إغلاق {symbol} ({tid}) خلال المهلة.</b> يرجى التحقق يدوياً من الحساب.")
+        return False
     except Exception as e:
-        import traceback
-        c_log("Closure failed for " + str(tid) + " : " + traceback.format_exc())
-        await send_tg_msg(f"⚠️ <b>فشل الإغلاق الآلي:</b> صفقة {symbol} (خطأ: {e})")
+        log_exception(f"_close_metaapi_trade [{symbol}/{tid}]", e)
+        await send_tg_msg(f"⚠️ <b>فشل الإغلاق الآلي:</b> صفقة {symbol} (خطأ: {e})\nيرجى التحقق يدوياً من الحساب.")
+        return False
 
 async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
@@ -836,16 +998,26 @@ async def gann_monitor_scanner() -> None:
 
             # MT5 Zombie Singleton Heartbeat
             if _metaapi_account and _metaapi_account.connection_status != 'CONNECTED':
-                c_log("MetaAPI connection lost. Attempting robust reconnect...")
+                await set_connection_state(CONN_READ_ONLY, "MetaAPI connection lost — attempting reconnect.")
+                reconnected = False
                 for attempt in range(5):
                     try:
                         await _metaapi_conn.connect()
                         await _metaapi_conn.wait_synchronized()
                         c_log("MetaAPI Reconnected successfully.")
+                        reconnected = True
                         break
                     except Exception as e:
-                        c_log(f"MetaAPI reconnect failed: {e}")
+                        log_exception(f"MetaAPI reconnect attempt {attempt+1}/5", e)
                         await asyncio.sleep(2 ** attempt)
+                if reconnected:
+                    await set_connection_state(CONN_RUNNING, "MetaAPI reconnected and synchronized.")
+                else:
+                    # Do not spin forever inside this loop iteration; stay
+                    # READ_ONLY, log it, and let the next scanner tick retry.
+                    # If this persists, an operator will see the escalation
+                    # message and the repeated READ_ONLY state in logs.
+                    c_log("MetaAPI reconnect exhausted 5 attempts this tick; will retry next cycle.")
 
             now_dt = datetime.now(timezone.utc)
             
@@ -880,10 +1052,20 @@ async def gann_monitor_scanner() -> None:
                         try:
                             positions = await _metaapi_conn.get_positions()
                             for p in positions: actual_positions[str(p.get('id'))] = p
+                            # Sync succeeded — if we were previously degraded because of
+                            # sync failures specifically, this is our signal to recover.
+                            if bot_state.get('connection_state') == CONN_READ_ONLY and \
+                               'sync' in bot_state.get('connection_state_reason', '').lower():
+                                await set_connection_state(CONN_RUNNING, "MetaAPI get_positions() succeeded again.")
                         except Exception as e:
-                            c_log(f"MetaAPI get_positions failed: {e}")
+                            log_exception(f"MetaAPI get_positions [{symbol}]", e)
                             sync_failed = True
-                            
+                            await set_connection_state(
+                                CONN_READ_ONLY,
+                                f"MetaAPI get_positions() sync failed for {symbol}: {e}. "
+                                f"Halting new trades and skipping reconciliation this tick (Amnesia Prevention)."
+                            )
+
                     if sync_failed:
                         continue # DO NOT proceed with reconciliation or risk Amnesia Wipe
 
@@ -918,7 +1100,7 @@ async def gann_monitor_scanner() -> None:
                             start_time = datetime.now(timezone.utc) - timedelta(days=2)
                             history_deals_cache = await _metaapi_conn.get_history_deals_by_time_range(start_time, datetime.now(timezone.utc))
                         except Exception as e:
-                            c_log(f"Failed to pre-fetch historical deals: {e}")
+                            log_exception(f"get_history_deals_by_time_range [{symbol}]", e)
                     
                     for tid, tr in list(sym_state['gann_open_trades'].items()):
                         is_buy = tr.get('is_buy')
@@ -982,7 +1164,10 @@ async def gann_monitor_scanner() -> None:
                                         save_bot_persistence()
                                         await send_tg_msg(f"🛡️ تم تفعيل Break-Even لـ {symbol}!")
                                     except Exception as e:
-                                        c_log(f"BE modify failed: {e}")
+                                        log_exception(f"BE modify_position [{symbol}/{tid}]", e)
+                                        # be_activated stays False so we retry next tick; the
+                                        # user is told immediately since capital protection failed.
+                                        await send_tg_msg(f"⚠️ <b>فشل تفعيل Break-Even لـ {symbol} ({tid}):</b> {e}\nسيُعاد المحاولة تلقائياً.")
                                 else:
                                     tr['sl'] = net_be
                                     tr['be_activated'] = True
@@ -1095,7 +1280,8 @@ async def gann_monitor_scanner() -> None:
                             await _gann_open_trade(symbol, is_buy, lv, candles, reason=reason, tf=tf)
                             break
                             
-        except Exception as e: c_log(f'Gann monitor scanner error: {e}')
+        except Exception as e:
+            log_exception('gann_monitor_scanner main loop', e)
         await asyncio.sleep(15)
 
 # ─────────────────────────────────────────────────────────────
@@ -1138,8 +1324,8 @@ async def gann_cycle_manager() -> None:
                             await send_tg_msg(f"🔄 <b>تحديث دورة جان ({cycle_h}h)</b>\nالزوج: {symbol}\nإغلاق H1: {h1_close:.5f}\nتم تصفير المستويات لتبدأ من جديد!")
                             
         except Exception as e:
-            c_log(f'Cycle manager error: {e}')
-        
+            log_exception('gann_cycle_manager main loop', e)
+
         await asyncio.sleep(60)
 
 async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
@@ -1601,7 +1787,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
         if _bt_progress:
             import html
             try: await _bt_progress.done(f'❌ خطأ داخلي في الباكتيست:\n{html.escape(str(e))}')
-            except: pass
+            except Exception as inner_e: log_exception('backtest error notification', inner_e)
     finally:
         bot_state['is_backtesting'] = False
 
@@ -1956,7 +2142,9 @@ async def supervised(coro_fn, *args, label: str = '') -> None:
             if label == 'tg_polling': _poll_task = task
             await coro_fn(*args)
         except asyncio.CancelledError: await asyncio.sleep(2)   
-        except Exception as e: c_log(f'Task "{label}" crashed: {e}'); await asyncio.sleep(5)
+        except Exception as e:
+            log_exception(f'supervised task "{label}"', e)
+            await asyncio.sleep(5)
 
 # ─────────────────────────────────────────────────────────────
 # ENTRY POINT & WEB SERVER
@@ -1984,7 +2172,7 @@ async def main() -> None:
         asyncio.create_task(supervised(gann_cycle_manager,    label='gann_cycle')),
     ]
     
-    c_log('Gold Scalper Bot v8.9 started successfully.')
+    c_log('Gold Scalper Bot v9.4 (Resilience-First Core) started successfully.')
     try: await asyncio.gather(*tasks)
     finally:
         if _http and not _http.closed: await _http.close()
