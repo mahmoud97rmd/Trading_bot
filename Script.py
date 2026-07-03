@@ -1583,7 +1583,11 @@ async def process_tg_update(update: dict) -> None:
             if cb != 'noop': await _handle_callback(cb, bot_state['chat_id'], None)
             return
 
-        if msg == '/start': await send_tg_msg('<b>مرحباً بك في Gold Scalper Bot v8.9</b>', get_main_keyboard())
+        if msg.startswith('/setsymbol '):
+            new_sym = msg.split(' ')[1].strip()
+            bot_state['symbol'] = new_sym
+            await send_tg_msg(f"✅ تم تغيير الرمز الخاص بـ MetaTrader إلى: <b>{new_sym}</b>")
+        elif msg == '/start': await send_tg_msg('<b>مرحباً بك في Gold Scalper Bot v8.9</b>', get_main_keyboard())
         return
 
     if 'callback_query' not in update: return
