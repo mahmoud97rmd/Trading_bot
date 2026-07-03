@@ -336,10 +336,11 @@ def _gann_calc_tpsl(symbol: str, entry: float, is_buy: bool, candles: list, tf: 
     return round(entry - tp_dist, prec), round(entry + sl_dist, prec)
 
 async def _gann_fetch_last_closed_h1(symbol: str) -> dict | None:
-    candles = await fetch_candles(symbol, '1h', count=2)
-    if not candles: return None
+    candles = await fetch_candles(symbol, '1h', count=3)
+    if not candles or len(candles) < 2: return None
     candles = sorted(candles, key=lambda c: c['time'])
-    return candles[-1]
+    # candles[-1] is the current open candle, candles[-2] is the last fully closed candle.
+    return candles[-2]
 
 def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
     sym_state = bot_state['symbol_state'][symbol]
@@ -804,6 +805,49 @@ async def gann_monitor_scanner() -> None:
 # ─────────────────────────────────────────────────────────────
 # PRO BACKTEST ENGINE (Macro Trend & Smart Break-Even)
 # ─────────────────────────────────────────────────────────────
+
+async def gann_cycle_manager() -> None:
+    c_log('Gann cycle manager started.')
+    while True:
+        try:
+            if bot_state['status'] != 'RUNNING':
+                await asyncio.sleep(60); continue
+
+            now_utc = datetime.now(timezone.utc)
+            active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
+            for symbol in active_symbols:
+                sym_state = bot_state['symbol_state'][symbol]
+                if not sym_state['gann_cycle_active']:
+                    continue
+                    
+                started_at = sym_state['gann_cycle_started_at']
+                if not started_at: continue
+                
+                cycle_h = sym_state['gann_cycle_hours']
+                elapsed_hours = (now_utc - started_at).total_seconds() / 3600.0
+                
+                if elapsed_hours >= cycle_h:
+                    last_h1 = await _gann_fetch_last_closed_h1(symbol)
+                    if last_h1:
+                        h1_time = last_h1['time']
+                        if not sym_state['gann_last_h1_time'] or h1_time > sym_state['gann_last_h1_time']:
+                            h1_close = float(last_h1['close'])
+                            sym_state['gann_levels'] = gann_calc_levels(symbol, h1_close)
+                            sym_state['gann_close_used'] = h1_close
+                            sym_state['gann_last_h1_time'] = h1_time
+                            sym_state['gann_cycle_started_at'] = now_utc
+                            
+                            # Clear used levels so we can take trades again!
+                            sym_state['gann_level_status'] = {}
+                            
+                            c_log(f'[{symbol}] New {cycle_h}h cycle started at {h1_close}')
+                            await send_tg_msg(f"🔄 <b>تحديث دورة جان ({cycle_h}h)</b>\nالزوج: {symbol}\nإغلاق H1: {h1_close:.5f}\nتم تصفير المستويات لتبدأ من جديد!")
+                            
+        except Exception as e:
+            c_log(f'Cycle manager error: {e}')
+        
+        await asyncio.sleep(60)
+
 async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
     global _bt_progress
     bot_state['is_backtesting'] = True
@@ -1613,6 +1657,7 @@ async def main() -> None:
         asyncio.create_task(supervised(telegram_polling_loop, label='tg_polling')),
         asyncio.create_task(supervised(telegram_watchdog,     label='tg_watchdog')),
         asyncio.create_task(supervised(gann_monitor_scanner,  label='gann_monitor')),
+        asyncio.create_task(supervised(gann_cycle_manager,    label='gann_cycle')),
     ]
     
     c_log('Gold Scalper Bot v8.9 started successfully.')
