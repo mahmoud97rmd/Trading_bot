@@ -1222,9 +1222,9 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                     
                 total_daily = daily_pl + floating_pl
                 if dd_limit < 0 and total_daily <= dd_limit:
-                    suspended_days[current_day] = f'🛑 تراجع عائم ({round(total_daily, 2)}$)'
+                    suspended_days[current_day] = f'🛑 تراجع عائم (الحد {dd_limit}$ | المحقق: {round(daily_pl, 2)}$ + العائم: {round(floating_pl, 2)}$ = {round(total_daily, 2)}$)'
                 elif profit_limit > 0 and total_daily >= profit_limit:
-                    suspended_days[current_day] = f'✅ هدف عائم ({round(total_daily, 2)}$)'
+                    suspended_days[current_day] = f'✅ هدف عائم (الحد {profit_limit}$ | المحقق: {round(daily_pl, 2)}$ + العائم: {round(floating_pl, 2)}$ = {round(total_daily, 2)}$)'
                     
                 if current_day in suspended_days:
                     # Close all open trades at current market price!
