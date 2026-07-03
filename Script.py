@@ -57,6 +57,26 @@ def c_log(msg: str) -> None:
 # ─────────────────────────────────────────────────────────────
 # GLOBAL STATE
 # ─────────────────────────────────────────────────────────────
+_metaapi = None
+_metaapi_account = None
+_metaapi_conn = None
+
+async def init_metaapi():
+    global _metaapi, _metaapi_account, _metaapi_conn
+    if not METAAPI_TOKEN or METAAPI_TOKEN == 'YOUR_METAAPI_TOKEN': return
+    if not ACCOUNT_ID or ACCOUNT_ID == 'YOUR_ACCOUNT_ID': return
+    try:
+        from metaapi_cloud_sdk import MetaApi
+        _metaapi = MetaApi(METAAPI_TOKEN)
+        _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
+        if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
+            _metaapi_conn = _metaapi_account.get_rpc_connection()
+            await _metaapi_conn.connect()
+            await _metaapi_conn.wait_synchronized()
+            c_log("✅ MetaAPI Persistent Connection established.")
+    except Exception as e:
+        c_log(f"MetaAPI Init Error: {e}")
+
 bot_state: dict = {
     'status':           'RUNNING',
     'symbol':           'XAUUSDm',
@@ -121,6 +141,12 @@ bot_state: dict = {
     
     'prot_daily_dd_usd':      200,
     'prot_daily_profit_usd':  150,
+    'prot_true_sync': True,
+    'prot_cost_be': True,
+    'prot_stale_filter': True,
+    'prot_cycle_inval': True,
+    'prot_cycle_inval_pts': 200,
+    'gann_anchor_tf': '1h',
     'prot_allow_multi_tf':    True,
 
     
@@ -220,9 +246,13 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
             for attempt in range(3):
                 try:
                     async with get_http().get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                        if resp.status != 200: break
+                        if resp.status != 200:
+                            if attempt == 2: break
+                            await asyncio.sleep(2 ** attempt)
+                            continue
                         data = await resp.json(); candles = data.get('candles', []); break
-                except Exception: await asyncio.sleep(1)
+                except Exception:
+                    await asyncio.sleep(2 ** attempt)
 
             if not candles: break
             complete = [c for c in candles if c.get('complete', True)]
@@ -535,6 +565,17 @@ def get_protection_keyboard() -> dict:
     ]
     return {'inline_keyboard': rows}
 
+
+def get_protection_keyboard() -> dict:
+    return {'inline_keyboard': [
+        [{'text': f"مزامنة MT4 (Reconciliation): {'✅' if bot_state.get('prot_true_sync', True) else '🔴'}", 'callback_data': 'tg_prot_sync'}],
+        [{'text': f"إلغاء الدورة وقت الانفجار: {'✅' if bot_state.get('prot_cycle_inval', True) else '🔴'}", 'callback_data': 'tg_prot_inval'}],
+        [{'text': f"BE شامل التكلفة (True Cost): {'✅' if bot_state.get('prot_cost_be', True) else '🔴'}", 'callback_data': 'tg_prot_cost'}],
+        [{'text': f"فلتر البيانات المتأخرة: {'✅' if bot_state.get('prot_stale_filter', True) else '🔴'}", 'callback_data': 'tg_prot_stale'}],
+        [{'text': f"إطار مرجعي للجان (Anchor): {bot_state.get('gann_anchor_tf', '1h').upper()}", 'callback_data': 'tg_prot_anchor'}],
+        [{'text': '← رجوع', 'callback_data': 'menu_gann'}]
+    ]}
+
 def get_gann_keyboard() -> dict:
     sym = bot_state['ui_selected_symbol']
     sym_state = bot_state['symbol_state'][sym]
@@ -573,6 +614,7 @@ def get_gann_keyboard() -> dict:
     
     rows = [
         [{'text': f'🤖 التداول الآلي (MetaAPI): {auto_t}', 'callback_data': 'gann_toggle_auto_trade'}],
+        [{'text': '🛡️ إعدادات الحماية المتقدمة', 'callback_data': 'menu_protection'}],
         [{'text': f'📐 {sym} — دورة: {cyc}  |  صفقات: {open_n}', 'callback_data': 'noop'}],
         [{'text': '🔄 عرض الدعوم والمقاومات الحالية', 'callback_data': 'gann_show_levels'}],
     ]
@@ -695,6 +737,16 @@ def get_gann_bt_keyboard() -> dict:
 # ─────────────────────────────────────────────────────────────
 # LIVE SCANNER (VWAP / EMA / BOTH Macro)
 # ─────────────────────────────────────────────────────────────
+async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict):
+    if not _metaapi_conn: return
+    try:
+        await _metaapi_conn.close_position(tid)
+        await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح موازياً لحماية الحساب!</b>")
+        if tid in sym_state['gann_open_trades']:
+            del sym_state['gann_open_trades'][tid]
+    except Exception as e:
+        await send_tg_msg(f"⚠️ <b>فشل الإغلاق الآلي:</b> صفقة {symbol} (خطأ: {e})")
+
 async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
     while True:
@@ -715,51 +767,101 @@ async def gann_monitor_scanner() -> None:
                 continue
                 
             active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
-            
             total_floating = 0.0
-            total_realized = bot_state.get('live_daily_realized', 0.0)
             
-            # --- First pass: track open trades and calculate floating ---
+            # --- MetaAPI Reconciliation ---
+            actual_positions = {}
+            if bot_state.get('prot_true_sync', True) and _metaapi_conn:
+                try:
+                    positions = await _metaapi_conn.get_positions()
+                    for p in positions: actual_positions[str(p.get('id'))] = p
+                except Exception as e: pass
+            
+            # --- First pass: track open trades ---
             for symbol in active_symbols:
                 sym_state = bot_state['symbol_state'][symbol]
-                if sym_state['gann_open_trades']:
-                    mc = await fetch_candles(symbol, '1m', count=2)
+                
+                # Check Cycle Invalidation (Frozen Gann Levels)
+                if bot_state.get('prot_cycle_inval', True) and sym_state.get('gann_close_used'):
+                    mc = await fetch_candles(symbol, '1m', count=1)
                     if mc:
                         live_px = float(mc[-1]['close'])
-                        closed_ids = []
-                        for tid, tr in sym_state['gann_open_trades'].items():
-                            is_buy = tr.get('is_buy')
-                            tp = tr.get('tp')
-                            sl = tr.get('sl')
-                            entry = tr.get('entry')
-                            tf = tr.get('tf')
-                            
-                            diff = (live_px - entry) if is_buy else (entry - live_px)
-                            cs = SYMBOL_INFO[symbol]['contract_size']
-                            quote_conv = 1.0
-                            trade_pl = round(diff * sym_state['lot_size'] * cs * quote_conv, 2)
-                            
-                            outcome = None
-                            if is_buy:
-                                if live_px >= tp: outcome = 'WIN ✅'
-                                elif live_px <= sl: outcome = 'LOSS ❌'
-                            else:
-                                if live_px <= tp: outcome = 'WIN ✅'
-                                elif live_px >= sl: outcome = 'LOSS ❌'
-                                
-                            if outcome:
+                        dist = abs(live_px - sym_state['gann_close_used'])
+                        pv = SYMBOL_INFO[symbol]['pip_value']
+                        inval_pts = bot_state.get('prot_cycle_inval_pts', 200) * pv
+                        if dist > inval_pts:
+                            sym_state['gann_levels'] = []
+                            sym_state['gann_close_used'] = None
+                            await send_tg_msg(f"🚨 <b>إلغاء دورة {symbol}:</b> السعر تحرك بحدة! تم تجميد التداول بانتظار الدورة القادمة للحماية.")
+                
+                if sym_state['gann_open_trades']:
+                    mc = await fetch_candles(symbol, '1m', count=2)
+                    if not mc: continue
+                    
+                    # Stale Data Filter
+                    candle_age = (now_dt - mc[-1]['time']).total_seconds()
+                    if bot_state.get('prot_stale_filter', True) and candle_age > 120:
+                        c_log(f"Stale data for {symbol} (age: {candle_age}s), skipping.")
+                        continue
+                        
+                    live_px = float(mc[-1]['close'])
+                    closed_ids = []
+                    
+                    for tid, tr in list(sym_state['gann_open_trades'].items()):
+                        is_buy = tr.get('is_buy')
+                        tp = tr.get('tp')
+                        sl = tr.get('sl')
+                        entry = tr.get('entry')
+                        tf = tr.get('tf')
+                        is_real = tr.get('is_real')
+                        
+                        diff = (live_px - entry) if is_buy else (entry - live_px)
+                        cs = SYMBOL_INFO[symbol]['contract_size']
+                        trade_pl = round(diff * sym_state['lot_size'] * cs, 2)
+                        
+                        if is_real and bot_state.get('prot_true_sync', True) and _metaapi_conn:
+                            if tid not in actual_positions:
                                 closed_ids.append(tid)
                                 bot_state['live_daily_realized'] += trade_pl
-                                msg = f"🔔 <b>تحديث صفقة [{symbol} - جان {tf}]</b>\n\nالنتيجة: {outcome} ({trade_pl}$)\nسعر الإغلاق: {live_px:.2f}"
-                                if tr.get('is_real'): msg += "\n\n(الصفقة حقيقية، تم إغلاقها تلقائياً على منصتك بناءً على TP/SL)"
-                                await send_tg_msg(msg)
+                                continue
                             else:
-                                total_floating += trade_pl
-                                
-                        for tid in closed_ids:
+                                trade_pl = actual_positions[tid].get('unrealizedProfit', trade_pl)
+                        
+                        outcome = None
+                        if is_buy:
+                            if live_px >= tp: outcome = 'WIN ✅'
+                            elif live_px <= sl: outcome = 'LOSS ❌'
+                        else:
+                            if live_px <= tp: outcome = 'WIN ✅'
+                            elif live_px >= sl: outcome = 'LOSS ❌'
+                            
+                        # True Cost-Aware BE
+                        if bot_state.get('prot_cost_be', True) and sym_state.get('break_even_enabled') and not tr.get('be_activated'):
+                            tp_dist = abs(tp - entry)
+                            if (is_buy and live_px >= entry + tp_dist*0.7) or (not is_buy and live_px <= entry - tp_dist*0.7):
+                                be_margin = sym_state.get('gann_atr_period', 14) * 0.1 * SYMBOL_INFO[symbol]['pip_value']
+                                net_be = (entry + be_margin) if is_buy else (entry - be_margin)
+                                tr['sl'] = net_be
+                                tr['be_activated'] = True
+                                if is_real and _metaapi_conn:
+                                    try:
+                                        await _metaapi_conn.modify_position(tid, stop_loss=net_be)
+                                        await send_tg_msg(f"🛡️ تم تفعيل Break-Even شامل التكلفة لـ {symbol}!")
+                                    except Exception as e: pass
+
+                        if outcome:
+                            closed_ids.append(tid)
+                            bot_state['live_daily_realized'] += trade_pl
+                            msg = f"🔔 <b>تحديث صفقة [{symbol} - جان {tf}]</b>\n\nالنتيجة: {outcome} ({trade_pl}$)\nسعر الإغلاق: {live_px:.2f}"
+                            await send_tg_msg(msg)
+                        else:
+                            total_floating += trade_pl
+                            
+                    for tid in closed_ids:
+                        if tid in sym_state['gann_open_trades']:
                             del sym_state['gann_open_trades'][tid]
 
-            # --- Evaluate Daily Limits ---
+            # --- Evaluate Daily Limits (Race Condition Fix) ---
             total_daily = bot_state['live_daily_realized'] + total_floating
             dd_limit = -float(bot_state.get('prot_daily_dd_usd', 220))
             profit_limit = float(bot_state.get('prot_daily_profit_usd', 150))
@@ -767,27 +869,19 @@ async def gann_monitor_scanner() -> None:
             if (dd_limit < 0 and total_daily <= dd_limit) or (profit_limit > 0 and total_daily >= profit_limit):
                 bot_state['live_daily_hit'] = True
                 limit_type = '🛑 تراجع عائم' if total_daily <= dd_limit else '✅ هدف يومي عائم'
-                await send_tg_msg(f"{limit_type} تم الوصول إليه! ({total_daily:.2f}$)\nسيتم إغلاق جميع الصفقات المفتوحة وإيقاف التداول لهذا اليوم.")
+                await send_tg_msg(f"{limit_type} تم الوصول إليه! ({total_daily:.2f}$)\nسيتم إغلاق جميع الصفقات المفتوحة موازياً وإيقاف التداول.")
                 
-                # Close all open trades internally AND via MetaAPI if real
+                coros = []
                 for symbol in active_symbols:
                     sym_state = bot_state['symbol_state'][symbol]
                     for tid, tr in list(sym_state['gann_open_trades'].items()):
-                        if tr.get('is_real'):
-                            try:
-                                api = MetaApi(METAAPI_TOKEN)
-                                account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-                                conn = account.get_rpc_connection()
-                                await conn.connect()
-                                await conn.wait_synchronized()
-                                await conn.close_position(tid)
-                                await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) آلياً لحماية الحساب!</b>")
-                            except Exception as e:
-                                await send_tg_msg(f"⚠️ <b>تنبيه عاجل:</b> فشل البوت في إغلاق صفقة {symbol} آلياً ({e}). <b>يرجى إغلاقها يدوياً من منصتك فوراً!</b>")
-                        del sym_state['gann_open_trades'][tid]
-                        
-                continue # Skip new trades
-                
+                        if tr.get('is_real') and _metaapi_conn:
+                            coros.append(_close_metaapi_trade(symbol, tid, sym_state))
+                        else:
+                            del sym_state['gann_open_trades'][tid]
+                if coros: await asyncio.gather(*coros)
+                continue
+
             for symbol in active_symbols:
                 sym_state = bot_state['symbol_state'][symbol]
 
@@ -883,7 +977,7 @@ async def gann_cycle_manager() -> None:
                     continue
                     
                 cycle_h = sym_state['gann_cycle_hours']
-                last_h1 = await _gann_fetch_last_closed_h1(symbol)
+                last_h1 = await _gann_fetch_last_closed_anchor(symbol)
                 
                 if last_h1:
                     h1_time = last_h1['time']
@@ -1466,6 +1560,15 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         bot_state['prot_daily_profit_usd'] = min(10000, bot_state['prot_daily_profit_usd'] + 100)
         await _show(chat_id, msg_id, 'إعدادات الحماية:', get_protection_keyboard())
     elif d == 'menu_gann': await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
+    elif d == 'menu_protection': await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+    elif d == 'tg_prot_sync': bot_state['prot_true_sync'] = not bot_state.get('prot_true_sync', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+    elif d == 'tg_prot_inval': bot_state['prot_cycle_inval'] = not bot_state.get('prot_cycle_inval', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+    elif d == 'tg_prot_cost': bot_state['prot_cost_be'] = not bot_state.get('prot_cost_be', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+    elif d == 'tg_prot_stale': bot_state['prot_stale_filter'] = not bot_state.get('prot_stale_filter', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+    elif d == 'tg_prot_anchor': 
+        bot_state['gann_anchor_tf'] = '4h' if bot_state.get('gann_anchor_tf', '1h') == '1h' else '1h'
+        await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+
     elif d == 'gann_show_levels':
         sym = bot_state['ui_selected_symbol']
         if not bot_state['symbol_state'][sym]['gann_levels'] or not bot_state['symbol_state'][sym]['gann_close_used']:
@@ -1707,6 +1810,7 @@ async def handle_ping(request: web.Request) -> web.Response:
 
 async def main() -> None:
     get_http()
+    await init_metaapi()
     app = web.Application()
     app.router.add_get('/', handle_ping)
     
