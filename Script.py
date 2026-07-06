@@ -19,7 +19,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 from aiohttp import web
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -116,11 +116,34 @@ async def set_connection_state(new_state: str, reason: str) -> None:
     icon = {'RUNNING': '\u2705', 'READ_ONLY': '\U0001F7E1', 'HALTED': '\U0001F6D1'}.get(new_state, '\u2139')
     await send_tg_msg(f"{icon} <b>connection state changed: {old_state} -> {new_state}</b>\n{reason}")
 
+_DAM_RESTRICTED_WINDOWS = [
+    (dtime(7, 0),  dtime(9, 0)),   # European Open fakeouts
+    (dtime(13, 0), dtime(14, 0)),  # Pre-US session turbulence
+]
+
+def _is_within_dam_restricted_window() -> bool:
+    """DAM (Damascus / UTC+3) time-of-day filter. Based on backtest
+    analysis, these windows carry enough market noise to invalidate Gann
+    levels and stack losses, so new entries are skipped during them.
+    Existing-position management (BE/TP/SL/closures) is NOT affected --
+    this only blocks NEW trade dispatch, same scope as is_trading_allowed().
+    Toggleable via bot_state['prot_dam_time_filter'] (default: on)."""
+    if not bot_state.get('prot_dam_time_filter', True):
+        return False
+    dam_now = datetime.now(timezone.utc) + timedelta(hours=3)
+    t = dam_now.time()
+    return any(start <= t < end for start, end in _DAM_RESTRICTED_WINDOWS)
+
 def is_trading_allowed() -> bool:
     """New order placement is only allowed when the connection state is
-    fully healthy. Existing-position management (BE/TP/SL) is handled
-    separately and is NOT gated by this, per the OANDA-degraded-mode rule."""
-    return bot_state.get('connection_state', CONN_RUNNING) == CONN_RUNNING
+    fully healthy AND we're not inside a restricted DAM time window.
+    Existing-position management (BE/TP/SL) is handled separately and is
+    NOT gated by this, per the OANDA-degraded-mode rule."""
+    if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING:
+        return False
+    if _is_within_dam_restricted_window():
+        return False
+    return True
 
 async def init_metaapi():
     """Startup order is fixed:
@@ -192,30 +215,43 @@ def _write_persistence_file_sync(data: dict) -> None:
     os.replace(TEMP_PERSISTENCE_FILE, PERSISTENCE_FILE)
 
 async def save_bot_persistence() -> None:
-    """Atomic write: full operational state, not just open trades, so a
-    hard restart can reconstruct the bot's world exactly, including
-    in-progress Gann cycles and used levels."""
+    """Atomic write: full operational state AND full settings, so a hard
+    restart reconstructs the bot's world exactly -- not just open trades
+    and Gann cycle state, but every user-configured setting (lot size,
+    protection limits, anchor timeframe, filters, TP/SL config, etc).
+
+    Deliberately exclude-list based, not include-whitelist based: the
+    previous version only ever saved a fixed list of live trade-state
+    fields, which meant lot size, protection dd/profit limits, the anchor
+    timeframe, and effectively every other setting were NEVER actually
+    persisted -- even though save_bot_persistence() was correctly being
+    called after every mutation. An exclude-list means any new setting
+    added later is persisted automatically instead of silently dropped
+    until someone remembers to add it to a whitelist.
+    """
     try:
+        # Fields that either aren't JSON-serializable or are purely
+        # transient/regenerated-on-render -- everything else in bot_state
+        # is a real setting and gets saved.
+        TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
+                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state'}
+
         symbol_snapshot = {}
         for sym in bot_state['active_symbols']:
             ss = bot_state['symbol_state'][sym]
-            symbol_snapshot[sym] = {
-                'gann_open_trades':      ss.get('gann_open_trades', {}),
-                'gann_levels':           ss.get('gann_levels', []),
-                'gann_level_status':     ss.get('gann_level_status', {}),
-                'gann_close_used':       ss.get('gann_close_used'),
-                'gann_last_h1_time':     ss.get('gann_last_h1_time').isoformat() if ss.get('gann_last_h1_time') else None,
-                'gann_cycle_active':     ss.get('gann_cycle_active', False),
-                'gann_cycle_started_at': ss.get('gann_cycle_started_at').isoformat() if ss.get('gann_cycle_started_at') else None,
-            }
+            snap = {k: v for k, v in ss.items() if k not in ('gann_last_h1_time', 'gann_cycle_started_at')}
+            snap['gann_last_h1_time'] = ss.get('gann_last_h1_time').isoformat() if ss.get('gann_last_h1_time') else None
+            snap['gann_cycle_started_at'] = ss.get('gann_cycle_started_at').isoformat() if ss.get('gann_cycle_started_at') else None
+            symbol_snapshot[sym] = snap
+
         data = {
-            'schema_version': 2,
-            'live_daily_realized': bot_state.get('live_daily_realized', 0.0),
-            'live_daily_date': str(bot_state.get('live_daily_date')),
-            'live_daily_hit': bot_state.get('live_daily_hit', False),
-            'connection_state': bot_state.get('connection_state', CONN_RUNNING),
+            'schema_version': 3,
             'symbol_state': symbol_snapshot,
         }
+        for k, v in bot_state.items():
+            if k not in TOP_LEVEL_EXCLUDE:
+                data[k] = v
+        data['live_daily_date'] = str(bot_state.get('live_daily_date'))
     except Exception as e:
         log_exception("save_bot_persistence (snapshot phase)", e)
         return
@@ -237,8 +273,16 @@ def load_bot_persistence():
     try:
         with open(PERSISTENCE_FILE, 'r') as f:
             data = json.load(f)
-        bot_state['live_daily_realized'] = data.get('live_daily_realized', 0.0)
-        bot_state['live_daily_hit'] = data.get('live_daily_hit', False)
+
+        TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
+                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state'}
+        for k, v in data.items():
+            # Only restore keys that already exist in bot_state's default
+            # shape -- never let a saved file inject brand-new top-level
+            # keys the current code doesn't define.
+            if k in bot_state and k not in TOP_LEVEL_EXCLUDE and k != 'live_daily_date':
+                bot_state[k] = v
+
         saved_date = data.get('live_daily_date')
         if saved_date and saved_date != 'None':
             bot_state['live_daily_date'] = datetime.strptime(saved_date, '%Y-%m-%d').date()
@@ -249,22 +293,22 @@ def load_bot_persistence():
                 if sym not in bot_state['symbol_state']:
                     continue
                 ss = bot_state['symbol_state'][sym]
-                ss['gann_open_trades']  = snap.get('gann_open_trades', {})
-                ss['gann_levels']       = snap.get('gann_levels', [])
-                ss['gann_level_status'] = snap.get('gann_level_status', {})
-                ss['gann_close_used']   = snap.get('gann_close_used')
-                ss['gann_cycle_active'] = snap.get('gann_cycle_active', False)
+                for k, v in snap.items():
+                    if k in ('gann_last_h1_time', 'gann_cycle_started_at'):
+                        continue
+                    if k in ss:  # same safety principle as top-level: only restore known fields
+                        ss[k] = v
                 lh1 = snap.get('gann_last_h1_time')
                 ss['gann_last_h1_time'] = pd.Timestamp(lh1).to_pydatetime() if lh1 else None
                 csa = snap.get('gann_cycle_started_at')
                 ss['gann_cycle_started_at'] = pd.Timestamp(csa).to_pydatetime() if csa else None
         else:
-            # Backward-compat with the old schema (open trades only).
+            # Backward-compat with the oldest schema (open trades only).
             for sym, trades in data.get('gann_open_trades', {}).items():
                 if sym in bot_state['symbol_state']:
                     bot_state['symbol_state'][sym]['gann_open_trades'] = trades
 
-        c_log("Bot state restored from persistence file (open trades, Gann cycle state, daily PnL).")
+        c_log("Bot state restored from persistence file (settings, open trades, Gann cycle state, daily PnL).")
     except Exception as e:
         # If the persistence file is corrupt we must not silently pretend
         # we're starting clean while real broker positions may still be
@@ -601,6 +645,15 @@ GANN_COEFS = [
     {'c': 8.0,    'star': False, 'fan': True},  # 1x8
 ]
 
+def _anchor_hours() -> int:
+    """Hour-equivalent of the selected Gann anchor timeframe."""
+    return 4 if bot_state.get('gann_anchor_tf', '1h') == '4h' else 1
+
+def _anchor_label() -> str:
+    """Display label ('H1'/'H4') matching the selected anchor timeframe --
+    used everywhere a message previously hardcoded the literal text 'H1'."""
+    return bot_state.get('gann_anchor_tf', '1h').upper()
+
 def gann_calc_levels(symbol: str, close: float) -> list[dict]:
     levels = []
     anchor_tf = bot_state.get('gann_anchor_tf', '1h')
@@ -629,7 +682,7 @@ def gann_calc_levels(symbol: str, close: float) -> list[dict]:
         if dn > 0:
             levels.append({'key': f'dn_{i}', 'price': dn, 'dir': 'dn', 'star': item['star'], 'fan': item['fan'], 'label': dn_lbl})
             
-    levels.append({'key': 'ref', 'price': round(close, SYMBOL_INFO[symbol]['prec']), 'dir': 'ref', 'star': False, 'fan': False, 'label': 'إغلاق H1'})
+    levels.append({'key': 'ref', 'price': round(close, SYMBOL_INFO[symbol]['prec']), 'dir': 'ref', 'star': False, 'fan': False, 'label': f'إغلاق {_anchor_label()}'})
     levels.sort(key=lambda x: x['price'], reverse=True)
     return levels
 
@@ -692,7 +745,7 @@ def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
     lines = []
     for l in bot_state['symbol_state'][symbol]['gann_levels']:
         if l['dir'] == 'ref':
-            lines.append(f"➖ <b>{l['price']:.2f}</b>  (إغلاق H1)")
+            lines.append(f"➖ <b>{l['price']:.2f}</b>  (إغلاق {_anchor_label()})")
             continue
         
         icon = '🔴' if l['dir'] == 'up' else '🟢'
@@ -708,7 +761,7 @@ def _gann_fmt_levels_msg(symbol: str, close: float) -> str:
     
     mode = f'لمس مباشر + فلتر ({flt_trend}_{sym_state["trend_timeframe"].upper()})' if sym_state['gann_entry_mode'] == 'touch_trend' else 'لمس أعمى (بدون فلتر)'
     return (f"📐 <b>سلّم جان (المروحة) — دورة جديدة</b>\n"
-            f"إغلاق H1: <b>{close:.2f}</b>\n\n"
+            f"إغلاق {_anchor_label()}: <b>{close:.2f}</b>\n\n"
             f"مدة المراقبة: {sym_state['gann_cycle_hours']}س  |  فلتر: {filt}\nالدخول: {mode}\n\n\n"
             + '\n'.join(lines))
 
@@ -720,10 +773,15 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
     sym_state = bot_state['symbol_state'][symbol]
 
     # Order-management critical path: never place an order while the
-    # connection state machine says we shouldn't be trading.
+    # connection state machine says we shouldn't be trading, or while
+    # we're inside a restricted DAM time window.
     if not is_trading_allowed():
-        c_log(f"Skipped entry [{symbol} {tf}]: connection_state={bot_state.get('connection_state')} "
-              f"({bot_state.get('connection_state_reason')})")
+        if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING:
+            c_log(f"Skipped entry [{symbol} {tf}]: connection_state={bot_state.get('connection_state')} "
+                  f"({bot_state.get('connection_state_reason')})")
+        else:
+            c_log(f"Skipped entry [{symbol} {tf}]: inside restricted DAM trading window "
+                  f"({datetime.now(timezone.utc) + timedelta(hours=3):%H:%M} DAM).")
         return
 
     try:
@@ -783,7 +841,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
             f"<b>✅ {'BUY 📈' if is_buy else 'SELL 📉'} [{symbol} - جان {tf}]</b>  {reason}\n\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {price:.2f}\n\n"
             f"TP: {tp}  SL: {sl}  |  {tpsl_lbl}{be_lbl}\n"
-            f"إغلاق H1: {bot_state['symbol_state'][symbol]['gann_close_used']:.5f}\n"
+            f"إغلاق {_anchor_label()}: {bot_state['symbol_state'][symbol]['gann_close_used']:.5f}\n"
             f"{real_msg}"
         )
     except Exception as e:
@@ -897,6 +955,7 @@ def get_protection_keyboard() -> dict:
         [{'text': f"BE شامل التكلفة (True Cost): {'✅' if bot_state.get('prot_cost_be', True) else '🔴'}", 'callback_data': 'tg_prot_cost'}],
         [{'text': f"فلتر البيانات المتأخرة: {'✅' if bot_state.get('prot_stale_filter', True) else '🔴'}", 'callback_data': 'tg_prot_stale'}],
         [{'text': f"إطار مرجعي للجان (Anchor): {bot_state.get('gann_anchor_tf', '1h').upper()}", 'callback_data': 'tg_prot_anchor'}],
+        [{'text': f"فلتر أوقات دمشق (07-09 | 13-14): {'✅' if bot_state.get('prot_dam_time_filter', True) else '🔴'}", 'callback_data': 'tg_prot_dam_time'}],
         [{'text': f'تكرار الصفقات (Multi-TF): {multi_tf}', 'callback_data': 'prot_toggle_multitf'}],
         [{'text': '🔙 رجوع للقائمة الرئيسية', 'callback_data': 'menu_main'}],
         [{'text': '🔙 رجوع لإعدادات جان', 'callback_data': 'menu_gann'}]
@@ -1564,7 +1623,7 @@ async def gann_cycle_manager() -> None:
                             sym_state['gann_level_status'] = {}
                             
                             c_log(f'[{symbol}] New {cycle_h}h cycle started at {h1_close}')
-                            await send_tg_msg(f"🔄 <b>تحديث دورة جان ({cycle_h}h)</b>\nالزوج: {symbol}\nإغلاق H1: {h1_close:.5f}\nتم تصفير المستويات لتبدأ من جديد!")
+                            await send_tg_msg(f"🔄 <b>تحديث دورة جان ({cycle_h}h)</b>\nالزوج: {symbol}\nإغلاق {_anchor_label()}: {h1_close:.5f}\nتم تصفير المستويات لتبدأ من جديد!")
                             
         except Exception as e:
             log_exception('gann_cycle_manager main loop', e)
@@ -1728,8 +1787,9 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                 c1_dn = df_trend['close'] < df_trend['VWAP']; c2_dn = df_trend['close'] < df_trend['EMA']
                 df_trend['macro_trend_up'] = np.where(c1_up & c2_up, True, np.where(c1_dn & c2_dn, False, None))
 
-            await prog.set_phase('جلب بيانات H1...')
-            candles_h1 = await fetch_candles(symbol, '1h', count=delta_hours + 10, end_time=end_dt)
+            anchor_gran = bot_state.get('gann_anchor_tf', '1h')
+            await prog.set_phase(f'جلب بيانات {_anchor_label()}...')
+            candles_h1 = await fetch_candles(symbol, anchor_gran, count=(delta_hours // _anchor_hours()) + 10, end_time=end_dt)
             if not candles_h1: continue
 
             await prog.set_phase('جلب شموع الفريمات الصغيرة...')
@@ -2071,7 +2131,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
         for tr in res['trade_logs']:
             if tr['cycle_ts'] != current_cycle:
                 current_cycle = tr['cycle_ts']
-                ws_trades.append([f"دورة H1: {tr['cycle_time_str']}  |  إغلاق H1: {tr['cycle_close']:.2f}"] + [""]*9)
+                ws_trades.append([f"دورة {_anchor_label()}: {tr['cycle_time_str']}  |  إغلاق {_anchor_label()}: {tr['cycle_close']:.2f}"] + [""]*9)
                 row_idx = ws_trades.max_row
                 ws_trades.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=10)
                 ws_trades.cell(row=row_idx, column=1).fill = header_fill
@@ -2095,7 +2155,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                     ws_trades.cell(row=row_idx, column=col).fill = fill
 
         ws_cycles = wb.create_sheet("دورات H1")
-        ws_cycles.append(["الزوج", "الدورة (DAM)", "إغلاق H1", "عدد الصفقات", "ملاحظة"])
+        ws_cycles.append(["الزوج", "الدورة (DAM)", f"إغلاق {_anchor_label()}", "عدد الصفقات", "ملاحظة"])
         for cell in ws_cycles[1]: cell.fill = gray_fill; cell.font = Font(bold=True)
         
         for cycle in res['cycle_logs']:
@@ -2295,8 +2355,32 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d == 'tg_prot_inval': bot_state['prot_cycle_inval'] = not bot_state.get('prot_cycle_inval', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     elif d == 'tg_prot_cost': bot_state['prot_cost_be'] = not bot_state.get('prot_cost_be', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     elif d == 'tg_prot_stale': bot_state['prot_stale_filter'] = not bot_state.get('prot_stale_filter', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
-    elif d == 'tg_prot_anchor': 
+    elif d == 'tg_prot_anchor':
         bot_state['gann_anchor_tf'] = '4h' if bot_state.get('gann_anchor_tf', '1h') == '1h' else '1h'
+        for sym, ss in bot_state['symbol_state'].items():
+            # Force every symbol to recompute its levels from the NEW
+            # anchor timeframe on the very next scanner tick, rather than
+            # waiting for whatever boundary the OLD anchor would have
+            # used next. Without this, "switching to 4h" would silently
+            # keep running on the old H1-derived levels until the current
+            # cycle happened to expire.
+            #
+            # gann_cycle_hours (ladder freeze / monitoring duration) is
+            # intentionally left untouched here -- it stays fully manual,
+            # adjustable via its own +/- buttons (e.g. 1h -> 2h/3h/4h),
+            # independent of whatever the anchor timeframe is set to.
+            ss['gann_last_h1_time'] = None
+            ss['gann_cycle_started_at'] = None
+        await save_bot_persistence()
+        await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+        await send_tg_msg(
+            f"✅ <b>تم تغيير الإطار المرجعي إلى {_anchor_label()}</b>\n"
+            f"سيتم استخراج مستويات جديدة بالكامل من إغلاق شمعة {_anchor_label()} في التحديث القادم.\n"
+            f"ملاحظة: مدة تجميد السلم (مدة المراقبة) لم تتغيّر — عدّلها يدوياً من أزرارها الخاصة لو حبيت."
+        )
+
+    elif d == 'tg_prot_dam_time':
+        bot_state['prot_dam_time_filter'] = not bot_state.get('prot_dam_time_filter', True)
         await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
 
     elif d == 'gann_show_levels':
