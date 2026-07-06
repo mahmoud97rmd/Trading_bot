@@ -1108,28 +1108,42 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
     how many trades are closing at once. Nothing here writes to the
     broker concurrently -- only the read-only status check is shared.
 
-    `closures` is a list of (symbol, tid, sym_state) tuples for real
-    trades only; callers handle simulated-trade deletion themselves.
+    `closures` is a list of (symbol, tid, sym_state, tr) tuples for real
+    trades only; callers handle simulated-trade deletion/notification
+    themselves. `tr` is the trade's own dict (entry/tp/sl/tf/is_buy/
+    last_known_pl/last_known_px) so every outcome message here can report
+    which specific trade it is, not just "a trade on this symbol closed."
     """
+    def _trade_detail_line(tr: dict) -> str:
+        pl = tr.get('last_known_pl', 0.0)
+        px = tr.get('last_known_px', tr.get('entry'))
+        outcome_lbl = 'ربح ✅' if pl >= 0 else 'خسارة ❌'
+        return (f"[جان {tr.get('tf')}] {'BUY 📈' if tr.get('is_buy') else 'SELL 📉'}\n"
+                f"الدخول: {tr.get('entry')}  |  آخر سعر معروف: {px}\n"
+                f"TP: {tr.get('tp')}  SL: {tr.get('sl')}\n"
+                f"النتيجة: {outcome_lbl} ({pl}$)")
+
     if not closures:
         return
     if not _metaapi_conn:
-        for symbol, tid, _ in closures:
+        for symbol, tid, _, tr in closures:
             c_log(f"Cannot close {tid} ({symbol}): no live MetaAPI connection. Position remains open on broker.")
+        detail = "\n\n".join(f"{symbol}: {_trade_detail_line(tr)}" for symbol, _, _, tr in closures)
         await send_tg_msg(
-            f"🛑 <b>تعذّر إغلاق {len(closures)} صفقة:</b> لا يوجد اتصال MetaAPI. جميعها ما زالت مفتوحة على الوسيط."
+            f"🛑 <b>تعذّر إغلاق {len(closures)} صفقة:</b> لا يوجد اتصال MetaAPI. جميعها ما زالت مفتوحة على الوسيط.\n\n{detail}"
         )
         return
 
-    pending = {}  # tid -> (symbol, sym_state)
-    for symbol, tid, sym_state in closures:
+    pending = {}  # tid -> (symbol, sym_state, tr)
+    for symbol, tid, sym_state, tr in closures:
         try:
             await _metaapi_conn.close_position(tid)
-            pending[str(tid)] = (symbol, sym_state)
+            pending[str(tid)] = (symbol, sym_state, tr)
         except Exception as e:
             log_exception(f"_close_metaapi_trades_batch close_position [{symbol}/{tid}]", e)
             await send_tg_msg(
-                f"⚠️ <b>فشل إرسال أمر إغلاق:</b> صفقة {symbol} ({tid}, خطأ: {e})\nيرجى التحقق يدوياً من الحساب."
+                f"⚠️ <b>فشل إرسال أمر إغلاق:</b> صفقة {symbol} ({tid}, خطأ: {e})\n"
+                f"يرجى التحقق يدوياً من الحساب.\n\n{_trade_detail_line(tr)}"
             )
 
     if not pending:
@@ -1150,8 +1164,10 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
         still_open_ids = {str(p.get('id')) for p in positions}
         for tid in list(pending.keys()):
             if tid not in still_open_ids:
-                symbol, sym_state = pending.pop(tid)
-                await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>")
+                symbol, sym_state, tr = pending.pop(tid)
+                await send_tg_msg(
+                    f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>\n\n{_trade_detail_line(tr)}"
+                )
                 if tid in sym_state['gann_open_trades']:
                     del sym_state['gann_open_trades'][tid]
                     await save_bot_persistence()
@@ -1159,9 +1175,11 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
         if pending:
             await asyncio.sleep(1.0)
 
-    for tid, (symbol, sym_state) in pending.items():
+    for tid, (symbol, sym_state, tr) in pending.items():
         c_log(f"Timeout waiting for {tid} ({symbol}) to disappear from MT5 positions after batch close.")
-        await send_tg_msg(f"⚠️ <b>لم يتم تأكيد إغلاق {symbol} ({tid}) خلال المهلة.</b> يرجى التحقق يدوياً من الحساب.")
+        await send_tg_msg(
+            f"⚠️ <b>لم يتم تأكيد إغلاق {symbol} ({tid}) خلال المهلة.</b> يرجى التحقق يدوياً من الحساب.\n\n{_trade_detail_line(tr)}"
+        )
 
 async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
@@ -1218,7 +1236,7 @@ async def gann_monitor_scanner() -> None:
                     sym_state = bot_state['symbol_state'][symbol]
                     for tid, tr in list(sym_state['gann_open_trades'].items()):
                         if tr.get('is_real') and _metaapi_conn:
-                            stale_real_closures.append((symbol, tid, sym_state))
+                            stale_real_closures.append((symbol, tid, sym_state, tr))
                 if stale_real_closures:
                     c_log(f"live_daily_hit is set but {len(stale_real_closures)} real trade(s) are still open -- "
                           f"retrying the mass closure (previous attempt may have crashed/errored mid-way).")
@@ -1327,6 +1345,7 @@ async def gann_monitor_scanner() -> None:
                         diff = (active_px - entry) if is_buy else (entry - active_px)
                         cs = SYMBOL_INFO[symbol]['contract_size']
                         trade_pl = round(diff * sym_state['lot_size'] * cs, 2)
+                        tr['last_known_pl'] = trade_pl
                         
                         if is_real and bot_state.get('prot_true_sync', True) and _metaapi_conn:
                             if tid not in actual_positions:
@@ -1405,8 +1424,19 @@ async def gann_monitor_scanner() -> None:
                     sym_state = bot_state['symbol_state'][symbol]
                     for tid, tr in list(sym_state['gann_open_trades'].items()):
                         if tr.get('is_real') and _metaapi_conn:
-                            real_closures.append((symbol, tid, sym_state))
+                            real_closures.append((symbol, tid, sym_state, tr))
                         else:
+                            pl = tr.get('last_known_pl', 0.0)
+                            px = tr.get('last_known_px', tr.get('entry'))
+                            outcome_lbl = 'ربح ✅' if pl >= 0 else 'خسارة ❌'
+                            await send_tg_msg(
+                                f"⏹️ <b>إغلاق (وهمي) [{symbol} - جان {tr.get('tf')}]</b>\n"
+                                f"سبب الإغلاق: حماية رأس المال (تراجع/هدف يومي)\n\n"
+                                f"الاتجاه: {'BUY 📈' if tr.get('is_buy') else 'SELL 📉'}\n"
+                                f"الدخول: {tr.get('entry')}  |  الإغلاق: {px}\n"
+                                f"TP: {tr.get('tp')}  SL: {tr.get('sl')}\n"
+                                f"النتيجة: {outcome_lbl} ({pl}$)"
+                            )
                             del sym_state['gann_open_trades'][tid]
                             await save_bot_persistence()
                 await _close_metaapi_trades_batch(real_closures)
@@ -1828,15 +1858,28 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             
             # Check floating PnL against limits
             if current_day not in suspended_days:
-                floating_pl = 0.0
+                floating_pl = 0.0        # close-based -- used for the PROFIT check (unchanged, a late trigger costs nothing)
+                floating_pl_worst = 0.0  # intrabar-worst-case -- used for the LOSS check only (tight, no overshoot)
                 for tr in open_trades:
                     lp = latest_price.get(tr['symbol'], tr['entry'])
                     diff = (lp - tr['entry']) if tr['is_buy'] else (tr['entry'] - lp)
                     floating_pl += round(diff * tr['lot'] * tr['cs'] * tr['quote_conv'], 2)
-                    
+
+                    # For the trade's own symbol, we have this candle's full
+                    # high/low right now -- use the worst excursion within
+                    # the bar (low for a long, high for a short) instead of
+                    # only the close. For other symbols we only have their
+                    # last close at this instant (an inherent limit of
+                    # single-symbol event-driven iteration), so fall back
+                    # to the same close-based price there.
+                    worst_px = (l if tr['is_buy'] else h) if tr['symbol'] == sym else lp
+                    diff_worst = (worst_px - tr['entry']) if tr['is_buy'] else (tr['entry'] - worst_px)
+                    floating_pl_worst += round(diff_worst * tr['lot'] * tr['cs'] * tr['quote_conv'], 2)
+
                 total_daily = daily_pl + floating_pl
-                if dd_limit < 0 and total_daily <= dd_limit:
-                    suspended_days[current_day] = f'🛑 تراجع عائم (الحد {dd_limit}$ | المحقق: {round(daily_pl, 2)}$ + العائم: {round(floating_pl, 2)}$ = {round(total_daily, 2)}$)'
+                total_daily_worst = daily_pl + floating_pl_worst
+                if dd_limit < 0 and total_daily_worst <= dd_limit:
+                    suspended_days[current_day] = f'🛑 تراجع عائم (الحد {dd_limit}$ | المحقق: {round(daily_pl, 2)}$ + العائم (أسوأ لحظة داخل الشمعة): {round(floating_pl_worst, 2)}$ = {round(total_daily_worst, 2)}$)'
                 elif profit_limit > 0 and total_daily >= profit_limit:
                     suspended_days[current_day] = f'✅ هدف عائم (الحد {profit_limit}$ | المحقق: {round(daily_pl, 2)}$ + العائم: {round(floating_pl, 2)}$ = {round(total_daily, 2)}$)'
 
@@ -1844,9 +1887,17 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                     suspend_trigger_time[current_day] = t
 
                 if current_day in suspended_days:
-                    # Close all open trades at current market price!
+                    # Close all open trades. For the loss-triggering
+                    # symbol, fill at the same worst-case intrabar price
+                    # that tripped the check (tight to the limit) rather
+                    # than the candle's close; other symbols still fill at
+                    # their last known close, same as before.
+                    was_loss_trigger = dd_limit < 0 and total_daily_worst <= dd_limit
                     for tr in open_trades:
-                        lp = latest_price.get(tr['symbol'], tr['entry'])
+                        if was_loss_trigger and tr['symbol'] == sym:
+                            lp = l if tr['is_buy'] else h
+                        else:
+                            lp = latest_price.get(tr['symbol'], tr['entry'])
                         diff = (lp - tr['entry']) if tr['is_buy'] else (tr['entry'] - lp)
                         p_usd = round(diff * tr['lot'] * tr['cs'] * tr['quote_conv'], 2)
                         tr['outcome'] = 'DAILY_LIMIT'
