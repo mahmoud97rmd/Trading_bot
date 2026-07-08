@@ -638,6 +638,29 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
             await asyncio.sleep(0.2)
     return collected
 
+async def fetch_master_price(symbol: str) -> float | None:
+    """Single Source of Truth for the CURRENT live price.
+
+    Call this exactly ONCE per symbol per scanner cycle, then reuse the
+    returned value for every enabled timeframe's touch-distance check.
+
+    Why this exists: a timeframe's own last candle close is NOT "the
+    current price" for anything above 1m — a 30m candle's close can be up
+    to ~30 minutes stale. Asking OANDA separately per-timeframe and using
+    each tf's own close as "live price" is exactly what caused the same
+    instant to read as e.g. 4067 on 1m and 4073 on 30m during a volatile
+    spike, and it also multiplies OANDA requests per cycle (contributing
+    to "Insufficient data from OANDA" failures under load). Timeframes
+    should still be fetched separately for their own historical
+    closes/EMAs/ATR — just never for "what is the price right now".
+    """
+    mc = await fetch_candles(symbol, '1m', count=1)
+    if not mc:
+        c_log(f"fetch_master_price [{symbol}]: no 1m data from OANDA this cycle -- "
+              f"skipping touch checks for this symbol rather than risk a stale/desynced price.")
+        return None
+    return float(mc[-1]['close'])
+
 # ─────────────────────────────────────────────────────────────
 # GANN LEVELS & FAN ENGINE (⭐ & ⭐🌀)
 # ─────────────────────────────────────────────────────────────
@@ -1429,6 +1452,16 @@ async def gann_run_diagnostics() -> str:
             lines.append("🛑 لا يوجد أي فريم مفعّل في gann_monitor_tfs -- لن يتم فحص أي شيء.")
             continue
 
+        # Same single source of truth as the live scanner -- one real-time
+        # price for this symbol, reused for every timeframe line below.
+        # This report used to show a different "current price" per tf
+        # (each one its own stale candle close), which is exactly the
+        # desync users were seeing between e.g. 1m and 30m.
+        master_px = await fetch_master_price(symbol)
+        if master_px is None:
+            lines.append("🛑 بيانات غير كافية من OANDA (تعذّر جلب السعر الحالي الموحّد) -- تم تخطي كل الفريمات لهذا الرمز.")
+            continue
+
         for tf in enabled_tfs:
             already_open = any(isinstance(v, dict) and v.get('tf') == tf for v in sym_state['gann_open_trades'].values())
             if already_open:
@@ -1444,7 +1477,7 @@ async def gann_run_diagnostics() -> str:
                 lines.append(f"[{tf}] 🛑 بيانات غير كافية من OANDA.")
                 continue
 
-            live_px = float(candles[-1]['close'])
+            live_px = master_px  # unified real-time price, NOT candles[-1]['close']
             trend_up = True
             if entry_mode == 'touch_trend':
                 if macro_trend_up is None:
@@ -1797,14 +1830,23 @@ async def gann_monitor_scanner() -> None:
                 levels      = gann_active_levels(symbol)
                 margin      = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
 
+                # ── Single Source of Truth for the current price ──
+                # Fetched ONCE per symbol per cycle here, and reused for every
+                # enabled timeframe below. Per-tf candle closes are only used
+                # for their own historical/ATR context (in _gann_open_trade),
+                # never as "the current price" -- that's what caused 1m and
+                # 30m to disagree on what "now" costs during a spike.
+                master_px = await fetch_master_price(symbol)
+                if master_px is None:
+                    continue
+
                 for tf in enabled_tfs:
                     if any(isinstance(v, dict) and v.get('tf') == tf for v in sym_state['gann_open_trades'].values()) or tf in sym_state['gann_open_trades'].values(): continue 
 
                     need = sym_state['gann_atr_period'] + 50
                     candles = await fetch_candles(symbol, tf, count=need)
                     if not candles or len(candles) < 3: continue
-                    close_px = float(candles[-1]['close'])
-                    live_px  = close_px 
+                    live_px = master_px  # unified real-time price, NOT candles[-1]['close']
 
                     trend_up = True
                     if sym_state['gann_entry_mode'] == 'touch_trend':
