@@ -234,7 +234,13 @@ async def save_bot_persistence() -> None:
         # transient/regenerated-on-render -- everything else in bot_state
         # is a real setting and gets saved.
         TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
-                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state'}
+                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state',
+                              # 'status' is a dead legacy field predating the connection_state
+                              # machine -- nothing in the current code ever writes to it, but a
+                              # stale value loaded from an old persistence file used to silently
+                              # kill the entire scanner/cycle-manager/reconciliation loop with
+                              # zero error message. Never restore it; always fixed at 'RUNNING'.
+                              'status'}
 
         symbol_snapshot = {}
         for sym in bot_state['active_symbols']:
@@ -275,7 +281,13 @@ def load_bot_persistence():
             data = json.load(f)
 
         TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
-                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state'}
+                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state',
+                              # 'status' is a dead legacy field predating the connection_state
+                              # machine -- nothing in the current code ever writes to it, but a
+                              # stale value loaded from an old persistence file used to silently
+                              # kill the entire scanner/cycle-manager/reconciliation loop with
+                              # zero error message. Never restore it; always fixed at 'RUNNING'.
+                              'status'}
         for k, v in data.items():
             # Only restore keys that already exist in bot_state's default
             # shape -- never let a saved file inject brand-new top-level
@@ -809,14 +821,11 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                 is_real = False
             else:
                 try:
-                    # Convert data feed symbol (e.g., XAU_USD) to broker symbol (e.g., XAUUSD)
-                    # The data feed requires the underscore, but the broker terminal expects no underscore.
-                    broker_symbol = symbol.replace("_", "") if symbol == "XAU_USD" else symbol
-                    
+                    mt4_symbol = bot_state.get('symbol', symbol.replace('_', ''))
                     if is_buy:
-                        res = await _metaapi_conn.create_market_buy_order(broker_symbol, lot, stop_loss=sl, take_profit=tp)
+                        res = await _metaapi_conn.create_market_buy_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
                     else:
-                        res = await _metaapi_conn.create_market_sell_order(broker_symbol, lot, stop_loss=sl, take_profit=tp)
+                        res = await _metaapi_conn.create_market_sell_order(mt4_symbol, lot, stop_loss=sl, take_profit=tp)
 
                     trade_id = str(res.get('orderId', res.get('positionId', trade_id)))
                     real_msg = "\n🚀 <b>تم فتح الصفقة حقيقياً على حسابك!</b>"
@@ -1261,6 +1270,11 @@ async def gann_run_diagnostics() -> str:
     lines = ["<b>🩺 تشخيص أسباب عدم فتح الصفقات</b>\n"]
 
     # --- Global gates (apply to every symbol) ---
+    legacy_status = bot_state.get('status', 'RUNNING')
+    if legacy_status != 'RUNNING':
+        lines.append(f"0️⃣ ⚠️ <b>bot_state['status'] = '{legacy_status}'</b> (متوقع 'RUNNING' دائماً -- "
+                      f"هذا يعني أن السكانر بالكامل متوقف بصمت. أعد تشغيل البوت فوراً.)")
+
     conn_state = bot_state.get('connection_state', CONN_RUNNING)
     conn_ok = conn_state == CONN_RUNNING
     lines.append(f"1️⃣ حالة الاتصال: {'✅ RUNNING' if conn_ok else f'🛑 {conn_state}'}")
@@ -1392,9 +1406,6 @@ async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
     while True:
         try:
-            if bot_state['status'] != 'RUNNING':
-                await asyncio.sleep(10); continue
-
             # MT5 Zombie Singleton Heartbeat
             if _metaapi_account and _metaapi_account.connection_status != 'CONNECTED':
                 await set_connection_state(CONN_READ_ONLY, "MetaAPI connection lost — attempting reconnect.")
@@ -1734,9 +1745,6 @@ async def gann_cycle_manager() -> None:
     c_log('Gann cycle manager started.')
     while True:
         try:
-            if bot_state['status'] != 'RUNNING':
-                await asyncio.sleep(60); continue
-
             now_utc = datetime.now(timezone.utc)
             active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
             for symbol in active_symbols:
@@ -1798,7 +1806,7 @@ async def global_ledger_reconciliation() -> None:
         try:
             await asyncio.sleep(RECONCILIATION_INTERVAL_SECONDS)
 
-            if bot_state.get('status') != 'RUNNING' or not _metaapi_conn:
+            if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING or not _metaapi_conn:
                 continue
 
             try:
