@@ -1050,6 +1050,9 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
 
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': price, 'is_real': is_real, 'sl': sl, 'tp': tp,
+            'level_key': level['key'], 'level_price': level['price'],
+            'cycle_close': bot_state['symbol_state'][symbol].get('gann_close_used', 0.0),
+            'open_time': detect_time.timestamp() if detect_time else datetime.now(timezone.utc).timestamp(),
             'be_trigger': (price + (tp - price)/2) if is_buy else (price - (price - tp)/2) # simplified BE trigger
         }
         combo_key = f"{level['key']}_{tf}" if bot_state.get('prot_allow_multi_tf', True) else level['key']
@@ -1146,6 +1149,7 @@ def get_main_keyboard() -> dict:
         [{'text': '🔌 فحص حالة حساب MetaAPI', 'callback_data': 'check_metaapi_status'}],
         [{'text': '🩺 تشخيص: ليه مفيش صفقات؟', 'callback_data': 'run_diag'}],
         [{'text': '📊 تصدير سجل تشخيص تفصيلي (Excel)', 'callback_data': 'export_diag_excel'}],
+        [{'text': '📈 تصدير سجل صفقات السيرفر الحي (Excel)', 'callback_data': 'export_live_excel'}],
         [{'text': '🔓 استئناف يدوي بعد HALT (بعد التأكد من الحساب)', 'callback_data': 'manual_resume_step1'}],
         [{'text': '📐 محرك جان (الاستراتيجية)', 'callback_data': 'menu_gann'}],
         [{'text': '🛡️ إعدادات الحماية', 'callback_data': 'menu_protection'}],
@@ -1370,6 +1374,13 @@ async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict) -> bool:
             if not any(str(p.get('id')) == str(tid) for p in positions):
                 await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>")
                 if tid in sym_state['gann_open_trades']:
+                    tr_copy = tr.copy()
+                    tr_copy['symbol'] = symbol
+                    tr_copy['tid'] = tid
+                    tr_copy['close_time'] = datetime.now(timezone.utc).timestamp()
+                    tr_copy['p_usd'] = tr.get('last_known_pl', 0.0)
+                    tr_copy['outcome'] = 'DAILY_LIMIT'
+                    bot_state.setdefault('live_trade_logs', []).append(tr_copy)
                     del sym_state['gann_open_trades'][tid]
                     await save_bot_persistence()
                 return True
@@ -1458,6 +1469,13 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
                     f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>\n\n{_trade_detail_line(tr)}"
                 )
                 if tid in sym_state['gann_open_trades']:
+                    tr_copy = tr.copy()
+                    tr_copy['symbol'] = symbol
+                    tr_copy['tid'] = tid
+                    tr_copy['close_time'] = datetime.now(timezone.utc).timestamp()
+                    tr_copy['p_usd'] = tr.get('last_known_pl', 0.0)
+                    tr_copy['outcome'] = 'DAILY_LIMIT'
+                    bot_state.setdefault('live_trade_logs', []).append(tr_copy)
                     del sym_state['gann_open_trades'][tid]
                     await save_bot_persistence()
 
@@ -1628,6 +1646,54 @@ async def gann_run_diagnostics() -> str:
             lines.append(f"[{tf}] السعر: {live_px:.2f}  |  أقرب مستوى موافق للترند [{dir_lbl}]: {nearest['price']:.2f} (فرق {nearest['dist']:.3f})  |  {status_icon}")
 
     return "\n".join(lines)
+
+
+async def export_live_excel() -> None:
+    logs = list(bot_state.get('live_trade_logs', []))
+    if not logs:
+        await send_tg_msg("لا يوجد صفقات مغلقة في السجل المباشر لهذه الجلسة بعد.")
+        return
+
+    processed = []
+    for tr in logs:
+        dir_str = 'BUY 📈' if tr.get('is_buy') else 'SELL 📉'
+        entry_val = tr.get('entry', 0.0)
+        level_k = tr.get('level_key', '?')
+        close_t = tr.get('close_time')
+        open_t = tr.get('open_time')
+        
+        row = {
+            'الزوج': tr.get('symbol', ''),
+            'وقت الفتح (DAM)': _utc_to_dam(datetime.fromtimestamp(open_t, timezone.utc)).strftime('%Y-%m-%d %H:%M') if open_t else '',
+            'وقت الإغلاق (DAM)': _utc_to_dam(datetime.fromtimestamp(close_t, timezone.utc)).strftime('%Y-%m-%d %H:%M') if close_t else '',
+            'TF': tr.get('tf', ''),
+            'اتجاه': dir_str,
+            'المستوى (الدخول)': f"{entry_val:.2f} ({level_k})",
+            'الهدف (TP)': round(tr.get('tp', 0.0), 2),
+            'الوقف (SL)': round(tr.get('sl', 0.0), 2),
+            'النتيجة': tr.get('outcome', ''),
+            'ربح ($)': tr.get('p_usd', 0.0),
+            'cycle_close': tr.get('cycle_close', '')
+        }
+        processed.append(row)
+
+    df = pd.DataFrame(processed)
+    fname = f"LiveTrades_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
+    try:
+        with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Live Trades', index=False)
+
+        await send_tg_document(
+            fname,
+            f"📊 <b>سجل الصفقات الحية المغلقة</b>\n"
+            f"عدد الصفقات: {len(processed)}
+"
+            f"هذا الملف مصمم ليكون مطابقاً لملف الباكتيست للمقارنة."
+        )
+    finally:
+        import os
+        if os.path.exists(fname):
+            os.remove(fname)
 
 async def export_diag_log_excel() -> None:
     """Export the FULL rolling diagnostic log (bot_state['diag_log']) to an
@@ -1882,6 +1948,7 @@ async def gann_monitor_scanner() -> None:
                                         c_log(f"Reconciliation: Exact PnL for {tid} fetched from MT5: {exact_pnl}$")
 
                                 closed_ids.append(tid)
+                                tr['last_known_pl'] = exact_pnl
                                 bot_state['live_daily_realized'] += exact_pnl
 
                                 if found_deal:
@@ -1937,6 +2004,16 @@ async def gann_monitor_scanner() -> None:
                             
                     for tid in closed_ids:
                         if tid in sym_state['gann_open_trades']:
+                            tr = sym_state['gann_open_trades'][tid]
+                            tr_copy = tr.copy()
+                            tr_copy['symbol'] = symbol
+                            tr_copy['tid'] = tid
+                            tr_copy['close_time'] = datetime.now(timezone.utc).timestamp()
+                            tr_copy['p_usd'] = tr.get('last_known_pl', 0.0)
+
+                            tr_copy['outcome'] = 'WIN ✅' if tr_copy['p_usd'] > 0 else ('LOSS ❌' if tr_copy['p_usd'] < 0 else 'BREAK_EVEN')
+                            bot_state.setdefault('live_trade_logs', []).append(tr_copy)
+                            
                             del sym_state['gann_open_trades'][tid]
                             await save_bot_persistence()
 
@@ -2408,6 +2485,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
 
                     for bar in m_window:
                         bar_close = float(bar['close']); bar_time = bar['time']
+                        bar_low = float(bar['low']); bar_high = float(bar['high'])
                         trend_up = True
                         if sym_state['gann_entry_mode'] == 'touch_trend':
                             trend_time = bar_time.floor(trend_freq)
@@ -2432,7 +2510,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                             if sym_state['gann_entry_mode'] == 'touch_trend':
                                 if is_buy and not trend_up: continue
                                 if not is_buy and trend_up: continue
-                            if abs(bar_close - lv['price']) > margin: continue
+                            if not (bar_low <= lv['price'] + margin and bar_high >= lv['price'] - margin): continue
                             
                             entry = lv['price']
                             be_trigger_px = None
