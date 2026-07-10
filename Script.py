@@ -1692,8 +1692,7 @@ async def export_live_excel() -> None:
         await send_tg_document(
             fname,
             f"📊 <b>سجل الصفقات الحية المغلقة</b>\n"
-            f"عدد الصفقات: {len(processed)}
-"
+            f"عدد الصفقات: {len(processed)}\n"
             f"هذا الملف مصمم ليكون مطابقاً لملف الباكتيست للمقارنة."
         )
     finally:
