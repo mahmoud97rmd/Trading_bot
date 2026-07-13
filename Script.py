@@ -1270,9 +1270,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                     for delay in (0, 1, 2):
                         if delay: await asyncio.sleep(delay)
                         try:
-                            positions = await _metaapi_conn.get_positions() if hasattr(_metaapi_conn, 'get_positions') else []
-# أو الأفضل هو الاعتماد على التزامن التلقائي للمكتبة إذا كنت تستخدم النسخة الحديثة
-
+                            positions = _metaapi_conn.terminal_state.positions
                             match = next((p for p in positions if str(p.get('id')) == trade_id), None)
                             if match and match.get('openPrice') is not None:
                                 real_fill_price = float(match['openPrice'])
@@ -1679,7 +1677,7 @@ async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict) -> bool:
         # trade during a batch closure risks tripping MetaAPI's rate limit
         # (HTTP 429). The SDK already background-syncs; 1s is plenty.
         for _ in range(25):
-            positions = await _metaapi_conn.get_positions()
+            positions = _metaapi_conn.terminal_state.positions
             if not any(str(p.get('id')) == str(tid) for p in positions):
                 await send_tg_msg(f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>")
                 if tid in sym_state['gann_open_trades']:
@@ -1755,7 +1753,7 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
         if not pending:
             break
         try:
-            positions = await _metaapi_conn.get_positions()
+            positions = _metaapi_conn.terminal_state.positions
             if not isinstance(positions, list):
                 raise TypeError(f"get_positions() returned {type(positions).__name__}, expected list")
         except Exception as e:
@@ -2091,7 +2089,7 @@ async def gann_monitor_scanner() -> None:
                     sync_failed = False
                     if bot_state.get('prot_true_sync', True) and _metaapi_conn:
                         try:
-                            positions = await _metaapi_conn.get_positions()
+                            positions = _metaapi_conn.terminal_state.positions
                             for p in positions: actual_positions[str(p.get('id'))] = p
                             # Sync succeeded — if we were previously degraded because of
                             # sync failures specifically, this is our signal to recover.
@@ -2512,7 +2510,7 @@ async def global_ledger_reconciliation() -> None:
                 continue
 
             try:
-                broker_positions = await _metaapi_conn.get_positions()
+                broker_positions = _metaapi_conn.terminal_state.positions
                 if not isinstance(broker_positions, list):
                     raise TypeError(f"get_positions() returned {type(broker_positions).__name__}, expected list")
             except Exception as e:
