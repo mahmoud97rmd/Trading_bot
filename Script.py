@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone, time as dtime
 from aiohttp import web
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from metaapi_cloud_sdk import MetaApi
+from metaapi_cloud_sdk import MetaApi, SynchronizationListener
 
 # -----------------------------------------------------------------
 # LOGGING (structured, always includes tracebacks for exceptions)
@@ -109,6 +109,70 @@ _metaapi = None
 _metaapi_account = None
 _metaapi_conn = None
 
+# ── Live-quote push cache (WebSocket/streaming feed) ──
+# Populated by _GannPriceListener.on_symbol_price_updated, keyed by the
+# OANDA-format symbol used everywhere else in the bot ('XAU_USD'), NOT
+# the broker's own symbol name ('XAUUSD') -- _broker_to_data_symbol
+# translates incoming broker-symbol ticks back to that key.
+live_quotes: dict[str, dict] = {}          # {'XAU_USD': {'bid':, 'ask':, 'mid':, 'ts': monotonic}}
+_broker_to_data_symbol: dict[str, str] = {}  # {'XAUUSD': 'XAU_USD', ...}
+_QUOTE_STALE_SECONDS = 5.0
+
+
+class _GannPriceListener(SynchronizationListener):
+    """Pushed quotes from MetaApi's streaming connection -- this is what
+    'broker-direct WebSocket price feed' actually means: MetaApi's own
+    live terminal-state cache, not OANDA's REST polling. Feeds
+    live_quotes[]; the scanner reads from there instead of calling out
+    to OANDA for the current price."""
+
+    async def on_symbol_price_updated(self, instance_index, price):
+        broker_sym = price.get('symbol')
+        data_sym = _broker_to_data_symbol.get(broker_sym)
+        if not data_sym:
+            return
+        bid = price.get('bid'); ask = price.get('ask')
+        if bid is None or ask is None:
+            return
+        live_quotes[data_sym] = {'bid': bid, 'ask': ask, 'mid': (bid + ask) / 2, 'ts': time.monotonic()}
+
+    async def on_connected(self, instance_index, replicas):
+        c_log("MetaAPI streaming connection established (price feed live).")
+
+    async def on_disconnected(self, instance_index):
+        c_log("MetaAPI streaming connection lost -- reconnect loop will retry and resubscribe.")
+
+
+async def _lq_subscribe_symbol(symbol: str) -> None:
+    """Subscribe one OANDA-format symbol's broker equivalent to live
+    quotes. Safe to call multiple times (idempotent on the broker side);
+    swallows failures so one bad symbol doesn't block the others."""
+    if _metaapi_conn is None:
+        return
+    broker_sym = _resolve_broker_symbol(symbol)
+    _broker_to_data_symbol[broker_sym] = symbol
+    try:
+        await _metaapi_conn.subscribe_to_market_data(broker_sym)
+    except Exception as e:
+        log_exception(f"_lq_subscribe_symbol [{symbol} -> {broker_sym}]", e)
+
+
+def _lq_is_stale(symbol: str) -> bool:
+    q = live_quotes.get(symbol)
+    return q is None or (time.monotonic() - q['ts']) > _QUOTE_STALE_SECONDS
+
+
+async def _lq_price_with_fallback(symbol: str) -> tuple[float | None, str, float | None]:
+    """Returns (price, source, age_ms). Prefers the pushed WebSocket
+    quote; falls back to the OANDA REST fetch (fetch_master_price) if
+    the feed is missing/stale, so a temporary MetaApi hiccup degrades
+    to the old behavior instead of silently blocking all touch checks."""
+    q = live_quotes.get(symbol)
+    if q is not None and (time.monotonic() - q['ts']) <= _QUOTE_STALE_SECONDS:
+        return q['mid'], 'ws', round((time.monotonic() - q['ts']) * 1000)
+    px = await fetch_master_price(symbol)
+    return px, 'oanda_fallback', None
+
 # Connection-state machine.
 # RUNNING    : normal operation, new trades allowed.
 # READ_ONLY  : sync with MetaAPI is degraded/unavailable. No new trades,
@@ -182,10 +246,20 @@ async def init_metaapi():
         _metaapi = MetaApi(METAAPI_TOKEN)
         _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
         if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
-            _metaapi_conn = _metaapi_account.get_rpc_connection()
+            # Streaming connection (not RPC): this is what gives us pushed,
+            # real-time quotes via the terminal-state sync -- an RPC
+            # connection only supports one-off trade commands and doesn't
+            # maintain a live quote cache at all. One streaming connection
+            # handles both quotes (via the listener) and order placement,
+            # so nothing else needs a second connection.
+            _metaapi_conn = _metaapi_account.get_streaming_connection()
+            _metaapi_conn.add_synchronization_listener(_GannPriceListener())
             await _metaapi_conn.connect()
             await _metaapi_conn.wait_synchronized()
-            c_log("MetaAPI Persistent Connection established.")
+            for sym, on in bot_state['active_symbols'].items():
+                if on:
+                    await _lq_subscribe_symbol(sym)
+            c_log("MetaAPI Persistent Streaming Connection established (live quotes subscribed).")
             await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized at startup.")
         else:
             c_log(f"MetaAPI account not deployed/connected at startup (state={_metaapi_account.state}, "
@@ -893,7 +967,8 @@ def _resolve_broker_symbol(symbol: str) -> str:
     return configured
 
 async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list, reason: str, tf: str,
-                            initial_px: float = None, detect_time: datetime = None, t1_signal_ts: float = None) -> None:
+                            initial_px: float = None, detect_time: datetime = None, t1_signal_ts: float = None,
+                            feed_source: str = None, feed_age_ms: float = None) -> None:
     global _consecutive_real_order_failures
     sym_state = bot_state['symbol_state'][symbol]
 
@@ -919,7 +994,14 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         # before this specific order goes out, and re-check it's still
         # actually near the level -- not the stale master_px from when the
         # cycle started.
-        fresh_px = await fetch_master_price(symbol)
+        #
+        # This used to be a second OANDA REST call here, which was itself
+        # extra latency added right before execution. Reading live_quotes
+        # is an in-memory cache read (no HTTP round-trip at all) as long as
+        # the WebSocket feed is fresh; REST is now only a fallback for when
+        # it isn't -- so this re-check got both more accurate AND faster,
+        # not just faster.
+        fresh_px, fresh_feed_source, fresh_feed_age_ms = await _lq_price_with_fallback(symbol)
         margin = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
         if fresh_px is None or abs(fresh_px - level['price']) > margin:
             bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
@@ -1033,10 +1115,20 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
 
                     code_delay_ms = round((t2_pre_send_ts - t1_signal_ts) * 1000) if t1_signal_ts else None
                     ping_ms = round((t3_ack_ts - t2_pre_send_ts) * 1000)
+                    # "Quote Age at Fire" is the real-world number that
+                    # actually matters for slippage: how stale was the price
+                    # this order was based on, at the instant it fired --
+                    # not how fast Python parsed a variable (that's Code
+                    # Delay below, kept for completeness but not the headline).
+                    feed_label = 'WS (MetaApi live)' if fresh_feed_source == 'ws' else 'OANDA REST (fallback — feed was stale)'
+                    age_str = f"{fresh_feed_age_ms}ms" if fresh_feed_age_ms is not None else 'n/a (REST fallback has no push-age)'
                     telemetry_lbl = (
-                        f"\n⏱ Code Delay (T2-T1): {code_delay_ms}ms | MetaApi Ping (T3-T2): {ping_ms}ms"
-                        if code_delay_ms is not None else
-                        f"\n⏱ MetaApi Ping (T3-T2): {ping_ms}ms (T1 unavailable)"
+                        f"\n📡 Feed: {feed_label} | Quote Age at Fire: {age_str}"
+                        + (
+                            f"\n⏱ Code Delay (T2-T1): {code_delay_ms}ms | MetaApi Ping (T3-T2): {ping_ms}ms"
+                            if code_delay_ms is not None else
+                            f"\n⏱ MetaApi Ping (T3-T2): {ping_ms}ms (T1 unavailable)"
+                        )
                     )
 
                     # CRITICAL: history deals/reconciliation are keyed by
@@ -1752,7 +1844,10 @@ async def gann_monitor_scanner() -> None:
                     try:
                         await _metaapi_conn.connect()
                         await _metaapi_conn.wait_synchronized()
-                        c_log("MetaAPI Reconnected successfully.")
+                        for sym, on in bot_state['active_symbols'].items():
+                            if on:
+                                await _lq_subscribe_symbol(sym)
+                        c_log("MetaAPI Reconnected successfully (live quotes resubscribed).")
                         reconnected = True
                         break
                     except Exception as e:
@@ -1766,6 +1861,17 @@ async def gann_monitor_scanner() -> None:
                     # If this persists, an operator will see the escalation
                     # message and the repeated READ_ONLY state in logs.
                     c_log("MetaAPI reconnect exhausted 5 attempts this tick; will retry next cycle.")
+
+            # Feed-level staleness watchdog: connection_status can still say
+            # CONNECTED while a symbol's subscription silently dropped (no
+            # more ticks arriving). This is caught independently of the
+            # connection-level check above, and just re-subscribes rather
+            # than tearing down the whole connection.
+            elif _metaapi_conn is not None:
+                for sym, on in bot_state['active_symbols'].items():
+                    if on and _lq_is_stale(sym):
+                        c_log(f"Live quote feed stale for {sym} -- resubscribing.")
+                        await _lq_subscribe_symbol(sym)
 
             now_dt = datetime.now(timezone.utc)
 
@@ -2077,12 +2183,16 @@ async def gann_monitor_scanner() -> None:
                     margin      = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
 
                     # ── Single Source of Truth for the current price ──
-                    # Fetched ONCE per symbol per cycle here, and reused for every
-                    # enabled timeframe below. Per-tf candle closes are only used
-                    # for their own historical/ATR context (in _gann_open_trade),
-                    # never as "the current price" -- that's what caused 1m and
-                    # 30m to disagree on what "now" costs during a spike.
-                    master_px = await fetch_master_price(symbol)
+                    # Prefers the pushed MetaApi WebSocket quote (live_quotes,
+                    # populated by _GannPriceListener) -- an in-memory read,
+                    # no HTTP round-trip. Falls back to the OANDA REST poll
+                    # only if that feed is missing/stale, so a temporary
+                    # MetaApi hiccup degrades gracefully instead of blocking
+                    # all touch checks for this symbol. Fetched ONCE per
+                    # symbol per cycle and reused for every enabled timeframe
+                    # below, same as before -- per-tf candle closes are only
+                    # ever used for their own historical/ATR context.
+                    master_px, feed_source, feed_age_ms = await _lq_price_with_fallback(symbol)
                     if master_px is None:
                         continue
                     detect_time = datetime.now(timezone.utc)
@@ -2199,7 +2309,8 @@ async def gann_monitor_scanner() -> None:
                                 touch_attempted = True
                                 t1_signal_ts = time.monotonic()
                                 await _gann_open_trade(symbol, is_buy, lv, candles, reason=reason, tf=tf,
-                                                        initial_px=master_px, detect_time=detect_time, t1_signal_ts=t1_signal_ts)
+                                                        initial_px=master_px, detect_time=detect_time, t1_signal_ts=t1_signal_ts,
+                                                        feed_source=feed_source, feed_age_ms=feed_age_ms)
                                 break
 
                         _diag_log_add({'ts': detect_time, 'symbol': symbol, 'tf': tf, 'master_px': master_px,
@@ -3105,9 +3216,16 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                     m_window = [c for c in candles_m if t_start <= c['time'] < t_end]
                     m_before = [c for c in candles_m if c['time'] < t_start]
                     atr_val = _gann_atr(m_before, sym_state['gann_atr_period']) if tpsl_mode == 'atr' else None
+                    # Execution-mode state: 'prev_bar_close' tracks bar-over-bar
+                    # momentum for hybrid's spike check, since OHLC data has no
+                    # sub-bar tick stream to check live momentum against.
+                    prev_bar_close = float(m_before[-1]['close']) if m_before else None
+                    exec_mode = bot_state.get('gann_execution_mode', 'instant')
+                    spike_limit = bot_state.get('gann_spike_limit_pts', 20) * pv
 
                     for bar in m_window:
                         bar_close = float(bar['close']); bar_time = bar['time']
+                        bar_high = float(bar['high']); bar_low = float(bar['low'])
                         trend_up = True
                         if sym_state['gann_entry_mode'] == 'touch_trend':
                             trend_time = bar_time.floor(trend_freq)
@@ -3116,7 +3234,8 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                                 if isinstance(val, pd.Series): val = val.iloc[-1]
                                 macro_trend_up = None if pd.isna(val) else bool(val)
                             else: macro_trend_up = None
-                            if macro_trend_up is None: continue
+                            if macro_trend_up is None:
+                                prev_bar_close = bar_close; continue
                             trend_up = macro_trend_up
 
                         if bot_state.get('prot_cycle_inval', True):
@@ -3131,7 +3250,27 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                             if sym_state['gann_entry_mode'] == 'touch_trend':
                                 if is_buy and not trend_up: continue
                                 if not is_buy and trend_up: continue
-                            if abs(bar_close - lv['price']) > margin: continue
+
+                            # ── Execution-mode gate (mirrors the live scanner) ──
+                            # close   : only the bar's CLOSE has to be within margin
+                            #           (this was the engine's only behavior before
+                            #           execution modes existed, and stays the default).
+                            # instant : any part of the bar's range (intrabar high/low,
+                            #           not just its close) touching the level counts --
+                            #           a live tick could have fired mid-bar.
+                            # hybrid  : same intrabar touch as instant, but rejected if
+                            #           this bar's close has already moved more than the
+                            #           spike limit from the PREVIOUS bar's close (the
+                            #           backtest's only available proxy for "live_px ran
+                            #           away from the last print" since OHLC has no
+                            #           sub-bar ticks to check momentum against directly).
+                            if exec_mode == 'close':
+                                if abs(bar_close - lv['price']) > margin: continue
+                            elif exec_mode == 'hybrid':
+                                if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
+                                if prev_bar_close is not None and abs(bar_close - prev_bar_close) > spike_limit: continue
+                            else:  # instant (default)
+                                if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
 
                             entry = lv['price']
                             tf_tp = _gann_tf_tp(symbol, btf); tf_sl = _gann_tf_sl(symbol, btf)
@@ -3147,6 +3286,8 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                                 'cycle_time': h1['time'], 'cycle_close': close, 'level_key': k,
                             })
                             level_used.add(combo_key)
+
+                        prev_bar_close = bar_close
 
         # ── PHASE 2: chronological, friction-aware, 1-minute-bar simulation ──
         await prog.set_phase('محاكاة التنفيذ الواقعي (سبريد/انزلاق/تأخير/عمولة)...')
@@ -3791,6 +3932,8 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     elif d.startswith('gann_toggle_pair_'):
         pair = d[len('gann_toggle_pair_'):]
         bot_state['active_symbols'][pair] = not bot_state['active_symbols'][pair]
+        if bot_state['active_symbols'][pair]:
+            await _lq_subscribe_symbol(pair)
         await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
     elif d.startswith('gann_sel_pair_'):
         pair = d[len('gann_sel_pair_'):]
