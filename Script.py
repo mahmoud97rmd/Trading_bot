@@ -58,6 +58,38 @@ def _diag_log_add(entry: dict) -> None:
     if len(log) > _DIAG_LOG_MAX_ENTRIES:
         del log[: len(log) - _DIAG_LOG_MAX_ENTRIES]
 
+def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px: float, pnl: float,
+                                  outcome_label: str, close_reason: str, pnl_confirmed: bool) -> None:
+    """Append one row of full detail for a just-closed real/virtual live
+    trade, feeding /export_live_trades_excel. Kept deliberately rich (every
+    field a human would need to judge "did this trade behave like the
+    backtest expected") since this is the ONLY place live trade outcomes
+    get durably recorded anywhere in the bot today."""
+    hist = bot_state.setdefault('live_trade_history', [])
+    entry = tr.get('entry'); is_buy = tr.get('is_buy')
+    opened_at = tr.get('opened_at')
+    closed_at_dt = datetime.now(timezone.utc)
+    duration_min = None
+    if opened_at:
+        try:
+            opened_dt = datetime.fromisoformat(opened_at) if isinstance(opened_at, str) else opened_at
+            duration_min = round((closed_at_dt - opened_dt).total_seconds() / 60.0, 1)
+        except Exception:
+            duration_min = None
+    intended_entry = tr.get('level_price', entry)
+    entry_slip = (entry - intended_entry) if (entry is not None and intended_entry is not None) else None
+    hist.append({
+        'symbol': symbol, 'tid': tid, 'tf': tr.get('tf'), 'is_real': bool(tr.get('is_real')),
+        'is_buy': is_buy, 'opened_at': opened_at, 'closed_at': closed_at_dt.isoformat(),
+        'duration_min': duration_min, 'level_price': intended_entry, 'entry': entry,
+        'entry_slippage': entry_slip, 'tp': tr.get('tp'), 'sl': tr.get('sl'), 'exit_price': exit_px,
+        'outcome': outcome_label, 'pnl': pnl, 'pnl_confirmed_from_broker': pnl_confirmed,
+        'close_reason': close_reason, 'be_activated': bool(tr.get('be_activated')),
+        'feed_source': tr.get('feed_source'), 'feed_age_ms': tr.get('feed_age_ms'),
+    })
+    if len(hist) > _DIAG_LOG_MAX_ENTRIES:
+        del hist[: len(hist) - _DIAG_LOG_MAX_ENTRIES]
+
 # -----------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------
@@ -580,8 +612,22 @@ bot_state: dict = {
         'gaps':      True,   # weekend/rollover gap risk
         'rejection': True,   # requote/rejection probability in volatility spikes
     },
-    'lt_commission_per_lot': 7.0,   # USD round-turn per 1.0 lot (typical OANDA-style raw/ECN gold commission)
-    'lt_swap_per_lot_night': -6.5,  # USD per lot per night held (gold short-side swap is usually negative for both directions; kept conservative)
+    # Calibrated from the actual XAUUSD broker spec (MT5 symbol properties
+    # screenshot): "Commissions: 0-1000 -> 5 USD per lot, Instant by deal
+    # volume, in deals" means 5 USD PER DEAL, i.e. per side -- a round-turn
+    # trade (open + close) costs 10, not the old flat guess of 7.
+    'lt_commission_per_lot': 10.0,  # USD round-turn per 1.0 lot (5 open + 5 close, per real broker spec)
+    # Swap was previously a single flat value applied to both directions,
+    # which is wrong: the real broker spec shows swap long/short are wildly
+    # asymmetric (Swap long: -93.1728, Swap short: +21.6848, in points), and
+    # Wednesday carries a 3x multiplier (standard weekend-rollover
+    # compensation). Points -> USD/lot conversion uses tick size x contract
+    # size from the same spec (0.01 x 100 = $1/point/lot for XAUUSD).
+    # Re-derive these two numbers yourself if your broker's spec differs.
+    'lt_swap_long_per_lot_night': -93.17,   # USD per lot per night held, BUY positions
+    'lt_swap_short_per_lot_night': 21.68,   # USD per lot per night held, SELL positions
+    'lt_swap_wednesday_multiplier': 3.0,    # applied when the rollover date is a Wednesday
+    'lt_swap_per_lot_night': -6.5,  # legacy fallback only, kept for old configs; no longer used directly
     'lt_rejection_prob': 0.015,     # probability a signal is rejected/requoted during an ATR spike bar
 
     
@@ -656,6 +702,11 @@ bot_state: dict = {
     # Deliberately excluded from persistence (see TOP_LEVEL_EXCLUDE) since
     # it's diagnostic-only and would otherwise bloat the save file.
     'diag_log': [],
+    # Full history of every CLOSED live/real trade, rich enough to rebuild an
+    # Excel report matching the backtest's own format. Unlike diag_log this
+    # IS persisted (not in TOP_LEVEL_EXCLUDE) -- it's the actual trade record,
+    # not throwaway diagnostics, and must survive a bot restart.
+    'live_trade_history': [],
     'prot_stale_filter': True,
     'prot_cycle_inval': True,
     'prot_cycle_inval_pts': 200,
@@ -1389,7 +1440,9 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
 
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': entry_final, 'is_real': is_real, 'sl': sl, 'tp': tp,
-            'be_trigger': (entry_final + (tp - entry_final)/2) if is_buy else (entry_final - (entry_final - tp)/2) # simplified BE trigger
+            'be_trigger': (entry_final + (tp - entry_final)/2) if is_buy else (entry_final - (entry_final - tp)/2), # simplified BE trigger
+            'opened_at': datetime.now(timezone.utc).isoformat(), 'level_price': level['price'],
+            'feed_source': feed_source, 'feed_age_ms': feed_age_ms,
         }
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
         await save_bot_persistence()
@@ -1497,6 +1550,7 @@ def get_main_keyboard() -> dict:
         [{'text': '🔌 فحص حالة حساب MetaAPI', 'callback_data': 'check_metaapi_status'}],
         [{'text': '🩺 تشخيص: ليه مفيش صفقات؟', 'callback_data': 'run_diag'}],
         [{'text': '📊 تصدير سجل تشخيص تفصيلي (Excel)', 'callback_data': 'export_diag_excel'}],
+        [{'text': '📒 تصدير سجل الصفقات الحية (Excel)', 'callback_data': 'export_live_trades_excel'}],
         [{'text': '🔓 استئناف يدوي بعد HALT (بعد التأكد من الحساب)', 'callback_data': 'manual_resume_step1'}],
         [{'text': '📐 محرك جان (الاستراتيجية)', 'callback_data': 'menu_gann'}],
         [{'text': '🛡️ إعدادات الحماية', 'callback_data': 'menu_protection'}],
@@ -1532,6 +1586,8 @@ def get_protection_keyboard() -> dict:
         [{'text': f"فلتر أوقات دمشق (07-09 | 13-14): {'✅' if bot_state.get('prot_dam_time_filter', True) else '🔴'}", 'callback_data': 'tg_prot_dam_time'}],
         [{'text': f"حساب جان: {'⚡ حي (كل 5 دقائق)' if bot_state.get('gann_calculation_mode', 'static_h1') == 'dynamic_live' else '📌 كلاسيكي (H1/H4)'}", 'callback_data': 'tg_gann_calc_mode'}],
         [{'text': f'تكرار الصفقات (Multi-TF): {multi_tf}', 'callback_data': 'prot_toggle_multitf'}],
+        [{'text': '── ── ──', 'callback_data': 'noop'}],
+        [{'text': '🔄 تصفير كل الحمايات النشطة الآن', 'callback_data': 'prot_reset_all'}],
         [{'text': '🔙 رجوع للقائمة الرئيسية', 'callback_data': 'menu_main'}],
         [{'text': '🔙 رجوع لإعدادات جان', 'callback_data': 'menu_gann'}]
     ]
@@ -1819,6 +1875,13 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
                 await send_tg_msg(
                     f"✅ <b>تم إغلاق صفقة {symbol} (حقيقية) بنجاح لحماية الحساب!</b>\n\n{_trade_detail_line(tr)}"
                 )
+                pl = tr.get('last_known_pl', 0.0)
+                px = tr.get('last_known_px', tr.get('entry'))
+                _record_closed_trade_history(
+                    symbol, tid, tr, exit_px=px, pnl=pl,
+                    outcome_label=('WIN' if pl > 0 else 'LOSS' if pl < 0 else 'BREAK_EVEN'),
+                    close_reason='daily_capital_protection_forced_close', pnl_confirmed=False,
+                )
                 if tid in sym_state['gann_open_trades']:
                     del sym_state['gann_open_trades'][tid]
                     await save_bot_persistence()
@@ -1872,6 +1935,23 @@ async def gann_run_diagnostics() -> str:
     for symbol in active_symbols:
         sym_state = bot_state['symbol_state'][symbol]
         lines.append(f"━━━━━━━━━━━━━━\n<b>{symbol}</b>")
+
+        # ⚠️ Real entries ONLY fire from _gann_tick_fire_check, which is
+        # ONLY invoked by _GannPriceListener.on_symbol_price_updated (a
+        # MetaApi WS push). Everything else below (levels, trend, distance)
+        # can look perfectly "ready" off OANDA data while this feed is
+        # silently dead/stale -- that combination is exactly "diagnostic
+        # says ready, zero trades fire for hours" with no other symptom.
+        q = live_quotes.get(symbol)
+        ws_age = (time.monotonic() - q['ts']) if q else None
+        if q is None:
+            lines.append("📡 تغذية MetaApi اللحظية (WS): 🛑 <b>لم تصل ولا تيك واحد بعد لهذا الرمز</b> -- "
+                          "بدون هذه التغذية لا يمكن لأي صفقة حقيقية أن تُفتح مهما كانت المستويات جاهزة.")
+        elif ws_age > _QUOTE_STALE_SECONDS:
+            lines.append(f"📡 تغذية MetaApi اللحظية (WS): 🛑 <b>متوقفة منذ {ws_age:.0f} ثانية</b> "
+                          f"(آخر تحديث Bid={q['bid']} Ask={q['ask']}) -- الدخول الفعلي متجمد حتى تعود.")
+        else:
+            lines.append(f"📡 تغذية MetaApi اللحظية (WS): ✅ حية (عمرها {ws_age:.1f}s)")
 
         cycle_active = sym_state.get('gann_cycle_active', False)
         n_levels = len(sym_state.get('gann_levels', []))
@@ -1985,9 +2065,27 @@ async def gann_run_diagnostics() -> str:
                 nd = nearest['dist']
                 reason_blocked.append(f"بعيد عن الهامش ({nd:.3f} > {margin:.3f})")
 
+            # exec_mode gate: within_margin above only checks the live tick,
+            # but _gann_tick_fire_check applies a SECOND, mode-specific gate
+            # on top of it (see gann_execution_mode) -- this was previously
+            # invisible here, so /diagnose could say "ready" for a level the
+            # real entry logic would still reject in close/hybrid mode.
+            exec_mode = bot_state.get('gann_execution_mode', 'instant')
+            closed_close = float(candles[-1]['close'])
+            if within_margin and exec_mode == 'close':
+                if abs(closed_close - nearest['price']) > margin:
+                    reason_blocked.append(
+                        f"وضع التنفيذ Close: إغلاق آخر شمعة {tf} ({closed_close:.2f}) بعيد عن المستوى "
+                        f"({abs(closed_close - nearest['price']):.3f} > {margin:.3f})")
+            elif within_margin and exec_mode == 'hybrid':
+                spike_limit = bot_state.get('gann_spike_limit_pts', 20) * SYMBOL_INFO[symbol]['pip_value']
+                if abs(live_px - closed_close) > spike_limit:
+                    reason_blocked.append(
+                        f"وضع التنفيذ Hybrid: قفزة سعرية عن آخر إغلاق ({abs(live_px - closed_close):.3f} > {spike_limit:.3f})")
+
             status_icon = '✅ جاهز للدخول' if (within_margin and not reason_blocked) else ('🛑 ' + ' | '.join(reason_blocked) if reason_blocked else '🟡 خارج الهامش')
             dir_lbl = 'دعم/شراء 🟢' if nearest['is_buy'] else 'مقاومة/بيع 🔴'
-            lines.append(f"[{tf}] السعر: {live_px:.2f}  |  أقرب مستوى موافق للترند [{dir_lbl}]: {nearest['price']:.2f} (فرق {nearest['dist']:.3f})  |  {status_icon}")
+            lines.append(f"[{tf}] السعر: {live_px:.2f} (وضع: {exec_mode})  |  أقرب مستوى موافق للترند [{dir_lbl}]: {nearest['price']:.2f} (فرق {nearest['dist']:.3f})  |  {status_icon}")
 
     return "\n".join(lines)
 
@@ -2036,6 +2134,105 @@ async def export_diag_log_excel() -> None:
             f"كل سطر = قرار واحد للسكانر الحي لكل (رمز، فريم) بكل دورة فحص، بما فيها أسباب "
             f"التجاهل التي لم تُرسَل كرسالة تيليجرام من قبل."
         )
+    finally:
+        if os.path.exists(fname):
+            os.remove(fname)
+
+async def export_live_trades_excel() -> None:
+    """Export every CLOSED real/live trade (bot_state['live_trade_history'])
+    to an .xlsx styled to match the backtest reports exactly (same headers
+    where they overlap, same WIN/LOSS/BREAK_EVEN color fills, same borders/
+    column widths) -- but for actual broker trades, with extra columns a
+    backtest doesn't need: entry slippage vs the intended level, whether the
+    close price/pnl is broker-confirmed or an estimate, why it closed early
+    (TP/SL hit vs daily capital-protection force-close), duration, and the
+    feed/latency this specific trade fired under."""
+    hist = list(bot_state.get('live_trade_history', []))
+    if not hist:
+        await send_tg_msg("لا يوجد سجل صفقات حية مغلقة بعد (يبدأ التسجيل تلقائياً من أول صفقة حقيقية تُغلق بعد هذا التحديث).")
+        return
+
+    gray_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    be_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")  # unconfirmed PnL estimate
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "الصفقات الحية"
+    headers = ["الزوج", "TF", "حقيقية/وهمية", "اتجاه", "وقت الفتح (DAM)", "وقت الإغلاق (DAM)",
+               "المدة (د)", "مستوى الدخول", "الدخول الفعلي", "انزلاق الدخول", "TP", "SL",
+               "سعر الإغلاق", "النتيجة", "ربح ($)", "مؤكد من الوسيط؟", "سبب الإغلاق",
+               "BE مفعّل؟", "مصدر التغذية", "عمر التغذية (ms)"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = gray_fill
+        cell.font = Font(bold=True)
+
+    _OUTCOME_DISPLAY = {'WIN': 'WIN ✅', 'LOSS': 'LOSS ❌', 'BREAK_EVEN': 'BREAK_EVEN ⚖️'}
+    _REASON_DISPLAY = {
+        'tp_sl_or_manual_broker_close': 'TP/SL (مؤكد من الوسيط)',
+        'tp_sl_hit': 'TP/SL (تقديري)',
+        'daily_capital_protection_forced_close': '⏹️ إغلاق مبكر (حماية رأس المال اليومية)',
+    }
+    running_bal = 0.0
+    n_win = n_loss = n_be = 0
+    for tr in hist:
+        pnl = tr.get('pnl') or 0.0
+        running_bal += pnl
+        outcome = tr.get('outcome')
+        if outcome == 'WIN': n_win += 1
+        elif outcome == 'LOSS': n_loss += 1
+        elif outcome == 'BREAK_EVEN': n_be += 1
+
+        def _dam(iso):
+            if not iso: return ''
+            try:
+                dt = datetime.fromisoformat(iso)
+                return _utc_to_dam(dt).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                return str(iso)
+
+        row = [
+            tr.get('symbol'), tr.get('tf'), 'حقيقية' if tr.get('is_real') else 'وهمية (Paper)',
+            'BUY 📈' if tr.get('is_buy') else 'SELL 📉', _dam(tr.get('opened_at')), _dam(tr.get('closed_at')),
+            tr.get('duration_min'), tr.get('level_price'), tr.get('entry'), tr.get('entry_slippage'),
+            tr.get('tp'), tr.get('sl'), tr.get('exit_price'), _OUTCOME_DISPLAY.get(outcome, outcome), pnl,
+            '✅' if tr.get('pnl_confirmed_from_broker') else '⚠️ تقديري', _REASON_DISPLAY.get(tr.get('close_reason'), tr.get('close_reason')),
+            '✅' if tr.get('be_activated') else '—', tr.get('feed_source') or '—', tr.get('feed_age_ms'),
+        ]
+        ws.append(row)
+        row_idx = ws.max_row
+        fill = green_fill if outcome == 'WIN' else red_fill if outcome == 'LOSS' else be_fill if outcome == 'BREAK_EVEN' else None
+        if fill:
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_idx, column=col).fill = fill
+        if not tr.get('pnl_confirmed_from_broker') and tr.get('is_real'):
+            ws.cell(row=row_idx, column=16).fill = yellow_fill
+
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    center_align = Alignment(horizontal='center', vertical='center')
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = thin_border
+            cell.alignment = center_align
+    from openpyxl.utils import get_column_letter
+    for i in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 20.0
+
+    fname = f"LiveTrades_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
+    wb.save(fname)
+    try:
+        total = len(hist)
+        wr = round(100 * n_win / max(1, n_win + n_loss), 1)
+        summary = (
+            f"📒 <b>سجل الصفقات الحية الكامل</b>\n"
+            f"{total} صفقة مغلقة  |  WR: {wr}% ({n_win} ربح / {n_loss} خسارة / {n_be} تعادل)\n"
+            f"صافي: {running_bal:+.2f}$\n\n"
+            f"⚠️ الصفوف الصفراء = ربح تقديري لم يتأكد بعد من سجل الوسيط."
+        )
+        await send_tg_document(fname, summary)
     finally:
         if os.path.exists(fname):
             os.remove(fname)
@@ -2276,6 +2473,11 @@ async def gann_monitor_scanner() -> None:
                                            f"سيتم تصحيح الرقم تلقائياً عند تأكيد الصفقة من السجل.")
 
                                 await send_tg_msg(msg)
+                                _record_closed_trade_history(
+                                    symbol, tid, tr, exit_px=active_px, pnl=exact_pnl,
+                                    outcome_label=('WIN' if exact_pnl > 0 else 'LOSS' if exact_pnl < 0 else 'BREAK_EVEN'),
+                                    close_reason='tp_sl_or_manual_broker_close', pnl_confirmed=found_deal,
+                                )
                                 continue
                             else:
                                 trade_pl = _safe_float(actual_positions[tid].get('unrealizedProfit'), trade_pl)
@@ -2308,6 +2510,10 @@ async def gann_monitor_scanner() -> None:
                             bot_state['live_daily_realized'] += trade_pl
                             msg = f"🔔 <b>تحديث صفقة [{symbol} - جان {tf}]</b>\n\nالنتيجة: {outcome} ({trade_pl}$)\nسعر الإغلاق: {live_px:.2f}"
                             await send_tg_msg(msg)
+                            _record_closed_trade_history(
+                                symbol, tid, tr, exit_px=live_px, pnl=trade_pl, outcome_label=outcome,
+                                close_reason='tp_sl_hit', pnl_confirmed=False,
+                            )
                         else:
                             total_floating += trade_pl
                             
@@ -2346,6 +2552,11 @@ async def gann_monitor_scanner() -> None:
                                 f"الدخول: {tr.get('entry')}  |  الإغلاق: {px}\n"
                                 f"TP: {tr.get('tp')}  SL: {tr.get('sl')}\n"
                                 f"النتيجة: {outcome_lbl} ({pl}$)"
+                            )
+                            _record_closed_trade_history(
+                                symbol, tid, tr, exit_px=px, pnl=pl,
+                                outcome_label=('WIN' if pl > 0 else 'LOSS' if pl < 0 else 'BREAK_EVEN'),
+                                close_reason='daily_capital_protection_forced_close', pnl_confirmed=False,
                             )
                             del sym_state['gann_open_trades'][tid]
                             await save_bot_persistence()
@@ -2437,27 +2648,38 @@ async def gann_monitor_scanner() -> None:
                     }
 
                     # Diagnostics: same visibility as before (nearest compatible
-                    # level + distance, whether it was in margin) -- computed
-                    # off the last WS quote for logging purposes only. This
-                    # block no longer decides anything; it just reports.
+                    # level + distance, whether it was in margin), now logged
+                    # EVERY cycle regardless of WS quote health -- this used to
+                    # log NOTHING at all whenever live_quotes[symbol] was empty/
+                    # stale, which is exactly the situation most worth capturing:
+                    # _gann_tick_fire_check (the only thing that ever opens a
+                    # real trade) is driven purely by WS ticks, so a dead/starved
+                    # WS feed silently stops all entries AND silently emptied
+                    # this very log at the same time, making both symptoms
+                    # ("ready per /diagnose, zero trades" and "no diag log yet")
+                    # look unrelated when they're actually the same root cause.
                     q = live_quotes.get(symbol)
-                    diag_px = q['mid'] if q else None
+                    ws_age_s = round(time.monotonic() - q['ts'], 1) if q else None
+                    ws_status = 'live' if (q and ws_age_s <= _QUOTE_STALE_SECONDS) else ('stale' if q else 'never_received')
+                    diag_px, price_source, _age_ms = await _lq_price_with_fallback(symbol)
+                    entry_mode = sym_state['gann_entry_mode']
+                    directional_levels = (
+                        [l for l in levels if (l['dir'] == 'dn') == macro_trend_up]
+                        if entry_mode == 'touch_trend' and macro_trend_up is not None else levels
+                    )
+                    nearest_dist = None; nearest_price = None
                     if diag_px is not None:
-                        entry_mode = sym_state['gann_entry_mode']
-                        directional_levels = (
-                            [l for l in levels if (l['dir'] == 'dn') == macro_trend_up]
-                            if entry_mode == 'touch_trend' and macro_trend_up is not None else levels
-                        )
-                        nearest_dist = None; nearest_price = None
                         for l in directional_levels:
                             d = abs(diag_px - l['price'])
                             if nearest_dist is None or d < nearest_dist:
                                 nearest_dist = d; nearest_price = l['price']
-                        _diag_log_add({'ts': detect_time, 'symbol': symbol, 'master_px': diag_px,
-                                       'trend_up': macro_trend_up, 'margin': margin,
-                                       'nearest_compatible_level': nearest_price, 'nearest_dist': nearest_dist,
-                                       'within_margin': (nearest_dist is not None and nearest_dist <= margin),
-                                       'skip_reason': 'cache_refresh_only(firing_is_now_tick_driven)'})
+                    _diag_log_add({'ts': detect_time, 'symbol': symbol, 'master_px': diag_px,
+                                   'price_source': price_source, 'ws_status': ws_status, 'ws_quote_age_s': ws_age_s,
+                                   'trend_up': macro_trend_up, 'margin': margin,
+                                   'nearest_compatible_level': nearest_price, 'nearest_dist': nearest_dist,
+                                   'within_margin': (nearest_dist is not None and nearest_dist <= margin),
+                                   'skip_reason': ('no_price_available' if diag_px is None else
+                                                   'cache_refresh_only(firing_is_now_tick_driven)')})
 
                 except Exception as sym_exc:
                     log_exception(f"gann_monitor_scanner per-symbol [{symbol}]", sym_exc)
@@ -3346,7 +3568,9 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
     fric = bot_state['lt_friction']
     base_spread = float(bot_state['lt_base_spread_usd'])
     comm_per_lot = float(bot_state['lt_commission_per_lot'])
-    swap_per_lot = float(bot_state['lt_swap_per_lot_night'])
+    swap_long_per_lot = float(bot_state.get('lt_swap_long_per_lot_night', -93.17))
+    swap_short_per_lot = float(bot_state.get('lt_swap_short_per_lot_night', 21.68))
+    swap_wed_mult = float(bot_state.get('lt_swap_wednesday_multiplier', 3.0))
     rej_prob = float(bot_state['lt_rejection_prob'])
 
     active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
@@ -3669,7 +3893,16 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                         p_usd = round(diff * lot * cs * quote_conv, 2)
                         commission = comm_per_lot * lot if fric['commission'] else 0.0
                         nights = max((t.date() - tr['time'].date()).days, 0)
-                        swap = swap_per_lot * lot * nights if fric['gaps'] else 0.0
+                        swap = 0.0
+                        if fric['gaps'] and nights > 0:
+                            per_night = swap_long_per_lot if is_buy else swap_short_per_lot
+                            # Each night held may itself be a Wednesday (tripled) or not --
+                            # walk the actual calendar days rather than assuming a flat rate.
+                            for i in range(nights):
+                                d = tr['time'].date() + timedelta(days=i)
+                                mult = swap_wed_mult if d.weekday() == 2 else 1.0  # Monday=0 .. Wednesday=2
+                                swap += per_night * mult
+                            swap *= lot
                         p_usd_net = round(p_usd - commission + swap, 2)
                         if tr['outcome'] == 'WIN' and p_usd_net < 0:
                             tr['outcome'] = 'LOSS'  # friction ate the whole win -- report it honestly
@@ -3924,6 +4157,15 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
                 await send_tg_msg(f"❌ فشل تصدير سجل التشخيص: {e}")
         asyncio.create_task(_export_diag_task())
         return
+    if d == 'export_live_trades_excel':
+        async def _export_live_trades_task():
+            try:
+                await export_live_trades_excel()
+            except Exception as e:
+                log_exception('export_live_trades_excel', e)
+                await send_tg_msg(f"❌ فشل تصدير سجل الصفقات الحية: {e}")
+        asyncio.create_task(_export_live_trades_task())
+        return
     if d == 'manual_resume_step1':
         current_state = bot_state.get('connection_state', CONN_RUNNING)
         if current_state == CONN_RUNNING:
@@ -4074,6 +4316,38 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
             f"سيتم استخراج مستويات جديدة بالكامل من إغلاق شمعة {_anchor_label()} في التحديث القادم.\n"
             f"ملاحظة: مدة تجميد السلم (مدة المراقبة) لم تتغيّر — عدّلها يدوياً من أزرارها الخاصة لو حبيت."
         )
+
+    elif d == 'prot_reset_all':
+        # Clears every "stuck until next natural trigger" protection state:
+        # - live_daily_hit: capital-protection daily DD/profit lock (normally
+        #   only clears at midnight broker time)
+        # - per-symbol cycle invalidation from prot_cycle_inval (spike >200pts
+        #   freezes that symbol until its NEXT H1 close -- this forces an
+        #   immediate rebuild instead of waiting)
+        # Does NOT touch gann_level_status (already-used levels this cycle) --
+        # that's a normal trading-logic guard, not a "protection freeze", and
+        # clearing it would let the bot re-enter a level it already traded.
+        was_daily_hit = bot_state.get('live_daily_hit', False)
+        bot_state['live_daily_hit'] = False
+        frozen_symbols = []
+        for sym, ss in bot_state['symbol_state'].items():
+            if ss.get('gann_close_used') is None and not ss.get('gann_levels'):
+                continue  # wasn't actually frozen
+            frozen_symbols.append(sym)
+            ss['gann_levels'] = []
+            ss['gann_close_used'] = None
+            ss['gann_last_h1_time'] = None
+            ss['gann_cycle_started_at'] = None
+        await save_bot_persistence()
+        await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+        summary = []
+        if was_daily_hit:
+            summary.append("• قفل حماية رأس المال اليومي (ربح/تراجع) — تم فكّه، الدخول مسموح من الآن")
+        if frozen_symbols:
+            summary.append(f"• تجميد الدورة بسبب انفجار سعري — تم فكّه لـ: {', '.join(frozen_symbols)} (سيُعاد بناء المستويات فوراً)")
+        if not summary:
+            summary.append("لا توجد حمايات نشطة حالياً لتصفيرها — كل شيء طبيعي.")
+        await send_tg_msg("🔄 <b>تصفير الحمايات</b>\n\n" + "\n".join(summary))
 
     elif d == 'tg_prot_dam_time':
         bot_state['prot_dam_time_filter'] = not bot_state.get('prot_dam_time_filter', True)
