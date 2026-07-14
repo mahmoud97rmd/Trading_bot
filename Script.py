@@ -215,17 +215,23 @@ async def _gann_tick_fire_check(symbol: str, live_px: float, feed_age_ms: float)
                 if entry_mode == 'touch_trend':
                     if is_buy and not trend_up: continue
                     if not is_buy and trend_up: continue
-                if abs(live_px - lv['price']) > margin:
-                    continue
-
-                # ── Execution mode gate (unchanged semantics, tick-driven now) ──
+                # ── Execution mode gate ──
+                # close: fire purely off the OANDA closed-candle close, exactly
+                # like run_gann_backtest's bar_close check -- do NOT also require
+                # the current MetaApi tick to be within margin (that's a second,
+                # cross-feed condition the classic backtest never applies, and it
+                # was silently killing/mismatching trades vs the backtest).
                 if exec_mode == 'close':
                     if abs(closed_close - lv['price']) > margin:
                         continue
                 elif exec_mode == 'hybrid':
+                    if abs(live_px - lv['price']) > margin:
+                        continue
                     if abs(live_px - closed_close) > spike_limit:
                         continue
-                # instant: no further gate -- the margin check above is enough.
+                else:  # instant
+                    if abs(live_px - lv['price']) > margin:
+                        continue
 
                 # ── Reserve the level NOW, synchronously ──
                 # asyncio only switches tasks at an `await`, so writing this
@@ -2797,6 +2803,9 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                 res['cycle_logs'].append({'symbol': symbol, 'time_ts': t_start.timestamp(), 'time_dt': t_start, 'close': close, 'levels': len(active_lv)})
                 
                 level_used = set()
+                exec_mode = bot_state.get('gann_execution_mode', 'instant')
+                spike_limit = bot_state.get('gann_spike_limit_pts', 20) * pv
+
                 for btf, candles_m in monitor_tfs_data.items():
                     m_window = [c for c in candles_m if t_start <= c['time'] < t_end]
                     m_before = [c for c in candles_m if c['time'] < t_start]
@@ -2804,6 +2813,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
 
                     for bar in m_window:
                         bar_close = float(bar['close']); bar_time = bar['time']
+                        bar_high = float(bar['high']); bar_low = float(bar['low'])
                         trend_up = True
                         if sym_state['gann_entry_mode'] == 'touch_trend':
                             trend_time = bar_time.floor(trend_freq)
@@ -2828,8 +2838,14 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                             if sym_state['gann_entry_mode'] == 'touch_trend':
                                 if is_buy and not trend_up: continue
                                 if not is_buy and trend_up: continue
-                            if abs(bar_close - lv['price']) > margin: continue
-                            
+                            if exec_mode == 'close':
+                                if abs(bar_close - lv['price']) > margin: continue
+                            elif exec_mode == 'hybrid':
+                                if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
+                                if abs(bar_close - lv['price']) > spike_limit: continue
+                            else:  # instant: any part of the bar's range counts (intrabar touch)
+                                if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
+
                             entry = lv['price']
                             be_trigger_px = None
                             if sym_state['break_even_enabled']:
