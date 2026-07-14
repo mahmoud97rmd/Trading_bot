@@ -16,6 +16,7 @@ import logging
 import traceback
 import time
 import random
+import zlib
 import aiohttp
 import os
 import sys
@@ -3347,12 +3348,27 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
     comm_per_lot = float(bot_state['lt_commission_per_lot'])
     swap_per_lot = float(bot_state['lt_swap_per_lot_night'])
     rej_prob = float(bot_state['lt_rejection_prob'])
-    rng = random.Random()
 
     active_symbols = [s for s, on in bot_state['active_symbols'].items() if on]
     if not active_symbols:
         bot_state['is_live_twin_running'] = False
         return
+
+    # Deterministic seed: identical config (symbols + date range + exec mode +
+    # friction toggles) => identical random slippage/latency/rejection draws
+    # every run. Before this, rng = random.Random() re-seeded from system
+    # entropy/time on every call, so re-running the SAME backtest with NO
+    # settings changed could still swing net P&L wildly (pure noise, not signal)
+    # -- that alone can dwarf real differences between exec modes or code fixes.
+    # Set bot_state['lt_seed'] to an int to override; None keeps this auto-seed.
+    override_seed = bot_state.get('lt_seed')
+    if override_seed is not None:
+        seed_val = int(override_seed)
+    else:
+        seed_key = (tuple(sorted(active_symbols)), start_dt.isoformat(), end_dt.isoformat(),
+                    bot_state.get('gann_execution_mode', 'instant'), tuple(sorted(fric.items())))
+        seed_val = zlib.crc32(str(seed_key).encode())
+    rng = random.Random(seed_val)
 
     first_sym_state = bot_state['symbol_state'][active_symbols[0]]
     enabled_tfs = [tf for tf, on in first_sym_state['gann_monitor_tfs'].items() if on] or ['5m']
