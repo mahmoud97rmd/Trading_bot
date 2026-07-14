@@ -932,23 +932,23 @@ async def fetch_master_price(symbol: str) -> float | None:
 # ─────────────────────────────────────────────────────────────
 GANN_TFC_H1 = 0.02
 
-# تصنيف دقيق للمستويات:
-# star = المستويات الأصلية القوية التي حققت لك 100%
-# fan  = المستويات الموازية للمروحة
+# تصنيف دقيق للمستويات (مطابق تماماً لتطبيق OTC-Calculator المرجعي):
+# star = المستويات الأصلية القوية (AIMP في الأصل: انحصرت في 0.0833, 0.5, 1.0 فقط)
+# fan  = "موازي للمروحة" -- في الأصل هذا يعني معامل الزاوية 0.125 (8x1) حصراً،
+#        وليس أي معامل آخر. القائمة الأصلية (ACOEF) فيها 11 معامل فقط --
+#        لا يوجد 3.0 ولا 8.0 إطلاقاً.
 GANN_COEFS = [
     {'c': 0.0208, 'star': False, 'fan': False},
     {'c': 0.0417, 'star': False, 'fan': False},
     {'c': 0.0625, 'star': False, 'fan': False},
-    {'c': 0.0833, 'star': True,  'fan': False}, 
-    {'c': 0.125,  'star': False, 'fan': True},  # 8x1
-    {'c': 0.25,   'star': False, 'fan': True},  # 4x1
-    {'c': 0.333,  'star': False, 'fan': True},  # 3x1
-    {'c': 0.5,    'star': True,  'fan': True},  # 2x1 (أيضاً يعتبر أصلي)
-    {'c': 1.0,    'star': True,  'fan': True},  # 1x1 (أيضاً يعتبر أصلي)
-    {'c': 2.0,    'star': False, 'fan': True},  # 1x2
-    {'c': 3.0,    'star': False, 'fan': True},  # 1x3
-    {'c': 4.0,    'star': False, 'fan': True},  # 1x4
-    {'c': 8.0,    'star': False, 'fan': True},  # 1x8
+    {'c': 0.0833, 'star': True,  'fan': False},
+    {'c': 0.125,  'star': False, 'fan': True},  # 8x1 -- الوحيد الذي يُعتبر "موازي للمروحة"
+    {'c': 0.25,   'star': False, 'fan': False},
+    {'c': 0.333,  'star': False, 'fan': False},
+    {'c': 0.5,    'star': True,  'fan': False},
+    {'c': 1.0,    'star': True,  'fan': False},
+    {'c': 2.0,    'star': False, 'fan': False},
+    {'c': 4.0,    'star': False, 'fan': False},
 ]
 
 def _anchor_hours() -> int:
