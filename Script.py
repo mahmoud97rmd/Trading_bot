@@ -559,6 +559,8 @@ bot_state: dict = {
     # (check live_px against the level margin and fire immediately).
     # Nothing about current live trading changes until this is toggled.
     'gann_execution_mode': 'instant',
+    'lt_latency_ms_min': 300,   # calibrate to YOUR account's measured MetaApi Ping/Code Delay
+    'lt_latency_ms_max': 370,   # (see the "Code Delay"/"MetaApi Ping" fields on real fills)
     'gann_spike_limit_pts': 20,   # hybrid mode: block entry if live_px has moved this many points past the last closed candle's close
 
     # ── Live-Twin Engine (realistic execution simulator) ──
@@ -3314,8 +3316,14 @@ def _lt_slippage(bar_range: float, atr_val: float | None, rng: random.Random) ->
 
 
 def _lt_latency_shift(path: np.ndarray, steps: int, rng: random.Random) -> float:
-    """Signal-to-fill delay (200-800ms) expressed as a fractional shift along the intrabar path."""
-    latency_ms = rng.randint(200, 800)
+    """Signal-to-fill delay expressed as a fractional shift along the intrabar path.
+    Bounds default to a rough guess (200-800ms) but should be set from the bot's
+    OWN measured MetaApi ping (see the 'Code Delay'/'MetaApi Ping' fields logged on
+    every real fill) via bot_state['lt_latency_ms_min']/['lt_latency_ms_max'] so the
+    simulation reflects this account's actual broker/network latency, not a guess."""
+    lo = bot_state.get('lt_latency_ms_min', 200)
+    hi = bot_state.get('lt_latency_ms_max', 800)
+    latency_ms = rng.randint(lo, hi)
     frac = min(latency_ms / 60000.0, 1.0)  # fraction of a 1-minute bar consumed by the delay
     idx = min(int(frac * steps), steps)
     return float(path[idx])
@@ -3450,7 +3458,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                     spike_limit = bot_state.get('gann_spike_limit_pts', 20) * pv
 
                     for bar in m_window:
-                        bar_close = float(bar['close']); bar_time = bar['time']
+                        bar_open = float(bar['open']); bar_close = float(bar['close']); bar_time = bar['time']
                         bar_high = float(bar['high']); bar_low = float(bar['low'])
                         trend_up = True
                         if sym_state['gann_entry_mode'] == 'touch_trend':
@@ -3510,6 +3518,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                                 'sl_d': sl_d, 'tp_d': tp_d, 'be_enabled': sym_state['break_even_enabled'],
                                 'lot': lot, 'cs': cs, 'quote_conv': quote_conv, 'tf': btf, 'combo_key': combo_key,
                                 'cycle_time': t_start, 'cycle_close': close, 'level_key': k,
+                                'bar_o': bar_open, 'bar_h': bar_high, 'bar_l': bar_low, 'bar_c': bar_close,
                             })
                             level_used.add(combo_key)
 
@@ -3679,12 +3688,15 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                 if fric['rejection'] and rng.random() < rej_prob:
                     res['rejected'] += 1; continue
 
-                sig_bar = m1_lookup.get(sig['symbol'], {}).get(sig['time'])
-                if sig_bar:
-                    so, sh, sl_, sc = sig_bar['open'], sig_bar['high'], sig_bar['low'], sig_bar['close']
-                    sig_bar_range = sh - sl_
-                else:
-                    so = sh = sl_ = sc = sig['intended_entry']; sig_bar_range = 0.0
+                # NOTE: previously this looked up m1_lookup[symbol][sig['time']],
+                # i.e. only the FIRST 1-minute slice of the signal's own bar --
+                # for a 5m/3m/2m signal that silently truncated the real bar
+                # range down to a 1-minute one, understating slippage sizing
+                # and shortening the reconstructed intrabar path. The touched
+                # bar's true OHLC is now carried on the signal itself from
+                # Phase 1, so use that directly.
+                so, sh, sl_, sc = sig['bar_o'], sig['bar_h'], sig['bar_l'], sig['bar_c']
+                sig_bar_range = sh - sl_
 
                 entry_spread, _ = _lt_current_spread(base_spread, sig['time'], sig_bar_range, sig_bar_range or 0.1) if fric['spread'] else (base_spread, False)
                 path = _lt_bridge_path(so, sh, sl_, sc, steps=20, rng=rng)
