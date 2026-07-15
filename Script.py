@@ -86,6 +86,7 @@ def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px: float
         'outcome': outcome_label, 'pnl': pnl, 'pnl_confirmed_from_broker': pnl_confirmed,
         'close_reason': close_reason, 'be_activated': bool(tr.get('be_activated')),
         'feed_source': tr.get('feed_source'), 'feed_age_ms': tr.get('feed_age_ms'),
+        'trigger_type': tr.get('trigger_type'),
     })
     if len(hist) > _DIAG_LOG_MAX_ENTRIES:
         del hist[: len(hist) - _DIAG_LOG_MAX_ENTRIES]
@@ -2311,7 +2312,7 @@ async def export_live_trades_excel() -> None:
     headers = ["الزوج", "TF", "حقيقية/وهمية", "اتجاه", "وقت الفتح (DAM)", "وقت الإغلاق (DAM)",
                "المدة (د)", "مستوى الدخول", "الدخول الفعلي", "انزلاق الدخول", "TP", "SL",
                "سعر الإغلاق", "النتيجة", "ربح ($)", "مؤكد من الوسيط؟", "سبب الإغلاق",
-               "BE مفعّل؟", "مصدر التغذية", "عمر التغذية (ms)"]
+               "BE مفعّل؟", "مصدر التغذية", "عمر التغذية (ms)", "نوع التنفيذ"]
     ws.append(headers)
     for cell in ws[1]:
         cell.fill = gray_fill
@@ -2322,6 +2323,9 @@ async def export_live_trades_excel() -> None:
         'tp_sl_or_manual_broker_close': 'TP/SL (مؤكد من الوسيط)',
         'tp_sl_hit': 'TP/SL (تقديري)',
         'daily_capital_protection_forced_close': '⏹️ إغلاق مبكر (حماية رأس المال اليومية)',
+    }
+    _TRIGGER_DISPLAY = {
+        'touch': 'لمس مباشر ⚡', 'close': 'إغلاق شمعة ⏳', 'hybrid': 'تنفيذ هجين 🛡️',
     }
     running_bal = 0.0
     n_win = n_loss = n_be = 0
@@ -2348,6 +2352,7 @@ async def export_live_trades_excel() -> None:
             tr.get('tp'), tr.get('sl'), tr.get('exit_price'), _OUTCOME_DISPLAY.get(outcome, outcome), pnl,
             '✅' if tr.get('pnl_confirmed_from_broker') else '⚠️ تقديري', _REASON_DISPLAY.get(tr.get('close_reason'), tr.get('close_reason')),
             '✅' if tr.get('be_activated') else '—', tr.get('feed_source') or '—', tr.get('feed_age_ms'),
+            _TRIGGER_DISPLAY.get(tr.get('trigger_type'), 'غير مسجَّل (صفقة سابقة قبل هذا التحديث)'),
         ]
         ws.append(row)
         row_idx = ws.max_row
@@ -4905,15 +4910,22 @@ async def process_tg_update(update: dict) -> None:
         if parts[0] == '/backtest':
             try:
                 if len(parts) == 2:
-                    dt = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    # Day boundaries are DAM-LOCAL (UTC+3), matching every
+                    # report/timestamp the bot shows elsewhere -- NOT raw UTC
+                    # midnight, which used to clip the first 3h of the
+                    # intended day and pull in 3h of the next one instead.
+                    dam_midnight = datetime.strptime(parts[1], "%Y-%m-%d")
+                    dt = (dam_midnight - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest(dt, dt + timedelta(days=1)))
-                    await send_tg_msg(f"⏳ جاري باكتيست ليوم {parts[1]}...")
+                    await send_tg_msg(f"⏳ جاري باكتيست ليوم {parts[1]} (بتوقيت دمشق)...")
                     return
                 elif len(parts) == 3:
-                    dt1 = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    dt2 = datetime.strptime(parts[2], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+                    dam_midnight1 = datetime.strptime(parts[1], "%Y-%m-%d")
+                    dam_midnight2 = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)
+                    dt1 = (dam_midnight1 - DAM_OFF).replace(tzinfo=timezone.utc)
+                    dt2 = (dam_midnight2 - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest(dt1, dt2))
-                    await send_tg_msg(f"⏳ جاري باكتيست من {parts[1]} إلى {parts[2]}...")
+                    await send_tg_msg(f"⏳ جاري باكتيست من {parts[1]} إلى {parts[2]} (بتوقيت دمشق)...")
                     return
             except Exception:
                 await send_tg_msg("❌ <b>خطأ في التاريخ!</b>\nالصيغة: <code>/backtest 2026-06-24</code>\nأو <code>/backtest 2026-06-24 2026-06-26</code>")
@@ -4922,15 +4934,18 @@ async def process_tg_update(update: dict) -> None:
         if parts[0] == '/livetwin':
             try:
                 if len(parts) == 2:
-                    dt = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    dam_midnight = datetime.strptime(parts[1], "%Y-%m-%d")
+                    dt = (dam_midnight - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_live_twin_running']: asyncio.create_task(run_live_twin_simulation(dt, dt + timedelta(days=1)))
-                    await send_tg_msg(f"⏳ جاري Live-Twin ليوم {parts[1]}...")
+                    await send_tg_msg(f"⏳ جاري Live-Twin ليوم {parts[1]} (بتوقيت دمشق)...")
                     return
                 elif len(parts) == 3:
-                    dt1 = datetime.strptime(parts[1], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    dt2 = datetime.strptime(parts[2], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+                    dam_midnight1 = datetime.strptime(parts[1], "%Y-%m-%d")
+                    dam_midnight2 = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)
+                    dt1 = (dam_midnight1 - DAM_OFF).replace(tzinfo=timezone.utc)
+                    dt2 = (dam_midnight2 - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_live_twin_running']: asyncio.create_task(run_live_twin_simulation(dt1, dt2))
-                    await send_tg_msg(f"⏳ جاري Live-Twin من {parts[1]} إلى {parts[2]}...")
+                    await send_tg_msg(f"⏳ جاري Live-Twin من {parts[1]} إلى {parts[2]} (بتوقيت دمشق)...")
                     return
             except Exception:
                 await send_tg_msg("❌ <b>خطأ في التاريخ!</b>\nالصيغة: <code>/livetwin 2026-06-24</code>\nأو <code>/livetwin 2026-06-24 2026-06-26</code>")
