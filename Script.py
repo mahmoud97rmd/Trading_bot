@@ -1051,17 +1051,27 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
             chunk = min(remaining, 5000)
             params = {'granularity': gran_str, 'count': chunk, 'to': current_end.strftime('%Y-%m-%dT%H:%M:%S.000000000Z'), 'price': 'M'}
             candles = []
-            for attempt in range(3):
+            # Was 3 attempts / max ~7s total backoff (1+2+4s) -- too short for
+            # OANDA rate-limit windows to clear, especially during a long
+            # multi-week backtest that fires many paginated chunks back to
+            # back across several symbols/timeframes. A month-long request
+            # would silently stop after the first rate-limited chunk and
+            # just keep whatever partial data it already had -- "30 days
+            # requested, a few days returned" with no visible error anywhere.
+            for attempt in range(6):
                 try:
                     async with get_http().get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                         if resp.status != 200:
-                            if attempt == 2: break
-                            await asyncio.sleep(2 ** attempt)
+                            if attempt == 5:
+                                c_log(f"fetch_candles [{symbol} {granularity_str}]: giving up after 6 attempts "
+                                      f"(last status {resp.status}) -- collected {len(collected)}/{fetch_count} candles so far.")
+                                break
+                            await asyncio.sleep(min(2 ** attempt, 30))
                             continue
                         data = await resp.json(); candles = data.get('candles', []); break
                 except Exception as e:
-                    log_exception(f"fetch_candles [{symbol} {granularity_str}] attempt {attempt+1}/3", e)
-                    await asyncio.sleep(2 ** attempt)
+                    log_exception(f"fetch_candles [{symbol} {granularity_str}] attempt {attempt+1}/6", e)
+                    await asyncio.sleep(min(2 ** attempt, 30))
 
             if not candles: break
             complete = [c for c in candles if c.get('complete', True)]
@@ -3200,6 +3210,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
     await prog.start(bot_state['chat_id'])
 
     res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'total_win_usd': 0.0, 'total_loss_usd': 0.0, 'peak_equity': 0.0, 'max_dd': 0.0, 'trade_logs': [], 'cycle_logs': []}
+    _earliest_1m_seen = {}  # {symbol: earliest candle datetime actually fetched} -- used to warn if a long-range request silently got truncated (see fetch_candles hardening)
     
     try:
         delta_hours = int((end_dt - start_dt).total_seconds() / 3600)
@@ -3253,6 +3264,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             need_1m = days_diff * 24 * 60 + 300
             mc_1m = await fetch_candles(symbol, '1m', count=need_1m, end_time=end_dt)
             if mc_1m:
+                _earliest_1m_seen[symbol] = min(c['time'] for c in mc_1m)
                 for c in mc_1m:
                     all_candles_events.append({'time': c['time'], 'symbol': symbol, 'high': float(c['high']), 'low': float(c['low']), 'close': float(c['close']), 'tf': '1m_track'})
 
@@ -3609,7 +3621,25 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             sum_text += "\nالتعليق بسبب حماية رأس المال:\n"
             for d_str, rsn in suspended_days.items():
                 sum_text += f"- {d_str}: {rsn}\n"
-                
+
+        # Coverage-shortfall warning: if OANDA data actually available starts
+        # meaningfully later than the requested start_dt (e.g. rate-limited
+        # pagination gave up early -- see fetch_candles), a "1 month" request
+        # can silently analyze only a few days with no error anywhere. Make
+        # that visible here instead of leaving the user to notice only from
+        # a suspiciously small trade count.
+        short_syms = []
+        for sym, earliest in _earliest_1m_seen.items():
+            earliest_dt = earliest if earliest.tzinfo else earliest.replace(tzinfo=timezone.utc)
+            gap_days = (earliest_dt - start_dt).total_seconds() / 86400
+            if gap_days > 1.0:  # more than a day short of what was requested
+                short_syms.append(f"{sym}: البيانات الفعلية بدأت من {earliest_dt.strftime('%Y-%m-%d %H:%M')} "
+                                   f"بدل {start_dt.strftime('%Y-%m-%d %H:%M')} (نقص {gap_days:.1f} يوم)")
+        if short_syms:
+            sum_text += ("\n⚠️ <b>تحذير: تغطية بيانات ناقصة</b>\n"
+                          "الفترة المطلوبة أكبر مما استطعنا جلبه فعلياً من أوندا (على الأغلب حد معدل API):\n"
+                          + "\n".join(short_syms) + "\n")
+
         sum_text += f"\nدورات H1: {len(res['cycle_logs'])}  |  TP/SL: {str('ATR' if tpsl_mode=='atr' else 'نقاط ثابتة')} | Lot: {lot}"
 
         wb = openpyxl.Workbook()
@@ -3886,6 +3916,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
     res = {'win': 0, 'loss': 0, 'be': 0, 'total_prof': 0.0, 'total_win_usd': 0.0, 'total_loss_usd': 0.0,
            'peak_equity': 0.0, 'max_dd': 0.0, 'trade_logs': [], 'total_commission': 0.0, 'total_swap': 0.0,
            'rejected': 0, 'gap_events': 0}
+    _earliest_1m_seen = {}  # {symbol: earliest candle datetime actually fetched} -- see fetch_candles hardening comment
 
     try:
         delta_hours = int((end_dt - start_dt).total_seconds() / 3600)
@@ -3935,6 +3966,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
             need_1m = days_diff * 24 * 60 + 300
             mc_1m = await fetch_candles(symbol, '1m', count=need_1m, end_time=end_dt)
             if not mc_1m: continue
+            _earliest_1m_seen[symbol] = min(c['time'] for c in mc_1m)
             m1_by_symbol[symbol] = sorted(mc_1m, key=lambda c: c['time'])
 
             monitor_tfs_data = {}
@@ -4285,6 +4317,18 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
             bot_state['is_live_twin_running'] = False; return
 
         await prog.set_phase('إنشاء ملف Excel المنسق...')
+        short_syms = []
+        for sym, earliest in _earliest_1m_seen.items():
+            earliest_dt = earliest if earliest.tzinfo else earliest.replace(tzinfo=timezone.utc)
+            gap_days = (earliest_dt - start_dt).total_seconds() / 86400
+            if gap_days > 1.0:
+                short_syms.append(f"{sym}: البيانات الفعلية بدأت من {earliest_dt.strftime('%Y-%m-%d %H:%M')} "
+                                   f"بدل {start_dt.strftime('%Y-%m-%d %H:%M')} (نقص {gap_days:.1f} يوم)")
+        coverage_warning = ""
+        if short_syms:
+            coverage_warning = ("\n⚠️ <b>تحذير: تغطية بيانات ناقصة</b>\n"
+                                 "الفترة المطلوبة أكبر مما استطعنا جلبه فعلياً من أوندا (على الأغلب حد معدل API):\n"
+                                 + "\n".join(short_syms) + "\n")
         sum_text = (
             f"<b>Live-Twin Engine اكتمل ✅ (واقعي)</b>\n"
             f"{syms_label} | friction: [{on_tags}]\n"
@@ -4298,6 +4342,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
             f"عمولة إجمالية: -${round(res['total_commission'],2)} | سواب: ${round(res['total_swap'],2)}\n"
             f"صفقات مرفوضة (Requote): {res['rejected']} | نوافذ Rollover: {res['gap_events']}\n"
             f"Spread الأساسي: ${base_spread} (34pt من تيك حي)"
+            f"{coverage_warning}"
         )
 
         wb = openpyxl.Workbook()
@@ -4355,6 +4400,7 @@ def get_live_twin_keyboard() -> dict:
         [{'text': 'يوم واحد', 'callback_data': 'lt_1'}, {'text': 'يومين', 'callback_data': 'lt_2'}],
         [{'text': 'ثلاثة أيام', 'callback_data': 'lt_3'}, {'text': 'أسبوع', 'callback_data': 'lt_7'}],
         [{'text': 'شهر كامل', 'callback_data': 'lt_30'}],
+        [{'text': 'أو أرسل: /backtestreal YYYY-MM-DD', 'callback_data': 'noop'}],
         [{'text': '← رجوع', 'callback_data': 'menu_main'}],
     ]}
 
@@ -4931,7 +4977,7 @@ async def process_tg_update(update: dict) -> None:
                 await send_tg_msg("❌ <b>خطأ في التاريخ!</b>\nالصيغة: <code>/backtest 2026-06-24</code>\nأو <code>/backtest 2026-06-24 2026-06-26</code>")
                 return
 
-        if parts[0] == '/livetwin':
+        if parts[0] in ('/livetwin', '/backtestreal'):
             try:
                 if len(parts) == 2:
                     dam_midnight = datetime.strptime(parts[1], "%Y-%m-%d")
@@ -4948,7 +4994,7 @@ async def process_tg_update(update: dict) -> None:
                     await send_tg_msg(f"⏳ جاري Live-Twin من {parts[1]} إلى {parts[2]} (بتوقيت دمشق)...")
                     return
             except Exception:
-                await send_tg_msg("❌ <b>خطأ في التاريخ!</b>\nالصيغة: <code>/livetwin 2026-06-24</code>\nأو <code>/livetwin 2026-06-24 2026-06-26</code>")
+                await send_tg_msg("❌ <b>خطأ في التاريخ!</b>\nالصيغة: <code>/backtestreal 2026-06-24</code> (أو <code>/livetwin</code>)\nأو <code>/backtestreal 2026-06-24 2026-06-26</code>")
                 return
 
         if not msg.startswith('/') and msg in bot_state.get('menu_button_map', {}):
