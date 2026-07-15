@@ -2410,21 +2410,24 @@ async def gann_monitor_scanner() -> None:
                 reconnected = False
                 for attempt in range(5):
                     try:
-                        await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
-                        await asyncio.wait_for(_metaapi_conn.wait_synchronized(), timeout=30)
-                        for sym, on in bot_state['active_symbols'].items():
-                            if on:
-                                await _lq_subscribe_symbol(sym)
-                        c_log("MetaAPI Reconnected successfully (live quotes resubscribed).")
-                        reconnected = True
-                        _last_any_tick_ts = time.monotonic()
-                        break
+                        # Full bootstrap, not a raw .connect() on _metaapi_conn:
+                        # if the ORIGINAL connection attempt failed because the
+                        # account wasn't DEPLOYED yet (or any other reason
+                        # _metaapi_conn was never created), _metaapi_conn is
+                        # still None here -- calling .connect() on it throws
+                        # AttributeError every single attempt forever, with no
+                        # way back to a working connection. _bootstrap_
+                        # metaapi_connection() re-fetches the account fresh
+                        # (so it sees a deployment-state change) and safely
+                        # (re)builds _metaapi_conn from scratch either way.
+                        reconnected = await _bootstrap_metaapi_connection()
+                        if reconnected:
+                            c_log("MetaAPI Reconnected successfully (live quotes resubscribed).")
+                            break
                     except Exception as e:
                         log_exception(f"MetaAPI reconnect attempt {attempt+1}/5", e)
-                        await asyncio.sleep(2 ** attempt)
-                if reconnected:
-                    await set_connection_state(CONN_RUNNING, "MetaAPI reconnected and synchronized.")
-                else:
+                    await asyncio.sleep(2 ** attempt)
+                if not reconnected:
                     # Do not spin forever inside this loop iteration; stay
                     # READ_ONLY, log it, and let the next scanner tick retry.
                     # If this persists, an operator will see the escalation
