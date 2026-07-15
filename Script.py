@@ -493,7 +493,21 @@ async def _bootstrap_metaapi_connection() -> bool:
     try:
         _metaapi = MetaApi(METAAPI_TOKEN)
         _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
-        if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
+        # NOTE: we deliberately do NOT also require
+        # _metaapi_account.connection_status == 'CONNECTED' here.
+        # MetaApi's own docs describe connectionStatus as a "replica field"
+        # -- a periodically-synced snapshot, not the real-time truth (the
+        # account dashboard's live "Connected" indicator uses the actual
+        # real-time websocket status, which can be ahead of this REST
+        # snapshot by anywhere from seconds to minutes). Gating here on that
+        # stale field caused the bot to refuse to even ATTEMPT a connection
+        # while the account was already genuinely healthy and connected on
+        # MetaApi's side. state == 'DEPLOYED' is a real, non-lagging fact
+        # (the API server either exists or it doesn't); the actual
+        # connectivity check now happens for real via wait_synchronized()
+        # below, which IS the authoritative real-time signal, wrapped in our
+        # existing timeout so a genuinely bad connection still fails fast.
+        if _metaapi_account.state == 'DEPLOYED':
             _metaapi_conn = _metaapi_account.get_streaming_connection()
             _metaapi_conn.add_synchronization_listener(_GannPriceListener())
             await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
@@ -506,9 +520,8 @@ async def _bootstrap_metaapi_connection() -> bool:
             await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized.")
             return True
         else:
-            c_log(f"MetaAPI account not deployed/connected (state={_metaapi_account.state}, "
-                  f"conn={_metaapi_account.connection_status}).")
-            await set_connection_state(CONN_READ_ONLY, "MetaAPI account is not DEPLOYED/CONNECTED.")
+            c_log(f"MetaAPI account not deployed (state={_metaapi_account.state}).")
+            await set_connection_state(CONN_READ_ONLY, f"MetaAPI account is not DEPLOYED (state={_metaapi_account.state}).")
             return False
     except Exception as e:
         log_exception("_bootstrap_metaapi_connection", e)
@@ -2405,7 +2418,7 @@ async def gann_monitor_scanner() -> None:
                 )
 
             # MT5 Zombie Singleton Heartbeat
-            if _metaapi_account and _metaapi_account.connection_status != 'CONNECTED':
+            if _metaapi_account and bot_state.get('connection_state') != CONN_RUNNING:
                 await set_connection_state(CONN_READ_ONLY, "MetaAPI connection lost — attempting reconnect.")
                 reconnected = False
                 for attempt in range(5):
