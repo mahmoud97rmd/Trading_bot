@@ -464,32 +464,20 @@ def is_trading_allowed() -> bool:
         return False
     return True
 
-async def init_metaapi():
-    """Startup order is fixed:
-       1) Reconstruct state from the persistence file (works even if the
-          broker/API is completely unreachable).
-       2) Only THEN attempt to talk to MetaAPI / the market.
-    """
+async def _bootstrap_metaapi_connection() -> bool:
+    """The actual connect-and-subscribe logic, extracted so it can be
+    retried from the live scanner loop, not just called once at process
+    startup. Returns True on success. This is what closes the gap where
+    a transient MetaApi/broker hiccup during the ONE startup attempt left
+    _metaapi_conn permanently None with no other recovery path able to
+    rebuild it from scratch (both the WS tick-watchdog and the Zombie
+    Singleton Heartbeat below require a connection object to already
+    exist before they can do anything)."""
     global _metaapi, _metaapi_account, _metaapi_conn, _last_any_tick_ts
-
-    load_bot_persistence()
-    if bot_state.get('_persistence_load_failed'):
-        await set_connection_state(
-            CONN_READ_ONLY,
-            "Startup persistence file was present but unreadable. Starting READ_ONLY until a human "
-            "confirms the true broker state and clears this manually."
-        )
-
     try:
         _metaapi = MetaApi(METAAPI_TOKEN)
         _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
         if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
-            # Streaming connection (not RPC): this is what gives us pushed,
-            # real-time quotes via the terminal-state sync -- an RPC
-            # connection only supports one-off trade commands and doesn't
-            # maintain a live quote cache at all. One streaming connection
-            # handles both quotes (via the listener) and order placement,
-            # so nothing else needs a second connection.
             _metaapi_conn = _metaapi_account.get_streaming_connection()
             _metaapi_conn.add_synchronization_listener(_GannPriceListener())
             await _metaapi_conn.connect()
@@ -497,16 +485,35 @@ async def init_metaapi():
             for sym, on in bot_state['active_symbols'].items():
                 if on:
                     await _lq_subscribe_symbol(sym)
-            c_log("MetaAPI Persistent Streaming Connection established (live quotes subscribed).")
+            c_log("MetaAPI Streaming Connection established (live quotes subscribed).")
             _last_any_tick_ts = time.monotonic()
-            await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized at startup.")
+            await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized.")
+            return True
         else:
-            c_log(f"MetaAPI account not deployed/connected at startup (state={_metaapi_account.state}, "
+            c_log(f"MetaAPI account not deployed/connected (state={_metaapi_account.state}, "
                   f"conn={_metaapi_account.connection_status}).")
-            await set_connection_state(CONN_READ_ONLY, "MetaAPI account is not DEPLOYED/CONNECTED at startup.")
+            await set_connection_state(CONN_READ_ONLY, "MetaAPI account is not DEPLOYED/CONNECTED.")
+            return False
     except Exception as e:
-        log_exception("init_metaapi", e)
-        await set_connection_state(CONN_READ_ONLY, f"MetaAPI init failed at startup: {e}")
+        log_exception("_bootstrap_metaapi_connection", e)
+        await set_connection_state(CONN_READ_ONLY, f"MetaAPI connection bootstrap failed: {e}")
+        return False
+
+
+async def init_metaapi():
+    """Startup order is fixed:
+       1) Reconstruct state from the persistence file (works even if the
+          broker/API is completely unreachable).
+       2) Only THEN attempt to talk to MetaAPI / the market.
+    """
+    load_bot_persistence()
+    if bot_state.get('_persistence_load_failed'):
+        await set_connection_state(
+            CONN_READ_ONLY,
+            "Startup persistence file was present but unreadable. Starting READ_ONLY until a human "
+            "confirms the true broker state and clears this manually."
+        )
+    await _bootstrap_metaapi_connection()
 
 DATA_DIR = os.environ.get('PERSISTENT_DATA_PATH', '/app/data')
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -2353,6 +2360,17 @@ async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
     while True:
         try:
+            # ── Cold-start self-heal ──
+            # If _metaapi_conn (or _metaapi_account) is still None, neither
+            # of the two watchdogs below can do anything -- both require a
+            # connection object to already exist before they'll act. This
+            # is exactly the gap that left the bot in silent, permanent
+            # READ_ONLY when the ONE startup connection attempt lost a race
+            # with a transient MetaApi/broker hiccup. Retry from scratch
+            # here, every scanner tick, until it succeeds.
+            if _metaapi_conn is None or _metaapi_account is None:
+                await _bootstrap_metaapi_connection()
+
             # ── WS tick-silence watchdog (runs BEFORE and INDEPENDENTLY of the
             # connection_status check below) ──
             # This is the fix for the 6-hour rollover freeze: connection_status
