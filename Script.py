@@ -381,6 +381,7 @@ async def _force_full_reconnect(reason: str) -> None:
         await send_tg_msg(f"🛑 <b>Watchdog: فشلت محاولة إعادة الاتصال التلقائي</b>\nالسبب الأصلي: {reason}\nالخطأ: {e}")
 
 
+async def _lq_subscribe_symbol(symbol: str) -> None:
     """Subscribe one OANDA-format symbol's broker equivalent to live
     quotes. Safe to call multiple times (idempotent on the broker side);
     swallows failures so one bad symbol doesn't block the others."""
