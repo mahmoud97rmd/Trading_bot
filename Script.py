@@ -362,13 +362,23 @@ async def _force_full_reconnect(reason: str) -> None:
     try:
         if _metaapi_conn is not None:
             try:
-                await _metaapi_conn.close()
+                await asyncio.wait_for(_metaapi_conn.close(), timeout=15)
             except Exception as e:
                 log_exception('_force_full_reconnect: close old connection', e)
         _metaapi_conn = _metaapi_account.get_streaming_connection()
         _metaapi_conn.add_synchronization_listener(_GannPriceListener())
-        await _metaapi_conn.connect()
-        await _metaapi_conn.wait_synchronized()
+        # asyncio.wait_for is the actual fix here: without it, a hung/degraded
+        # region on the SDK side (e.g. it keeps internally retrying a broker
+        # region that's unhealthy) means this await NEVER returns -- which
+        # freezes the ENTIRE gann_monitor_scanner loop forever, including
+        # every future watchdog check. That silently explains "996s stale,
+        # zero alerts, zero retries" far better than a slow-but-finite
+        # reconnect would: the loop wasn't retrying every 15s and failing
+        # quietly, it was stuck on this one await the whole time. A bounded
+        # timeout guarantees the loop always gets control back and can try
+        # again fresh (a brand new connection object) next cycle.
+        await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
+        await asyncio.wait_for(_metaapi_conn.wait_synchronized(), timeout=30)
         for sym, on in bot_state['active_symbols'].items():
             if on:
                 await _lq_subscribe_symbol(sym)
@@ -376,6 +386,12 @@ async def _force_full_reconnect(reason: str) -> None:
         c_log("WS WATCHDOG: reconnect successful, ticks should resume.")
         await set_connection_state(CONN_RUNNING, "WS watchdog: forced reconnect succeeded.")
         await send_tg_msg(f"🔁 <b>Watchdog: أعيد الاتصال تلقائياً بـ MetaApi</b>\nالسبب: {reason}")
+    except asyncio.TimeoutError:
+        c_log("WS WATCHDOG: reconnect attempt timed out -- will retry next scan cycle (~15s).")
+        await send_tg_msg(
+            f"🛑 <b>Watchdog: انتهت مهلة إعادة الاتصال (30s)</b>\nالسبب الأصلي: {reason}\n"
+            f"سيُعاد المحاولة تلقائياً بدورة فحص جديدة خلال ~15 ثانية."
+        )
     except Exception as e:
         log_exception('_force_full_reconnect', e)
         await send_tg_msg(f"🛑 <b>Watchdog: فشلت محاولة إعادة الاتصال التلقائي</b>\nالسبب الأصلي: {reason}\nالخطأ: {e}")
@@ -480,8 +496,8 @@ async def _bootstrap_metaapi_connection() -> bool:
         if _metaapi_account.state == 'DEPLOYED' and _metaapi_account.connection_status == 'CONNECTED':
             _metaapi_conn = _metaapi_account.get_streaming_connection()
             _metaapi_conn.add_synchronization_listener(_GannPriceListener())
-            await _metaapi_conn.connect()
-            await _metaapi_conn.wait_synchronized()
+            await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
+            await asyncio.wait_for(_metaapi_conn.wait_synchronized(), timeout=30)
             for sym, on in bot_state['active_symbols'].items():
                 if on:
                     await _lq_subscribe_symbol(sym)
@@ -2394,8 +2410,8 @@ async def gann_monitor_scanner() -> None:
                 reconnected = False
                 for attempt in range(5):
                     try:
-                        await _metaapi_conn.connect()
-                        await _metaapi_conn.wait_synchronized()
+                        await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
+                        await asyncio.wait_for(_metaapi_conn.wait_synchronized(), timeout=30)
                         for sym, on in bot_state['active_symbols'].items():
                             if on:
                                 await _lq_subscribe_symbol(sym)
