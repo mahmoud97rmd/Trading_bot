@@ -58,40 +58,47 @@ def _diag_log_add(entry: dict) -> None:
     if len(log) > _DIAG_LOG_MAX_ENTRIES:
         del log[: len(log) - _DIAG_LOG_MAX_ENTRIES]
 
-def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px: float, pnl: float,
-                                  outcome_label: str, close_reason: str, pnl_confirmed: bool) -> None:
+_trade_history_lock = asyncio.Lock()
+
+async def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px: float, pnl: float,
+                                        outcome_label: str, close_reason: str, pnl_confirmed: bool) -> None:
     """Append one row of full detail for a just-closed real/virtual live
     trade, feeding /export_live_trades_excel. Kept deliberately rich (every
     field a human would need to judge "did this trade behave like the
     backtest expected") since this is the ONLY place live trade outcomes
     get durably recorded anywhere in the bot today."""
-    hist = bot_state.setdefault('live_trade_history', [])
-    entry = tr.get('entry'); is_buy = tr.get('is_buy')
-    opened_at = tr.get('opened_at')
-    closed_at_dt = datetime.now(timezone.utc)
-    duration_min = None
-    if opened_at:
-        try:
-            opened_dt = datetime.fromisoformat(opened_at) if isinstance(opened_at, str) else opened_at
-            duration_min = round((closed_at_dt - opened_dt).total_seconds() / 60.0, 1)
-        except Exception:
-            duration_min = None
-    intended_entry = tr.get('level_price', entry)
-    entry_slip = (entry - intended_entry) if (entry is not None and intended_entry is not None) else None
-    hist.append({
-        'symbol': symbol, 'tid': tid, 'tf': tr.get('tf'), 'is_real': bool(tr.get('is_real')),
-        'is_buy': is_buy, 'opened_at': opened_at, 'closed_at': closed_at_dt.isoformat(),
-        'duration_min': duration_min, 'level_price': intended_entry, 'entry': entry,
-        'entry_slippage': entry_slip, 'tp': tr.get('tp'), 'sl': tr.get('sl'), 'exit_price': exit_px,
-        'outcome': outcome_label, 'pnl': pnl, 'pnl_confirmed_from_broker': pnl_confirmed,
-        'close_reason': close_reason, 'be_activated': bool(tr.get('be_activated')),
-        'feed_source': tr.get('feed_source'), 'feed_age_ms': tr.get('feed_age_ms'),
-        'trigger_type': tr.get('trigger_type'),
-        'exec_latency_ms': tr.get('exec_latency_ms'), 'exec_method': tr.get('exec_method'),
-        'exec_ioc_fail_reason': tr.get('exec_ioc_fail_reason'), 'exec_slippage': tr.get('exec_slippage'),
-    })
-    if len(hist) > _DIAG_LOG_MAX_ENTRIES:
-        del hist[: len(hist) - _DIAG_LOG_MAX_ENTRIES]
+    try:
+        entry = tr.get('entry')
+        is_buy = tr.get('is_buy')
+        opened_at = tr.get('opened_at')
+        closed_at_dt = datetime.now(timezone.utc)
+        duration_min = None
+        if opened_at:
+            try:
+                opened_dt = datetime.fromisoformat(opened_at) if isinstance(opened_at, str) else opened_at
+                duration_min = round((closed_at_dt - opened_dt).total_seconds() / 60.0, 1)
+            except Exception:
+                duration_min = None
+        intended_entry = tr.get('level_price', entry)
+        entry_slip = (entry - intended_entry) if (entry is not None and intended_entry is not None) else None
+        async with _trade_history_lock:
+            hist = bot_state.setdefault('live_trade_history', [])
+            hist.append({
+                'symbol': symbol, 'tid': tid, 'tf': tr.get('tf'), 'is_real': bool(tr.get('is_real')),
+                'is_buy': is_buy, 'opened_at': opened_at, 'closed_at': closed_at_dt.isoformat(),
+                'duration_min': duration_min, 'level_price': intended_entry, 'entry': entry,
+                'entry_slippage': entry_slip, 'tp': tr.get('tp'), 'sl': tr.get('sl'), 'exit_price': exit_px,
+                'outcome': outcome_label, 'pnl': pnl, 'pnl_confirmed_from_broker': pnl_confirmed,
+                'close_reason': close_reason, 'be_activated': bool(tr.get('be_activated')),
+                'feed_source': tr.get('feed_source'), 'feed_age_ms': tr.get('feed_age_ms'),
+                'trigger_type': tr.get('trigger_type'),
+                'exec_latency_ms': tr.get('exec_latency_ms'), 'exec_method': tr.get('exec_method'),
+                'exec_ioc_fail_reason': tr.get('exec_ioc_fail_reason'), 'exec_slippage': tr.get('exec_slippage'),
+            })
+            if len(hist) > _DIAG_LOG_MAX_ENTRIES:
+                del hist[: len(hist) - _DIAG_LOG_MAX_ENTRIES]
+    except Exception as e:
+        log_exception(f'_record_closed_trade_history [{symbol} {tid}]', e)
 
 # -----------------------------------------------------------------
 # CONFIGURATION
@@ -152,6 +159,10 @@ _metaapi_conn = None
 # translates incoming broker-symbol ticks back to that key.
 live_quotes: dict[str, dict] = {}          # {'XAU_USD': {'bid':, 'ask':, 'mid':, 'ts': monotonic}}
 _broker_to_data_symbol: dict[str, str] = {}  # {'XAUUSD': 'XAU_USD', ...}
+
+# Cap concurrent tick-processing tasks to prevent unbounded task pile-up
+# during high-frequency tick bursts.
+_tick_semaphore = asyncio.Semaphore(5)
 _QUOTE_STALE_SECONDS = 5.0
 # Updated on EVERY tick received from MetaApi, for ANY symbol -- this is
 # deliberately independent of live_quotes/_broker_to_data_symbol (which can
@@ -195,7 +206,7 @@ class _GannPriceListener(SynchronizationListener):
         # immediately -- _gann_tick_fire_check does its own (awaited) I/O,
         # but none of that blocks the SDK's socket message processing since
         # it's a separate task, not inline in this callback.
-        asyncio.create_task(_gann_tick_fire_check(data_sym, mid, 0.0))
+        _safe_task(_gann_tick_fire_check(data_sym, mid, 0.0), 'tick_fire_check')
 
     async def on_connected(self, instance_index, replicas):
         c_log("MetaAPI streaming connection established (price feed live).")
@@ -203,6 +214,11 @@ class _GannPriceListener(SynchronizationListener):
     async def on_disconnected(self, instance_index):
         c_log("MetaAPI streaming connection lost -- reconnect loop will retry and resubscribe.")
 
+
+def _safe_task(coro, name=''):
+    t = asyncio.create_task(coro)
+    t.add_done_callback(lambda fut: log_exception(f'background task [{name}]', fut.exception()) if not fut.cancelled() and fut.exception() else None)
+    return t
 
 async def _gann_tick_fire_check(symbol: str, live_px: float, feed_age_ms: float) -> None:
     """The actual touch decision, run the instant a new tick arrives (called
@@ -212,125 +228,100 @@ async def _gann_tick_fire_check(symbol: str, live_px: float, feed_age_ms: float)
     checked against that data is always this exact tick, never a value
     read back out of a timer loop. That's what makes firing on a stale
     quote structurally impossible now, not just less likely."""
-    try:
-        if bot_state.get('connection_state') != CONN_RUNNING:
-            return
-        if bot_state.get('live_daily_hit'):
-            return
-        if bot_state.get('prot_dam_time_filter', True):
-            dam_time = (datetime.now(timezone.utc) + timedelta(hours=3)).time()
-            if any(start <= dam_time < end for start, end in _DAM_RESTRICTED_WINDOWS):
+    # Backpressure: if 5 tick checks are already running, skip this tick
+    if _tick_semaphore.locked():
+        return
+    async with _tick_semaphore:
+        try:
+            if bot_state.get('connection_state') != CONN_RUNNING:
+                return
+            if bot_state.get('live_daily_hit'):
+                return
+            cache = _gann_cache.get(symbol)
+            if not cache:
+                return
+            sym_state = bot_state['symbol_state'][symbol]
+            if not sym_state['gann_cycle_active'] or not sym_state['gann_levels']:
                 return
 
-        cache = _gann_cache.get(symbol)
-        if not cache:
-            return
-        sym_state = bot_state['symbol_state'][symbol]
-        if not sym_state['gann_cycle_active'] or not sym_state['gann_levels']:
-            return
+            max_concurrent = max(1, int(bot_state.get('prot_max_concurrent_trades', 4)))
+            open_count = sum(1 for v in sym_state['gann_open_trades'].values() if isinstance(v, dict))
+            if open_count >= max_concurrent:
+                return
 
-        max_concurrent = int(bot_state.get('prot_max_concurrent_trades', 4))
-        open_count = sum(1 for v in sym_state['gann_open_trades'].values() if isinstance(v, dict))
-        if open_count >= max_concurrent:
-            return
+            margin = cache['margin']; levels = cache['levels']; trend_up = cache['trend_up']
+            entry_mode = sym_state['gann_entry_mode']
+            exec_mode = bot_state.get('gann_execution_mode', 'instant')
+            pv = SYMBOL_INFO[symbol]['pip_value']
+            spike_limit = bot_state.get('gann_spike_limit_pts', 20) * pv
+            flt_type = sym_state['trend_filter_type']; ttf = sym_state['trend_timeframe']
+            detect_time = datetime.now(timezone.utc)
 
-        margin = cache['margin']; levels = cache['levels']; trend_up = cache['trend_up']
-        entry_mode = sym_state['gann_entry_mode']
-        exec_mode = bot_state.get('gann_execution_mode', 'instant')
-        pv = SYMBOL_INFO[symbol]['pip_value']
-        spike_limit = bot_state.get('gann_spike_limit_pts', 20) * pv
-        flt_type = sym_state['trend_filter_type']; ttf = sym_state['trend_timeframe']
-        detect_time = datetime.now(timezone.utc)
+            for tf in cache['enabled_tfs']:
+                if any(isinstance(v, dict) and v.get('tf') == tf for v in sym_state['gann_open_trades'].values()):
+                    continue
+                tf_data = cache['tf_data'].get(tf)
+                if not tf_data:
+                    continue
+                candles = tf_data['candles']; closed_close = tf_data['closed_close']
 
-        for tf in cache['enabled_tfs']:
-            if any(isinstance(v, dict) and v.get('tf') == tf for v in sym_state['gann_open_trades'].values()):
-                continue
-            tf_data = cache['tf_data'].get(tf)
-            if not tf_data:
-                continue
-            candles = tf_data['candles']; closed_close = tf_data['closed_close']
+                if entry_mode == 'touch_trend' and trend_up is None:
+                    continue
 
-            if entry_mode == 'touch_trend' and trend_up is None:
-                continue
+                if exec_mode == 'all_concurrent':
+                    channels = ['touch', 'close', 'hybrid']
+                elif exec_mode == 'close':
+                    channels = ['close']
+                elif exec_mode == 'hybrid':
+                    channels = ['hybrid']
+                else:
+                    channels = ['touch']
 
-            # ── Which trigger channel(s) to evaluate this tick ──
-            # For the 3 existing modes this is a single channel, identical
-            # to the old behavior. all_concurrent runs all three
-            # independently -- each is checked against the SAME level pool
-            # but gets its OWN dedup key (see combo_key below), so e.g. a
-            # touch and a close can both fire on the same level without
-            # blocking each other, exactly as requested for the 24h
-            # concurrent comparison test.
-            if exec_mode == 'all_concurrent':
-                channels = ['touch', 'close', 'hybrid']
-            elif exec_mode == 'close':
-                channels = ['close']
-            elif exec_mode == 'hybrid':
-                channels = ['hybrid']
-            else:
-                channels = ['touch']  # 'instant'
-
-            for channel in channels:
-                for lv in levels:
-                    k = lv['key']; dir_ = lv['dir']
-                    # Only all_concurrent suffixes the channel onto the dedup
-                    # key -- the other 3 modes keep their exact original key
-                    # so nothing about their existing dedup/persistence
-                    # behavior changes.
-                    base_combo = f"{k}_{tf}" if bot_state['prot_allow_multi_tf'] else k
-                    combo_key = f"{base_combo}_{channel}" if exec_mode == 'all_concurrent' else base_combo
-                    if sym_state['gann_level_status'].get(combo_key) == 'used':
-                        continue
-                    is_buy = (dir_ == 'dn')
-                    if entry_mode == 'touch_trend':
-                        if is_buy and not trend_up: continue
-                        if not is_buy and trend_up: continue
-
-                    # ── Execution mode gate ──
-                    # close: fire purely off the OANDA closed-candle close, exactly
-                    # like run_gann_backtest's bar_close check -- do NOT also require
-                    # the current MetaApi tick to be within margin (that's a second,
-                    # cross-feed condition the classic backtest never applies, and it
-                    # was silently killing/mismatching trades vs the backtest).
-                    if channel == 'close':
-                        if abs(closed_close - lv['price']) > margin:
+                for channel in channels:
+                    for lv in levels:
+                        k = lv['key']; dir_ = lv['dir']
+                        base_combo = f"{k}_{tf}" if bot_state['prot_allow_multi_tf'] else k
+                        combo_key = f"{base_combo}_{channel}" if exec_mode == 'all_concurrent' else base_combo
+                        if sym_state['gann_level_status'].get(combo_key) == 'used':
                             continue
-                    elif channel == 'hybrid':
-                        if abs(live_px - lv['price']) > margin:
-                            continue
-                        if abs(live_px - closed_close) > spike_limit:
-                            continue
-                    else:  # touch (instant)
-                        if abs(live_px - lv['price']) > margin:
-                            continue
+                        is_buy = (dir_ == 'dn')
+                        if entry_mode == 'touch_trend':
+                            if is_buy and not trend_up: continue
+                            if not is_buy and trend_up: continue
 
-                    # ── Reserve the level NOW, synchronously ──
-                    # asyncio only switches tasks at an `await`, so writing this
-                    # before any await here is atomic with respect to every other
-                    # concurrent tick's task -- a second tick arriving a
-                    # microsecond later will see 'used' immediately, even though
-                    # _gann_open_trade's own internal marking (further below,
-                    # after several awaits of its own) hasn't happened yet. Without
-                    # this, going event-driven (many concurrent per-tick tasks
-                    # instead of one serial scanner loop) would let two
-                    # near-simultaneous ticks both fire on the same level.
-                    sym_state['gann_level_status'][combo_key] = 'used'
+                        q = live_quotes.get(symbol, {})
+                        check_px = q.get('bid' if is_buy else 'ask') or live_px
 
-                    if flt_type == 'vwap': flt_label = f"VWAP={sym_state['trend_vwap_period']}\n"
-                    elif flt_type == 'ema': flt_label = f"EMA={sym_state['trend_ema_period']}\n"
-                    else: flt_label = "VWAP+EMA"
-                    trigger_lbl = {'touch': 'لمس مباشر ⚡', 'close': 'إغلاق شمعة ⏳', 'hybrid': 'تنفيذ هجين 🛡️'}[channel]
-                    dir_word = 'BUY' if is_buy else 'SELL'
-                    dir_emoji = '📈' if is_buy else '📉'
-                    reason = f"{dir_word} {dir_emoji} [{symbol} - جان {tf}] {trigger_lbl} (مع {flt_label}_{ttf.upper()})"
+                        if channel == 'close':
+                            if abs(closed_close - lv['price']) > margin:
+                                continue
+                        elif channel == 'hybrid':
+                            if abs(check_px - lv['price']) > margin:
+                                continue
+                            if abs(check_px - closed_close) > spike_limit:
+                                continue
+                        else:
+                            if abs(check_px - lv['price']) > margin:
+                                continue
 
-                    t1_signal_ts = time.monotonic()
-                    await _gann_open_trade(symbol, is_buy, lv, candles, reason=reason, tf=tf,
-                                            initial_px=live_px, detect_time=detect_time, t1_signal_ts=t1_signal_ts,
-                                            feed_source='ws', feed_age_ms=feed_age_ms, trigger_type=channel)
-                    break  # this channel found its level for this tick -- other channels still get their own independent check
-    except Exception as e:
-        log_exception(f"_gann_tick_fire_check [{symbol}]", e)
+                        sym_state['gann_level_status'][combo_key] = 'used'
+
+                        if flt_type == 'vwap': flt_label = f"VWAP={sym_state['trend_vwap_period']}\n"
+                        elif flt_type == 'ema': flt_label = f"EMA={sym_state['trend_ema_period']}\n"
+                        else: flt_label = "VWAP+EMA"
+                        trigger_lbl = {'touch': 'لمس مباشر ⚡', 'close': 'إغلاق شمعة ⏳', 'hybrid': 'تنفيذ هجين 🛡️'}[channel]
+                        dir_word = 'BUY' if is_buy else 'SELL'
+                        dir_emoji = '📈' if is_buy else '📉'
+                        reason = f"{dir_word} {dir_emoji} [{symbol} - جان {tf}] {trigger_lbl} (مع {flt_label}_{ttf.upper()})"
+
+                        t1_signal_ts = time.monotonic()
+                        await _gann_open_trade(symbol, is_buy, lv, candles, reason=reason, tf=tf,
+                                                initial_px=live_px, detect_time=detect_time, t1_signal_ts=t1_signal_ts,
+                                                feed_source='ws', feed_age_ms=feed_age_ms, trigger_type=channel,
+                                                combo_key=combo_key)
+                        break
+        except Exception as e:
+            log_exception(f"_gann_tick_fire_check [{symbol}]", e)
 
 
 def _is_market_hours_now() -> bool:
@@ -362,6 +353,9 @@ async def _force_full_reconnect(reason: str) -> None:
     global _metaapi_conn, _last_any_tick_ts
     c_log(f"WS WATCHDOG: forcing full reconnect -- {reason}")
     await set_connection_state(CONN_READ_ONLY, f"WS watchdog: {reason}")
+    if _metaapi_account is None:
+        c_log("WS WATCHDOG: _metaapi_account is None — cannot reconnect")
+        return
     try:
         if _metaapi_conn is not None:
             try:
@@ -442,8 +436,10 @@ CONN_READ_ONLY = 'READ_ONLY'
 CONN_HALTED    = 'HALTED'
 
 _state_lock = asyncio.Lock()
+_last_state_notify_ts = 0.0
 
 async def set_connection_state(new_state: str, reason: str) -> None:
+    global _last_state_notify_ts
     async with _state_lock:
         old_state = bot_state.get('connection_state', CONN_RUNNING)
         if old_state == new_state:
@@ -451,6 +447,10 @@ async def set_connection_state(new_state: str, reason: str) -> None:
         bot_state['connection_state'] = new_state
         bot_state['connection_state_reason'] = reason
     logger.warning("Connection state: %s -> %s (%s)", old_state, new_state, reason)
+    now = time.monotonic()
+    if now - _last_state_notify_ts < 10.0:
+        return
+    _last_state_notify_ts = now
     icon = {'RUNNING': '\u2705', 'READ_ONLY': '\U0001F7E1', 'HALTED': '\U0001F6D1'}.get(new_state, '\u2139')
     await send_tg_msg(f"{icon} <b>connection state changed: {old_state} -> {new_state}</b>\n{reason}")
 
@@ -472,12 +472,14 @@ def _is_within_dam_restricted_window() -> bool:
     t = dam_now.time()
     return any(start <= t < end for start, end in _DAM_RESTRICTED_WINDOWS)
 
-def is_trading_allowed() -> bool:
+async def is_trading_allowed() -> bool:
     """New order placement is only allowed when the connection state is
     fully healthy AND we're not inside a restricted DAM time window.
     Existing-position management (BE/TP/SL) is handled separately and is
     NOT gated by this, per the OANDA-degraded-mode rule."""
-    if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING:
+    async with _state_lock:
+        conn_state = bot_state.get('connection_state', CONN_RUNNING)
+    if conn_state != CONN_RUNNING:
         return False
     if _is_within_dam_restricted_window():
         return False
@@ -538,7 +540,7 @@ async def init_metaapi():
           broker/API is completely unreachable).
        2) Only THEN attempt to talk to MetaAPI / the market.
     """
-    load_bot_persistence()
+    await load_bot_persistence()
     if bot_state.get('_persistence_load_failed'):
         await set_connection_state(
             CONN_READ_ONLY,
@@ -577,8 +579,8 @@ _persistence_write_lock = asyncio.Lock()
 
 def _write_persistence_file_sync(data: dict) -> None:
     """Pure blocking I/O, no bot_state access -- safe to run in a thread."""
-    with open(TEMP_PERSISTENCE_FILE, 'w') as f:
-        json.dump(data, f)
+    with open(TEMP_PERSISTENCE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(TEMP_PERSISTENCE_FILE, PERSISTENCE_FILE)
@@ -604,19 +606,11 @@ async def save_bot_persistence() -> None:
         # is a real setting and gets saved.
         TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
                               'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state',
-                              # 'status' is a dead legacy field predating the connection_state
-                              # machine -- nothing in the current code ever writes to it, but a
-                              # stale value loaded from an old persistence file used to silently
-                              # kill the entire scanner/cycle-manager/reconciliation loop with
-                              # zero error message. Never restore it; always fixed at 'RUNNING'.
-                              'status',
-                              # Diagnostic-only rolling buffer -- large, purely informational,
-                              # and reset-on-restart is fine. Never persist or reload it.
                               'diag_log'}
 
         symbol_snapshot = {}
-        for sym in bot_state['active_symbols']:
-            ss = bot_state['symbol_state'][sym]
+        for sym in sorted(bot_state['active_symbols'].keys()):
+            ss = bot_state['symbol_state'].get(sym) or {}
             snap = {k: v for k, v in ss.items() if k not in ('gann_last_h1_time', 'gann_cycle_started_at')}
             snap['gann_last_h1_time'] = ss.get('gann_last_h1_time').isoformat() if ss.get('gann_last_h1_time') else None
             snap['gann_cycle_started_at'] = ss.get('gann_cycle_started_at').isoformat() if ss.get('gann_cycle_started_at') else None
@@ -629,7 +623,8 @@ async def save_bot_persistence() -> None:
         for k, v in bot_state.items():
             if k not in TOP_LEVEL_EXCLUDE:
                 data[k] = v
-        data['live_daily_date'] = str(bot_state.get('live_daily_date'))
+        raw = bot_state.get('live_daily_date')
+        data['live_daily_date'] = raw.isoformat() if hasattr(raw, 'isoformat') else str(raw or '')
     except Exception as e:
         log_exception("save_bot_persistence (snapshot phase)", e)
         return
@@ -644,33 +639,30 @@ async def save_bot_persistence() -> None:
         log_exception("save_bot_persistence (write phase)", e)
         c_log(f"CRITICAL: Persistence Save Error -- open trade state may not survive a restart: {e}")
 
-def load_bot_persistence():
+async def load_bot_persistence():
     if not os.path.exists(PERSISTENCE_FILE):
         c_log("No persistence file found -- starting fresh (expected on first boot).")
         return
     try:
-        with open(PERSISTENCE_FILE, 'r') as f:
-            data = json.load(f)
+        def _read():
+            with open(PERSISTENCE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        data = await asyncio.to_thread(_read)
 
         TOP_LEVEL_EXCLUDE = {'connection_obj', 'menu_button_map', 'timeframes',
-                              'is_backtesting', 'live_connected', 'last_poll_ok', 'symbol_state',
-                              # 'status' is a dead legacy field predating the connection_state
-                              # machine -- nothing in the current code ever writes to it, but a
-                              # stale value loaded from an old persistence file used to silently
-                              # kill the entire scanner/cycle-manager/reconciliation loop with
-                              # zero error message. Never restore it; always fixed at 'RUNNING'.
-                              'status',
+                              'is_backtesting', 'is_live_twin_running',
+                              'live_connected', 'last_poll_ok', 'symbol_state',
                               'diag_log'}
         for k, v in data.items():
-            # Only restore keys that already exist in bot_state's default
-            # shape -- never let a saved file inject brand-new top-level
-            # keys the current code doesn't define.
             if k in bot_state and k not in TOP_LEVEL_EXCLUDE and k != 'live_daily_date':
                 bot_state[k] = v
 
         saved_date = data.get('live_daily_date')
-        if saved_date and saved_date != 'None':
-            bot_state['live_daily_date'] = datetime.strptime(saved_date, '%Y-%m-%d').date()
+        if saved_date and saved_date != 'None' and saved_date:
+            try:
+                bot_state['live_daily_date'] = datetime.fromisoformat(saved_date).date()
+            except Exception:
+                bot_state['live_daily_date'] = None
 
         symbol_state_data = data.get('symbol_state')
         if symbol_state_data is not None:
@@ -704,7 +696,6 @@ def load_bot_persistence():
         bot_state['_persistence_load_failed'] = True
 
 bot_state: dict = {
-    'status':           'RUNNING',
     'connection_state': 'RUNNING',
     'connection_state_reason': '',
     'symbol':           'XAUUSD',
@@ -885,6 +876,7 @@ class _ExecTracker:
         slippage = None
         if fill_price is not None and level_price is not None:
             slippage = round(abs(fill_price - level_price), 5)
+        err_str = str(error)[:200] if error else None
         self.orders.append({
             'ts': time.monotonic(),
             'symbol': symbol,
@@ -895,7 +887,7 @@ class _ExecTracker:
             'latency_ms': latency_ms,
             'method': method_used,
             'success': success,
-            'error': str(error) if error else None,
+            'error': err_str,
         })
         if len(self.orders) > self.maxlen:
             self.orders.pop(0)
@@ -1086,19 +1078,11 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
     url = f'{OANDA_BASE_URL}/instruments/{symbol}/candles'
     current_end = end_time if end_time else datetime.now(timezone.utc)
 
-    sem = _get_oanda_sem()
-    async with sem:
-        while remaining > 0:
-            chunk = min(remaining, 5000)
-            params = {'granularity': gran_str, 'count': chunk, 'to': current_end.strftime('%Y-%m-%dT%H:%M:%S.000000000Z'), 'price': 'M'}
-            candles = []
-            # Was 3 attempts / max ~7s total backoff (1+2+4s) -- too short for
-            # OANDA rate-limit windows to clear, especially during a long
-            # multi-week backtest that fires many paginated chunks back to
-            # back across several symbols/timeframes. A month-long request
-            # would silently stop after the first rate-limited chunk and
-            # just keep whatever partial data it already had -- "30 days
-            # requested, a few days returned" with no visible error anywhere.
+    while remaining > 0:
+        chunk = min(remaining, 5000)
+        params = {'granularity': gran_str, 'count': chunk, 'to': current_end.strftime('%Y-%m-%dT%H:%M:%S.000000000Z'), 'price': 'M'}
+        candles = []
+        async with _get_oanda_sem():
             for attempt in range(6):
                 try:
                     async with get_http().get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
@@ -1114,25 +1098,25 @@ async def fetch_candles(symbol: str, granularity_str: str, count: int = 5000, en
                     log_exception(f"fetch_candles [{symbol} {granularity_str}] attempt {attempt+1}/6", e)
                     await asyncio.sleep(min(2 ** attempt, 30))
 
-            if not candles: break
-            complete = [c for c in candles if c.get('complete', True)]
-            if not complete: break
+        if not candles: break
+        complete = [c for c in candles if c.get('complete', True)]
+        if not complete: break
 
-            formatted = []
-            for c in complete:
-                vc = _validated_candle(c, symbol, granularity_str)
-                if vc is not None:
-                    formatted.append(vc)
+        formatted = []
+        for c in complete:
+            vc = _validated_candle(c, symbol, granularity_str)
+            if vc is not None:
+                formatted.append(vc)
 
-            if not formatted:
-                c_log(f"fetch_candles [{symbol} {granularity_str}]: entire chunk failed validation, aborting fetch.")
-                break
+        if not formatted:
+            c_log(f"fetch_candles [{symbol} {granularity_str}]: entire chunk failed validation, aborting fetch.")
+            break
 
-            collected = formatted + collected; remaining -= len(complete)
-            earliest = pd.Timestamp(complete[0]['time']).tz_convert('UTC')
-            current_end = earliest.to_pydatetime() - timedelta(seconds=1)
-            if len(complete) < chunk: break
-            await asyncio.sleep(0.2)
+        collected = formatted + collected; remaining -= len(complete)
+        earliest = pd.Timestamp(complete[0]['time']).tz_convert('UTC')
+        current_end = earliest.to_pydatetime() - timedelta(seconds=1)
+        if len(complete) < chunk: break
+        await asyncio.sleep(0.2)
     return collected
 
 async def fetch_master_price(symbol: str) -> float | None:
@@ -1567,14 +1551,15 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
 
 async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list, reason: str, tf: str,
                             initial_px: float = None, detect_time: datetime = None, t1_signal_ts: float = None,
-                            feed_source: str = None, feed_age_ms: float = None, trigger_type: str = None) -> None:
+                            feed_source: str = None, feed_age_ms: float = None, trigger_type: str = None,
+                            combo_key: str = None) -> None:
     global _consecutive_real_order_failures
     sym_state = bot_state['symbol_state'][symbol]
 
     # Order-management critical path: never place an order while the
     # connection state machine says we shouldn't be trading, or while
     # we're inside a restricted DAM time window.
-    if not is_trading_allowed():
+    if not await is_trading_allowed():
         if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING:
             c_log(f"Skipped entry [{symbol} {tf}]: connection_state={bot_state.get('connection_state')} "
                   f"({bot_state.get('connection_state_reason')})")
@@ -1584,26 +1569,19 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         return
 
     try:
+        _lk = combo_key or level['key']
+        is_real = sym_state.get('auto_trade', False)
+
         # ── Re-verify price at execution time (Point 3) ──
-        # Trades within the same scan cycle open sequentially, one timeframe
-        # at a time. During a fast/volatile move, the price can drift far
-        # from the level between the first and last order in the same
-        # batch (this is exactly how one support touch ended up opening
-        # entries $1-9 apart from each other). Re-fetch a fresh price right
-        # before this specific order goes out, and re-check it's still
-        # actually near the level -- not the stale master_px from when the
-        # cycle started.
-        #
-        # This used to be a second OANDA REST call here, which was itself
-        # extra latency added right before execution. Reading live_quotes
-        # is an in-memory cache read (no HTTP round-trip at all) as long as
-        # the WebSocket feed is fresh; REST is now only a fallback for when
-        # it isn't -- so this re-check got both more accurate AND faster,
-        # not just faster.
-        fresh_px, fresh_feed_source, fresh_feed_age_ms = await _lq_price_with_fallback(symbol)
+        # For real trades, fetch a fresh price right before execution to
+        # confirm the level is still valid. Simulated trades skip this
+        # since they don't interact with the broker.
+        fresh_px, fresh_feed_source, fresh_feed_age_ms = initial_px, 'ws', feed_age_ms
+        if is_real:
+            fresh_px, fresh_feed_source, fresh_feed_age_ms = await _lq_price_with_fallback(symbol)
         margin = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
         if fresh_px is None or abs(fresh_px - level['price']) > margin:
-            bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+            bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             # Detail requested: exactly how much the price moved, over how
             # long, and what the pre-existing code threshold is (the touch
             # margin, gann_touch_margin_pts -- unchanged, no new number
@@ -1640,7 +1618,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         # nonsensical/rejected stops, e.g. "Invalid stops"). Better to skip
         # cleanly here than let the broker reject it after the fact.
         if is_buy and (price >= tp or price <= sl):
-            bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+            bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             await send_tg_msg(
                 f"<b>⏭️ [{symbol} - جان {tf}]</b>  {reason}\n"
                 f"المستوى: {level['price']:.2f}\n"
@@ -1649,7 +1627,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
             )
             return
         if not is_buy and (price <= tp or price >= sl):
-            bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+            bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             await send_tg_msg(
                 f"<b>⏭️ [{symbol} - جان {tf}]</b>  {reason}\n"
                 f"المستوى: {level['price']:.2f}\n"
@@ -1751,7 +1729,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         # paper-trading (auto_trade was never enabled to begin with) is a
         # completely different, intentional case and is still tracked.
         if execution_failed:
-            bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+            bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             await send_tg_msg(
                 f"<b>⏭️ [{symbol} - جان {tf}]</b>  {reason}\n"
                 f"المستوى: {level['price']:.2f}\n"
@@ -1771,14 +1749,13 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
 
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': entry_final, 'is_real': is_real, 'sl': sl, 'tp': tp,
-            'be_trigger': (entry_final + (tp - entry_final)/2) if is_buy else (entry_final - (entry_final - tp)/2),
             'opened_at': datetime.now(timezone.utc).isoformat(), 'level_price': level['price'],
             'feed_source': feed_source, 'feed_age_ms': feed_age_ms, 'trigger_type': trigger_type,
             'exec_latency_ms': exec_latency, 'exec_method': exec_method,
             'exec_ioc_fail_reason': exec_ioc_fail, 'exec_slippage': exec_slippage,
         }
-        bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
-        await save_bot_persistence()
+        bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
+        await _debounced_persist_save()
 
         entry_note = {
             'confirmed_position': ' (مؤكد من الوسيط)',
@@ -1786,22 +1763,25 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
             'simulated': '',
         }.get(fill_price_source, ' (تقديري قبل التنفيذ — تعذّر تأكيد سعر الوسيط)')
         slippage_line = ""
-        if is_real:
+        if is_real and entry_final is not None:
             actual_slippage = abs(entry_final - level['price'])
             pv = SYMBOL_INFO[symbol]['pip_value']
             slippage_line = f"الانزلاق الفعلي عن المستوى: {actual_slippage:.2f} ({actual_slippage / pv:.1f} نقطة)\n"
+
+        close_used = bot_state['symbol_state'][symbol].get('gann_close_used')
+        close_label = f'{close_used:.5f}' if close_used is not None else '-'
 
         await send_tg_msg(
             f"<b>✅ {reason}</b>\n\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {entry_final:.2f}{entry_note}\n\n"
             f"TP: {tp}  SL: {sl}  |  {tpsl_lbl}{be_lbl}\n"
             f"{slippage_line}"
-            f"إغلاق {_anchor_label()}: {bot_state['symbol_state'][symbol]['gann_close_used']:.5f}\n"
+            f"إغلاق {_anchor_label()}: {close_label}\n"
             f"{real_msg}"
         )
     except Exception as e:
         log_exception(f"_gann_open_trade [{symbol} {tf}]", e)
-        bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
+        bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
         await send_tg_msg(f"<b>❌ فشل تنفيذ الصفقة [{symbol} - جان {tf}]</b>\nالمستوى: {level['price']:.5f}\n{e}")
 
 # ─────────────────────────────────────────────────────────────
@@ -2177,16 +2157,19 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
         return
 
     pending = {}  # tid -> (symbol, sym_state, tr)
+    close_errors = []
     for symbol, tid, sym_state, tr in closures:
         try:
             await _metaapi_conn.close_position(tid)
             pending[str(tid)] = (symbol, sym_state, tr)
         except Exception as e:
             log_exception(f"_close_metaapi_trades_batch close_position [{symbol}/{tid}]", e)
-            await send_tg_msg(
-                f"⚠️ <b>فشل إرسال أمر إغلاق:</b> صفقة {symbol} ({tid}, خطأ: {e})\n"
-                f"يرجى التحقق يدوياً من الحساب.\n\n{_trade_detail_line(tr)}"
-            )
+            close_errors.append(f"{symbol} ({tid}): {e}")
+    if close_errors:
+        await send_tg_msg(
+            f"⚠️ <b>فشل إرسال {len(close_errors)}/{len(closures)} أمر إغلاق</b>\n"
+            + "\n".join(close_errors)[:3500]
+        )
 
     if not pending:
         return
@@ -2212,7 +2195,7 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
                 )
                 pl = tr.get('last_known_pl', 0.0)
                 px = tr.get('last_known_px', tr.get('entry'))
-                _record_closed_trade_history(
+                await _record_closed_trade_history(
                     symbol, tid, tr, exit_px=px, pnl=pl,
                     outcome_label=('WIN' if pl > 0 else 'LOSS' if pl < 0 else 'BREAK_EVEN'),
                     close_reason='daily_capital_protection_forced_close', pnl_confirmed=False,
@@ -2238,11 +2221,6 @@ async def gann_run_diagnostics() -> str:
     lines = ["<b>🩺 تشخيص أسباب عدم فتح الصفقات</b>\n"]
 
     # --- Global gates (apply to every symbol) ---
-    legacy_status = bot_state.get('status', 'RUNNING')
-    if legacy_status != 'RUNNING':
-        lines.append(f"0️⃣ ⚠️ <b>bot_state['status'] = '{legacy_status}'</b> (متوقع 'RUNNING' دائماً -- "
-                      f"هذا يعني أن السكانر بالكامل متوقف بصمت. أعد تشغيل البوت فوراً.)")
-
     conn_state = bot_state.get('connection_state', CONN_RUNNING)
     conn_ok = conn_state == CONN_RUNNING
     lines.append(f"1️⃣ حالة الاتصال: {'✅ RUNNING' if conn_ok else f'🛑 {conn_state}'}")
@@ -2256,7 +2234,7 @@ async def gann_run_diagnostics() -> str:
     if filter_on and dam_blocked:
         lines.append("   🛑 داخل نافذة محظورة الآن -- لن تُفتح أي صفقة جديدة حتى تنتهي.")
 
-    overall_allowed = is_trading_allowed()
+    overall_allowed = await is_trading_allowed()
     lines.append(f"3️⃣ الخلاصة العامة is_trading_allowed(): {'✅ مسموح' if overall_allowed else '🛑 ممنوع'}\n")
 
     if not overall_allowed:
@@ -2936,7 +2914,7 @@ async def gann_monitor_scanner() -> None:
                                            f"سيتم تصحيح الرقم تلقائياً عند تأكيد الصفقة من السجل.")
 
                                 await send_tg_msg(msg)
-                                _record_closed_trade_history(
+                                await _record_closed_trade_history(
                                     symbol, tid, tr, exit_px=active_px, pnl=exact_pnl,
                                     outcome_label=('WIN' if exact_pnl > 0 else 'LOSS' if exact_pnl < 0 else 'BREAK_EVEN'),
                                     close_reason='tp_sl_or_manual_broker_close', pnl_confirmed=found_deal,
@@ -2973,13 +2951,13 @@ async def gann_monitor_scanner() -> None:
                             bot_state['live_daily_realized'] += trade_pl
                             msg = f"🔔 <b>تحديث صفقة [{symbol} - جان {tf}]</b>\n\nالنتيجة: {outcome} ({trade_pl}$)\nسعر الإغلاق: {live_px:.2f}"
                             await send_tg_msg(msg)
-                            _record_closed_trade_history(
+                            await _record_closed_trade_history(
                                 symbol, tid, tr, exit_px=live_px, pnl=trade_pl, outcome_label=outcome,
                                 close_reason='tp_sl_hit', pnl_confirmed=False,
                             )
                         else:
                             total_floating += trade_pl
-                            
+
                     for tid in closed_ids:
                         if tid in sym_state['gann_open_trades']:
                             del sym_state['gann_open_trades'][tid]
@@ -3016,7 +2994,7 @@ async def gann_monitor_scanner() -> None:
                                 f"TP: {tr.get('tp')}  SL: {tr.get('sl')}\n"
                                 f"النتيجة: {outcome_lbl} ({pl}$)"
                             )
-                            _record_closed_trade_history(
+                            await _record_closed_trade_history(
                                 symbol, tid, tr, exit_px=px, pnl=pl,
                                 outcome_label=('WIN' if pl > 0 else 'LOSS' if pl < 0 else 'BREAK_EVEN'),
                                 close_reason='daily_capital_protection_forced_close', pnl_confirmed=False,
@@ -3038,8 +3016,10 @@ async def gann_monitor_scanner() -> None:
 
                     macro_trend_up = None
                     if sym_state['gann_entry_mode'] == 'touch_trend':
-                        p_vwap = sym_state['trend_vwap_period'] if flt_type == 'vwap' else 0
-                        p_ema  = sym_state['trend_ema_period'] if flt_type == 'ema' else 0
+                        flt_is_vwap = flt_type in ('vwap', 'both')
+                        flt_is_ema  = flt_type in ('ema', 'both')
+                        p_vwap = sym_state['trend_vwap_period'] if flt_is_vwap else 0
+                        p_ema  = sym_state['trend_ema_period'] if flt_is_ema else 0
                         max_period = max(p_vwap, p_ema, 100)
                     
                         trend_candles = await fetch_candles(symbol, ttf, count=max(max_period+10, 120))
@@ -3047,20 +3027,24 @@ async def gann_monitor_scanner() -> None:
                             df_trend = pd.DataFrame(trend_candles)
                             current_trend_close = float(trend_candles[-1]['close'])
                         
-                            if flt_type == 'vwap':
+                            if flt_is_vwap:
                                 df_trend['Typical_Price'] = (df_trend['high'] + df_trend['low'] + df_trend['close']) / 3
                                 df_trend['VWAP'] = (df_trend['Typical_Price'] * df_trend['volume']).rolling(window=p_vwap).sum() / df_trend['volume'].rolling(window=p_vwap).sum()
                                 current_vwap = df_trend.iloc[-1]['VWAP']
                                 if pd.isna(current_vwap): current_vwap = current_trend_close
+                                vwap_up = current_trend_close > current_vwap
                             
-                            if flt_type == 'ema':
+                            if flt_is_ema:
                                 df_trend['EMA'] = df_trend['close'].ewm(span=p_ema, adjust=False).mean()
                                 current_ema = df_trend.iloc[-1]['EMA']
+                                ema_up = current_trend_close > current_ema
 
                             if flt_type == 'vwap':
-                                macro_trend_up = (current_trend_close > current_vwap)
+                                macro_trend_up = vwap_up
                             elif flt_type == 'ema':
-                                macro_trend_up = (current_trend_close > current_ema)
+                                macro_trend_up = ema_up
+                            elif flt_type == 'both':
+                                macro_trend_up = vwap_up if vwap_up == ema_up else None
 
                     levels      = gann_active_levels(symbol)
                     margin      = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
@@ -3280,7 +3264,7 @@ async def global_ledger_reconciliation() -> None:
                 log_exception('global_ledger_reconciliation get_positions', e)
                 continue
 
-            broker_ids = {str(p.get('id')) for p in broker_positions}
+            broker_ids = {str(p['id']) for p in broker_positions if p.get('id')}
 
             known_ids = set()
             for sym, ss in bot_state['symbol_state'].items():
@@ -3496,7 +3480,11 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
             prec = SYMBOL_INFO[symbol]['prec'];
             
             quote = symbol.split('_')[1] if '_' in symbol else 'USD'
-            quote_conv = {'USD': 1.0, 'JPY': 1/150.0, 'AUD': 0.66, 'NZD': 0.61, 'EUR': 1.08, 'GBP': 1.27, 'CAD': 0.73, 'CHF': 1.11}.get(quote, 1.0)
+            _QUOTE_RATES = {'USD': 1.0, 'JPY': 1/150.0, 'AUD': 0.66, 'NZD': 0.61, 'EUR': 1.08, 'GBP': 1.27, 'CAD': 0.73, 'CHF': 1.11}
+            quote_conv = _QUOTE_RATES.get(quote)
+            if quote_conv is None:
+                c_log(f"WARNING: unknown quote currency '{quote}' in {symbol} — quote_conv defaulted to 1.0, PnL may be incorrect")
+                quote_conv = 1.0
 
             await prog.set_phase(f'جلب بيانات الترند ({desc_ttf})...')
             max_period = max(sym_state['trend_vwap_period'], sym_state['trend_ema_period'], 100)
@@ -3762,10 +3750,12 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                             tr['sl_current'] = net_be
                             tr['be_activated'] = True
 
-                    # Outcome check uses h/l for extreme boundary testing
+                    # Outcome check uses h/l for extreme boundary testing.
+                    # BE threshold derived from pip_value instead of hardcoded 0.01.
+                    _be_thresh = pv * 2
                     if is_buy:
                         if l <= sl_current:
-                            tr['outcome'] = 'BREAK_EVEN' if sl_current > entry - 0.01 else 'LOSS'
+                            tr['outcome'] = 'BREAK_EVEN' if sl_current > entry - _be_thresh else 'LOSS'
                             tr['p_usd'] = round(abs(sl_current - entry) * lot * cs * quote_conv, 2) if tr['outcome'] == 'BREAK_EVEN' else -round(sl_d * lot * cs * quote_conv, 2)
                             closed = True
                         elif not closed and h >= tp_px:
@@ -3774,7 +3764,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                             closed = True
                     else:
                         if h >= sl_current:
-                            tr['outcome'] = 'BREAK_EVEN' if sl_current < entry + 0.01 else 'LOSS'
+                            tr['outcome'] = 'BREAK_EVEN' if sl_current < entry + _be_thresh else 'LOSS'
                             tr['p_usd'] = round(abs(entry - sl_current) * lot * cs * quote_conv, 2) if tr['outcome'] == 'BREAK_EVEN' else -round(sl_d * lot * cs * quote_conv, 2)
                             closed = True
                         elif not closed and l <= tp_px:
@@ -3813,7 +3803,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                     # that caused real losses live), which is NOT what the
                     # live bot actually does anymore, and inflates backtest
                     # trade counts relative to what live can ever produce.
-                    max_concurrent_bt = int(bot_state.get('prot_max_concurrent_trades', 4))
+                    max_concurrent_bt = max(1, int(bot_state.get('prot_max_concurrent_trades', 4)))
                     open_count_bt = sum(1 for tr in open_trades if tr['symbol'] == sig['symbol'])
                     if open_count_bt >= max_concurrent_bt:
                         continue
@@ -4083,7 +4073,7 @@ def _lt_bridge_path(o: float, h: float, l: float, c: float, steps: int, rng: ran
     inside a bar where raw OHLC can't tell us -- not claimed as the
     literal historical tick path, just a principled stand-in for one.
     """
-    incs = np.array([rng.gauss(0, 1) for _ in range(steps)])
+    incs = rng.normal(0, 1, steps)
     w = np.concatenate(([0.0], np.cumsum(incs)))
     t = np.linspace(0.0, 1.0, steps + 1)
     bridge = w - t * w[-1]
@@ -4116,16 +4106,19 @@ def _lt_slippage(bar_range: float, atr_val: float | None, rng: random.Random) ->
 
 def _lt_latency_shift(path: np.ndarray, steps: int, rng: random.Random) -> float:
     """Signal-to-fill delay expressed as a fractional shift along the intrabar path.
-    Bounds default to a rough guess (200-800ms) but should be set from the bot's
-    OWN measured MetaApi ping (see the 'Code Delay'/'MetaApi Ping' fields logged on
-    every real fill) via bot_state['lt_latency_ms_min']/['lt_latency_ms_max'] so the
-    simulation reflects this account's actual broker/network latency, not a guess."""
+    Bounds default to a rough guess (160-200ms) but should be set from the bot's
+    OWN measured MetaApi ping. Uses linear interpolation so the result is accurate
+    regardless of step count -- previously `int(frac * steps)` = 0 for 20 steps."""
     lo = bot_state.get('lt_latency_ms_min', 160)
     hi = bot_state.get('lt_latency_ms_max', 200)
     latency_ms = rng.randint(lo, hi)
     frac = min(latency_ms / 60000.0, 1.0)  # fraction of a 1-minute bar consumed by the delay
-    idx = min(int(frac * steps), steps)
-    return float(path[idx])
+    idx_f = frac * steps
+    idx = int(idx_f)
+    if idx >= steps:
+        return float(path[-1])
+    t = idx_f - idx
+    return float(path[idx] * (1.0 - t) + path[idx + 1] * t)
 
 
 async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None:
@@ -4200,7 +4193,11 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
             cs = SYMBOL_INFO[symbol]['contract_size']
 
             quote = symbol.split('_')[1] if '_' in symbol else 'USD'
-            quote_conv = {'USD': 1.0, 'JPY': 1/150.0, 'AUD': 0.66, 'NZD': 0.61, 'EUR': 1.08, 'GBP': 1.27, 'CAD': 0.73, 'CHF': 1.11}.get(quote, 1.0)
+            _QUOTE_RATES = {'USD': 1.0, 'JPY': 1/150.0, 'AUD': 0.66, 'NZD': 0.61, 'EUR': 1.08, 'GBP': 1.27, 'CAD': 0.73, 'CHF': 1.11}
+            quote_conv = _QUOTE_RATES.get(quote)
+            if quote_conv is None:
+                c_log(f"WARNING: unknown quote currency '{quote}' in {symbol} — quote_conv defaulted to 1.0, PnL may be incorrect")
+                quote_conv = 1.0
 
             await prog.set_phase(f'جلب بيانات الترند ({ttf.upper()})...')
             max_period = max(sym_state['trend_vwap_period'], sym_state['trend_ema_period'], 100)
@@ -4380,7 +4377,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
         total_signals = len(all_signals)
         dd_limit = -float(bot_state['prot_daily_dd_usd'])
         profit_limit = float(bot_state['prot_daily_profit_usd'])
-        max_concurrent = int(bot_state.get('prot_max_concurrent_trades', 4))
+        max_concurrent = max(1, int(bot_state.get('prot_max_concurrent_trades', 4)))
 
         total_events = len(all_1m_events)
         await prog.set_tf('محاكاة 1m واقعية', total_events)
@@ -4473,7 +4470,8 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                         if outcome == 'sl':
                             raw_px = sl_current
                             fill_px = raw_px - (exit_spread/2.0 + slip) if is_buy else raw_px + (exit_spread/2.0 + slip)
-                            tr['outcome'] = 'BREAK_EVEN' if sl_current > entry - 0.01 and is_buy or (not is_buy and sl_current < entry + 0.01) else 'LOSS'
+                            _be_thresh = SYMBOL_INFO[tr['symbol']]['pip_value'] * 2
+                            tr['outcome'] = 'BREAK_EVEN' if (is_buy and sl_current > entry - _be_thresh) or (not is_buy and sl_current < entry + _be_thresh) else 'LOSS'
                         else:
                             raw_px = tp_px
                             fill_px = raw_px - (exit_spread/2.0 + slip) if is_buy else raw_px + (exit_spread/2.0 + slip)
@@ -4733,31 +4731,49 @@ async def check_metaapi_status_command(chat_id: int):
         import html
         await send_tg_msg(f"❌ خطأ في الاتصال بـ MetaAPI:\n{html.escape(str(e))}")
 
+_last_persist_save_ts = 0.0
+
+async def _debounced_persist_save():
+    global _last_persist_save_ts
+    now = time.monotonic()
+    if now - _last_persist_save_ts < 2.0:
+        return
+    _last_persist_save_ts = now
+    await save_bot_persistence()
+
 async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     if d == 'check_metaapi_status':
-        asyncio.create_task(check_metaapi_status_command(chat_id))
+        _safe_task(check_metaapi_status_command(chat_id), 'check_metaapi_status')
         return
     if d == 'run_diag':
         async def _run_diag_task():
             try:
                 report = await gann_run_diagnostics()
-                # Telegram hard-caps messages at 4096 chars; a multi-symbol,
-                # multi-timeframe report can exceed that easily. Split on
-                # line boundaries rather than sending an oversized message
-                # that would just fail outright.
-                lines = report.split('\n')
+                # Telegram hard-caps messages at 4096 chars. Split on
+                # double-newline (section) boundaries first; if a section
+                # still exceeds 3500, split on single lines. Never split
+                # inside an HTML tag (ensured by only splitting on \n).
+                sections = report.split('\n\n')
                 chunk = ""
-                for line in lines:
-                    if len(chunk) + len(line) + 1 > 3500:
-                        await send_tg_msg(chunk)
+                for sec in sections:
+                    if len(chunk) + len(sec) + 2 > 3500:
+                        if chunk.strip():
+                            await send_tg_msg(chunk)
                         chunk = ""
-                    chunk += line + "\n"
+                        if len(sec) > 3500:
+                            for line in sec.split('\n'):
+                                if len(chunk) + len(line) + 1 > 3500:
+                                    await send_tg_msg(chunk)
+                                    chunk = ""
+                                chunk += line + "\n"
+                            continue
+                    chunk += sec + "\n\n"
                 if chunk.strip():
                     await send_tg_msg(chunk)
             except Exception as e:
                 log_exception('gann_run_diagnostics', e)
                 await send_tg_msg(f"❌ فشل التشخيص: {e}")
-        asyncio.create_task(_run_diag_task())
+        _safe_task(_run_diag_task(), 'run_diag')
         return
     if d == 'export_diag_excel':
         async def _export_diag_task():
@@ -4775,7 +4791,7 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
             except Exception as e:
                 log_exception('export_live_trades_excel', e)
                 await send_tg_msg(f"❌ فشل تصدير سجل الصفقات الحية: {e}")
-        asyncio.create_task(_export_live_trades_task())
+        _safe_task(_export_live_trades_task(), 'export_live_trades_excel')
         return
     if d == 'export_exec_report':
         async def _export_exec_report_task():
@@ -4807,7 +4823,7 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
                         os.remove(fname)
                     except Exception as e:
                         log_exception('export_exec_report cleanup', e)
-        asyncio.create_task(_export_exec_report_task())
+        _safe_task(_export_exec_report_task(), 'export_exec_report')
         return
     if d == 'manual_resume_step1':
         current_state = bot_state.get('connection_state', CONN_RUNNING)
@@ -4841,8 +4857,7 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
 
     sym = bot_state['ui_selected_symbol']
     sym_state = bot_state['symbol_state'][sym]
-    if d == 'menu_main': await _show(chat_id, msg_id, 'القائمة الرئيسية:', get_main_keyboard())
-    elif d == 'menu_main':
+    if d == 'menu_main':
         await _show(chat_id, msg_id, '<b>مرحباً بك في Gold Scalper Bot v8.9</b>', get_main_keyboard())
 
     elif d == 'menu_presets':
@@ -4931,7 +4946,6 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         bot_state['prot_daily_profit_usd'] = min(10000, bot_state['prot_daily_profit_usd'] + 50)
         await _show(chat_id, msg_id, 'إعدادات الحماية:', get_protection_keyboard())
     elif d == 'menu_gann': await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
-    elif d == 'menu_protection': await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     elif d == 'tg_prot_sync': bot_state['prot_true_sync'] = not bot_state.get('prot_true_sync', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     elif d == 'tg_prot_inval': bot_state['prot_cycle_inval'] = not bot_state.get('prot_cycle_inval', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     elif d == 'tg_prot_cost': bot_state['prot_cost_be'] = not bot_state.get('prot_cost_be', True); await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
@@ -5188,7 +5202,9 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         days = int(d.split('_')[1])
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
-        if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest(start_dt, end_dt))
+        if not bot_state['is_backtesting']:
+            bot_state['is_backtesting'] = True
+            _safe_task(run_gann_backtest(start_dt, end_dt), 'backtest_preset')
         await _show(chat_id, msg_id, f'⏳ باكتيست يعمل...', get_gann_bt_keyboard())
     elif d == 'cancel_bt':
         global _bt_progress
@@ -5210,7 +5226,9 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         days = int(d.split('_')[1])
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
-        if not bot_state['is_live_twin_running']: asyncio.create_task(run_live_twin_simulation(start_dt, end_dt))
+        if not bot_state['is_live_twin_running']:
+            bot_state['is_live_twin_running'] = True
+            _safe_task(run_live_twin_simulation(start_dt, end_dt), 'livetwin_preset')
         await _show(chat_id, msg_id, '⏳ Live-Twin يعمل...', get_live_twin_keyboard())
     elif d == 'cancel_lt':
         global _lt_progress
@@ -5223,7 +5241,8 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     # status check (which mutates nothing) falls through to here. Save
     # once, after the mutation has landed in bot_state, so a restart never
     # reverts a toggle/setting change back to the last trade's snapshot.
-    await save_bot_persistence()
+    # Debounce: a rapid burst of setting toggles coalesces into one write.
+    await _debounced_persist_save()
 
 # ─────────────────────────────────────────────────────────────
 # TELEGRAM POLLING & WATCHDOG
@@ -5263,7 +5282,9 @@ async def process_tg_update(update: dict) -> None:
                     # intended day and pull in 3h of the next one instead.
                     dam_midnight = datetime.strptime(parts[1], "%Y-%m-%d")
                     dt = (dam_midnight - DAM_OFF).replace(tzinfo=timezone.utc)
-                    if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest(dt, dt + timedelta(days=1)))
+                    if not bot_state['is_backtesting']:
+                        bot_state['is_backtesting'] = True
+                        _safe_task(run_gann_backtest(dt, dt + timedelta(days=1)), 'backtest_cmd')
                     await send_tg_msg(f"⏳ جاري باكتيست ليوم {parts[1]} (بتوقيت دمشق)...")
                     return
                 elif len(parts) == 3:
@@ -5271,7 +5292,9 @@ async def process_tg_update(update: dict) -> None:
                     dam_midnight2 = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)
                     dt1 = (dam_midnight1 - DAM_OFF).replace(tzinfo=timezone.utc)
                     dt2 = (dam_midnight2 - DAM_OFF).replace(tzinfo=timezone.utc)
-                    if not bot_state['is_backtesting']: asyncio.create_task(run_gann_backtest(dt1, dt2))
+                    if not bot_state['is_backtesting']:
+                        bot_state['is_backtesting'] = True
+                        _safe_task(run_gann_backtest(dt1, dt2), 'backtest_range_cmd')
                     await send_tg_msg(f"⏳ جاري باكتيست من {parts[1]} إلى {parts[2]} (بتوقيت دمشق)...")
                     return
             except Exception:
@@ -5283,7 +5306,9 @@ async def process_tg_update(update: dict) -> None:
                 if len(parts) == 2:
                     dam_midnight = datetime.strptime(parts[1], "%Y-%m-%d")
                     dt = (dam_midnight - DAM_OFF).replace(tzinfo=timezone.utc)
-                    if not bot_state['is_live_twin_running']: asyncio.create_task(run_live_twin_simulation(dt, dt + timedelta(days=1)))
+                    if not bot_state['is_live_twin_running']:
+                        bot_state['is_live_twin_running'] = True
+                        _safe_task(run_live_twin_simulation(dt, dt + timedelta(days=1)), 'livetwin_cmd')
                     await send_tg_msg(f"⏳ جاري Live-Twin ليوم {parts[1]} (بتوقيت دمشق)...")
                     return
                 elif len(parts) == 3:
@@ -5291,7 +5316,9 @@ async def process_tg_update(update: dict) -> None:
                     dam_midnight2 = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)
                     dt1 = (dam_midnight1 - DAM_OFF).replace(tzinfo=timezone.utc)
                     dt2 = (dam_midnight2 - DAM_OFF).replace(tzinfo=timezone.utc)
-                    if not bot_state['is_live_twin_running']: asyncio.create_task(run_live_twin_simulation(dt1, dt2))
+                    if not bot_state['is_live_twin_running']:
+                        bot_state['is_live_twin_running'] = True
+                        _safe_task(run_live_twin_simulation(dt1, dt2), 'livetwin_range_cmd')
                     await send_tg_msg(f"⏳ جاري Live-Twin من {parts[1]} إلى {parts[2]} (بتوقيت دمشق)...")
                     return
             except Exception:
@@ -5309,12 +5336,13 @@ async def process_tg_update(update: dict) -> None:
             await save_bot_persistence()
             await send_tg_msg(f"✅ تم تغيير الرمز الخاص بـ MetaTrader إلى: <b>{new_sym}</b>")
         elif msg == '/start': await send_tg_msg('<b>مرحباً بك في Gold Scalper Bot v8.9</b>', get_main_keyboard())
+        else: await send_tg_msg("❌ أمر غير معروف. استخدم /start لعرض القائمة.")
         return
 
     if 'callback_query' not in update: return
     q = update['callback_query']; d = q['data']; chat_id = q['message']['chat']['id']; msg_id = q['message']['message_id']
     bot_state['chat_id'] = chat_id
-    asyncio.create_task(answer_callback(q['id']))
+    _safe_task(answer_callback(q['id']), 'answer_callback')
     try: await _handle_callback(d, chat_id, msg_id)
     except Exception as e: log_exception(f'callback dispatch [{d}]', e)
 
@@ -5327,7 +5355,7 @@ async def telegram_polling_loop() -> None:
     # a ClientSession + TCPConnector on every backoff cycle leaked sockets
     # into TIME_WAIT over long uptimes. We only ever tear this down once,
     # in the finally block below, on task cancellation/shutdown.
-    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300, force_close=True)
+    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=28)
     sess = aiohttp.ClientSession(connector=connector, timeout=timeout)
     try:
