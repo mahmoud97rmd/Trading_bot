@@ -1358,27 +1358,28 @@ def _resolve_broker_symbol(symbol: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # SMART ORDER EXECUTION: LIMIT-first, MARKET-fallback
 # ─────────────────────────────────────────────────────────────
+class _SkipLimitPhase(Exception):
+    """Raised inside Phase 1 to skip to Phase 2 cleanly (no error log)."""
+    pass
+
+
 async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
                                 level_price: float, sl: float, tp: float,
                                 t1_signal_ts: float,
                                 max_slippage_points: int) -> dict:
     """Zero-slippage execution for Gann level touch trading.
 
-    Phase 1 — LIMIT (IOC) at the exact Gann level price.
-      If price is AT the level when detected, the limit fills instantly at
-      that price. No slippage by definition — the broker fills you at the
-      limit price or better. IOC means any unfilled portion is immediately
-      cancelled (no stale pending orders left behind).
-
-      This is the CORRECT semantics for touch trading: you want to enter at
-      the level, not chase price away from it. The 38.9-pip slippage scenario
-      ($3.89 on XAUUSD) is structurally impossible with this approach because
-      the order never executes away from the level.
+    Phase 1 — LIMIT (GTD 3s) at the exact Gann level price.
+      Places a pending limit order that auto-cancels after 3 seconds if
+      unfilled.  MT5 requires the limit price to be on the valid side of
+      market (Buy Limit ≤ Ask, Sell Limit ≥ Bid), so the function checks
+      current bid/ask first and skips to Phase 2 if the level has already
+      been passed.
 
     Phase 2 — MARKET (FOK) with tight deviation guard.
-      Only reached if the limit IOC didn't fill (price moved past the level
-      during the ~20ms round-trip). The FOK deviation cap then limits max
-      slippage to `max_slippage_points` broker points — a hard safety net.
+      Only reached if Phase 1 was skipped or the GTD limit expired without
+      filling. The FOK deviation cap limits max slippage to
+      `max_slippage_points` broker points — a hard safety net.
 
     Returns dict with keys: success, trade_id, fill_price, fill_source,
                             latency_ms, method_used, error, ioc_fail_reason.
@@ -1392,24 +1393,54 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
     ioc_fail_reason = None
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 1 — LIMIT ORDER (IOC) AT EXACT GANN LEVEL PRICE
+    # PHASE 1 — LIMIT ORDER (GTD 3s) AT EXACT GANN LEVEL PRICE
     # ═══════════════════════════════════════════════════════════
+    # NOTE: MT5 rejects `fillingModes: ['ORDER_FILLING_IOC']` on pending
+    # (limit) orders — IOC/FOK are market-order-only in MT5.  Instead we
+    # use a plain GTD limit with a 3-second expiration so the order
+    # auto-cancels if price has already moved past the level.
+
+    limit_price = level_price
+    market_price = None
+    try:
+        q = live_quotes.get(symbol)
+        if q and 'ask' in q and 'bid' in q:
+            market_price = float(q['bid'] if is_buy else q['ask'])
+    except Exception:
+        pass
+
+    if is_buy:
+        # Buy Limit must be <= market Ask for MT5 to accept
+        if market_price is not None and limit_price > market_price:
+            c_log(f"Buy Limit {limit_price} > Ask {market_price} — level passed, "
+                  f"skipping Phase 1")
+            ioc_fail_reason = 'Skipped — level above market for buy limit'
+            raise _SkipLimitPhase(ioc_fail_reason)
+    else:
+        # Sell Limit must be >= market Bid for MT5 to accept
+        if market_price is not None and limit_price < market_price:
+            c_log(f"Sell Limit {limit_price} < Bid {market_price} — level passed, "
+                  f"skipping Phase 1")
+            ioc_fail_reason = 'Skipped — level below market for sell limit'
+            raise _SkipLimitPhase(ioc_fail_reason)
+
     limit_opts = {
         'slippage': max_slippage_points,
-        'fillingModes': ['ORDER_FILLING_IOC'],
         'comment': 'limit_buy_gann' if is_buy else 'limit_sell_gann',
+        'expirationType': 'ORDER_TIME_SPECIFIED',
+        'expiration': datetime.utcnow() + timedelta(seconds=3),
     }
 
     t_start = time.monotonic()
     try:
         if is_buy:
             res = await _metaapi_conn.create_limit_buy_order(
-                broker_symbol, lot, level_price,
+                broker_symbol, lot, limit_price,
                 stop_loss=sl, take_profit=tp, options=limit_opts,
             )
         else:
             res = await _metaapi_conn.create_limit_sell_order(
-                broker_symbol, lot, level_price,
+                broker_symbol, lot, limit_price,
                 stop_loss=sl, take_profit=tp, options=limit_opts,
             )
         t_ack = time.monotonic()
@@ -1417,7 +1448,7 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
 
         trade_id_candidate = str(res.get('positionId', res.get('orderId', '')))
 
-        # IOC fills happen immediately — check for the resulting position
+        # Limit orders fill when price reaches the level — check position
         for delay in (0, 0.3, 0.7):
             if delay:
                 await asyncio.sleep(delay)
@@ -1446,17 +1477,19 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
                 'error': None, 'ioc_fail_reason': None,
             }
 
-        # Limit IOC did NOT fill (price moved away). Log the EXACT response,
-        # capture the reason, then fall through to the market-order fallback.
-        ioc_fail_reason = 'Limit IOC did not fill — price moved away from level'
+        # Limit did NOT fill (3s GTD expired or order not yet confirmed).
+        # Capture the reason, then fall through to the market-order fallback.
+        ioc_fail_reason = 'Limit GTD expired — price moved away from level'
         if res.get('message'):
             ioc_fail_reason += f' | Broker: {res["message"]}'
         _exec_tracker.record(symbol, is_buy, level_price, None,
                              None, latency_ms, 'limit', False,
                              error=RuntimeError(ioc_fail_reason))
-        c_log(f"Limit IOC did not fill for {symbol} at {level_price} "
+        c_log(f"Limit did not fill for {symbol} at {level_price} "
               f"(latency={latency_ms}ms) — {ioc_fail_reason}")
 
+    except _SkipLimitPhase:
+        ioc_fail_reason = ioc_fail_reason or 'Phase 1 skipped'
     except Exception as e:
         latency_ms = round((time.monotonic() - t_start) * 1000)
         error = e
