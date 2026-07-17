@@ -2567,79 +2567,72 @@ async def export_live_trades_excel() -> None:
 # ─────────────────────────────────────────────────────────────
 # EXECUTION DETAILS REPORT (Telegram text, not Excel)
 # ─────────────────────────────────────────────────────────────
-async def export_execution_details_report() -> str:
-    """Formats every closed trade in live_trade_history with the 4 execution
-    metrics (latency, method, IOC failure reason, slippage) as a Telegram-safe
-    HTML text report. Returns the complete text, not a file."""
+async def export_execution_details_report() -> str | None:
+    """Generate an Excel report of every closed trade with the 4 execution
+    metrics (latency, method, IOC failure reason, slippage) in dedicated
+    columns. Returns the .xlsx filename to send, or None if no data."""
     hist = list(bot_state.get('live_trade_history', []))
     if not hist:
-        return "<b>📭 لا يوجد سجل صفقات حية مغلقة بعد.</b>"
+        return None
 
-    lines = ["<b>📋 تقرير تفاصيل تنفيذ الصفقات الحية</b>\n"]
-    win = loss = be = 0
-    total_pnl = 0.0
-
-    for i, tr in enumerate(hist, 1):
+    rows = []
+    for tr in hist:
+        symbol = tr.get('symbol', '')
+        tf = tr.get('tf', '')
         is_buy = tr.get('is_buy')
-        dir_emoji = '📈 BUY' if is_buy else '📉 SELL'
-        tf = tr.get('tf', '?')
-        symbol = tr.get('symbol', '?')
-        entry = tr.get('entry')
-        level_price = tr.get('level_price')
-        exit_px = tr.get('exit_price')
         pnl = tr.get('pnl', 0.0)
-        outcome = tr.get('outcome', '?')
-        is_real = tr.get('is_real', False)
-        total_pnl += pnl
-        if outcome == 'WIN': win += 1
-        elif outcome == 'LOSS': loss += 1
-        else: be += 1
-
-        outcome_emoji = '✅' if outcome == 'WIN' else '❌' if outcome == 'LOSS' else '⚖️'
-
-        # ── The 4 required execution metrics ──
-        exec_lat = tr.get('exec_latency_ms')
-        exec_method = tr.get('exec_method')
-        exec_ioc = tr.get('exec_ioc_fail_reason')
-        exec_slip = tr.get('exec_slippage')
+        outcome = tr.get('outcome', '')
         pv = SYMBOL_INFO.get(symbol, {}).get('pip_value', 0.01)
 
-        lat_str = f"{exec_lat}ms" if exec_lat is not None else "—"
-        method_str = {
-            'limit': 'المرحلة 1: حدّي (Limit IOC) ✅',
-            'market_fallback': 'المرحلة 2: سوقي (Market FOK) ⚠️',
-        }.get(exec_method, exec_method or "—")
+        exec_slip = tr.get('exec_slippage')
+        slip_pips = round(exec_slip / pv, 1) if exec_slip is not None and pv else None
 
-        # Slippage in price units and pips
-        if exec_slip is not None:
-            slip_pips = exec_slip / pv if pv else 0
-            slip_str = f"{exec_slip:.2f} ({slip_pips:.1f} نقطة)"
-        else:
-            slip_str = "—"
+        method_raw = tr.get('exec_method')
+        method_label = {'limit': 'Phase 1 (Limit IOC)',
+                        'market_fallback': 'Phase 2 (Market FOK)'}.get(method_raw, method_raw or '')
 
-        # IOC failure reason
-        ioc_str = exec_ioc if exec_ioc else "—" if exec_method != 'limit' else "لم يُستخدم (نجاح Limit)"
+        opened = tr.get('opened_at')
+        closed = tr.get('closed_at')
+        try:
+            opened_dam = _utc_to_dam(datetime.fromisoformat(opened)).strftime('%Y-%m-%d %H:%M:%S') if opened else ''
+        except Exception:
+            opened_dam = str(opened) if opened else ''
+        try:
+            closed_dam = _utc_to_dam(datetime.fromisoformat(closed)).strftime('%Y-%m-%d %H:%M:%S') if closed else ''
+        except Exception:
+            closed_dam = str(closed) if closed else ''
 
-        lines.append(
-            f"━━━━━━━━━━━━━━━\n"
-            f"<b>#{i}</b> {dir_emoji} [{symbol} - {tf}]\n"
-            f"{outcome_emoji} <b>النتيجة:</b> {outcome}  |  {pnl:+.2f}$\n"
-            f"💰 <b>المستوى:</b> {level_price}  |  <b>الدخول:</b> {entry}  |  <b>الإغلاق:</b> {exit_px}\n"
-            f"⏱ <b>زمن التنفيذ:</b> {lat_str}\n"
-            f"🔧 <b>طريقة التنفيذ:</b> {method_str}\n"
-            f"📊 <b>الانزلاق السعري:</b> {slip_str}\n"
-            f"⚠️ <b>سبب فشل IOC:</b> {ioc_str}\n"
-        )
+        rows.append({
+            'Pair': symbol,
+            'TF': tf,
+            'Direction': 'BUY' if is_buy else 'SELL',
+            'Open Time (DAM)': opened_dam,
+            'Close Time (DAM)': closed_dam,
+            'Level Price': tr.get('level_price'),
+            'Entry Price': tr.get('entry'),
+            'Exit Price': tr.get('exit_price'),
+            'PnL ($)': round(pnl, 2),
+            'Result': outcome,
+            'Execution Latency (ms)': tr.get('exec_latency_ms'),
+            'Execution Method': method_label,
+            'Final Slippage (Pips)': slip_pips,
+            'IOC Failure Reason': tr.get('exec_ioc_fail_reason') or '',
+        })
 
-    wr = round(100 * win / max(win + loss, 1), 1)
-    lines.append(
-        f"━━━━━━━━━━━━━━━\n"
-        f"<b>📊 ملخص</b>\n"
-        f"إجمالي: {len(hist)}  |  ربح: {win}  |  خسارة: {loss}  |  تعادل: {be}\n"
-        f"WR: {wr}%  |  صافي PnL: {total_pnl:+.2f}$"
-    )
+    df = pd.DataFrame(rows)
+    fname = f"Execution_Report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
 
-    return "\n".join(lines)
+    try:
+        with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Execution Details', index=False)
+            ws = writer.sheets['Execution Details']
+            for col_idx in range(1, len(df.columns) + 1):
+                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 22
+    except Exception as e:
+        log_exception('export_execution_details_report [Excel write]', e)
+        return None
+
+    return fname
 
 
 async def gann_monitor_scanner() -> None:
@@ -4753,22 +4746,34 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
         return
     if d == 'export_exec_report':
         async def _export_exec_report_task():
+            fname = None
             try:
-                report = await export_execution_details_report()
-                if len(report) > 4000:
-                    chunks = []
-                    for line in report.split('\n'):
-                        if not chunks or len(chunks[-1]) + len(line) + 1 > 3500:
-                            chunks.append(line)
-                        else:
-                            chunks[-1] += '\n' + line
-                    for chunk in chunks:
-                        await send_tg_msg(chunk)
-                else:
-                    await send_tg_msg(report)
+                fname = await export_execution_details_report()
+                if fname is None:
+                    await send_tg_msg("📭 <b>لا يوجد سجل صفقات حية مغلقة بعد.</b>")
+                    return
+                hist = bot_state.get('live_trade_history', [])
+                wins = sum(1 for t in hist if t.get('outcome') == 'WIN')
+                losses = sum(1 for t in hist if t.get('outcome') == 'LOSS')
+                bes = sum(1 for t in hist if t.get('outcome') == 'BREAK_EVEN')
+                total_pnl = sum(t.get('pnl', 0.0) for t in hist)
+                wr = round(100 * wins / max(wins + losses, 1), 1)
+                caption = (
+                    f"📋 <b>تقرير تفاصيل التنفيذ</b>\n"
+                    f"{len(hist)} صفقة  |  ربح: {wins}  |  خسارة: {losses}  |  تعادل: {bes}\n"
+                    f"WR: {wr}%  |  صافي PnL: {total_pnl:+.2f}$\n\n"
+                    f"الأعمدة: Latency (ms), Method, Slippage (Pips), IOC Fail Reason"
+                )
+                await send_tg_document(fname, caption)
             except Exception as e:
                 log_exception('export_execution_details_report', e)
                 await send_tg_msg(f"❌ فشل إنشاء تقرير التنفيذ: {e}")
+            finally:
+                if fname and os.path.exists(fname):
+                    try:
+                        os.remove(fname)
+                    except Exception as e:
+                        log_exception('export_exec_report cleanup', e)
         asyncio.create_task(_export_exec_report_task())
         return
     if d == 'manual_resume_step1':
