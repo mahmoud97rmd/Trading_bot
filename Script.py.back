@@ -163,13 +163,6 @@ _broker_to_data_symbol: dict[str, str] = {}  # {'XAUUSD': 'XAU_USD', ...}
 # Cap concurrent tick-processing tasks to prevent unbounded task pile-up
 # during high-frequency tick bursts.
 _tick_semaphore = asyncio.Semaphore(5)
-
-# Event-driven fill detection: map order_id -> asyncio.Event
-# A background task monitors terminal_state.positions and sets the event
-# when the position appears, eliminating busy-wait polling (saves 300-1000ms per trade).
-_fill_events: dict[str, asyncio.Event] = {}
-_fill_results: dict[str, dict] = {}  # order_id -> {fill_price, fill_source, trade_id}
-_fill_monitor_started = False
 _QUOTE_STALE_SECONDS = 5.0
 # Updated on EVERY tick received from MetaApi, for ANY symbol -- this is
 # deliberately independent of live_quotes/_broker_to_data_symbol (which can
@@ -421,19 +414,15 @@ def _lq_is_stale(symbol: str) -> bool:
 
 
 async def _lq_price_with_fallback(symbol: str) -> tuple[float | None, str, float | None]:
-    """Returns (price, source, age_ms). 
-    
-    CRITICAL: In the EXECUTION path we MUST NOT fall back to OANDA REST.
-    A 50-150ms REST call adds unacceptable latency. Instead we return None
-    and let the caller reject the trade. The scanner cycle uses a separate
-    path that can tolerate the fallback for diagnostics only.
-    """
+    """Returns (price, source, age_ms). Prefers the pushed WebSocket
+    quote; falls back to the OANDA REST fetch (fetch_master_price) if
+    the feed is missing/stale, so a temporary MetaApi hiccup degrades
+    to the old behavior instead of silently blocking all touch checks."""
     q = live_quotes.get(symbol)
     if q is not None and (time.monotonic() - q['ts']) <= _QUOTE_STALE_SECONDS:
         return q['mid'], 'ws', round((time.monotonic() - q['ts']) * 1000)
-    # WS quote missing or stale — DO NOT fall back to OANDA REST
-    # (that would add 50-150ms latency). Return None to signal stale feed.
-    return None, 'ws_stale', None
+    px = await fetch_master_price(symbol)
+    return px, 'oanda_fallback', None
 
 # Connection-state machine.
 # RUNNING    : normal operation, new trades allowed.
@@ -448,59 +437,6 @@ CONN_HALTED    = 'HALTED'
 
 _state_lock = asyncio.Lock()
 _last_state_notify_ts = 0.0
-
-# Event-driven fill detection: map order_id -> asyncio.Event
-# A background task monitors terminal_state.positions and sets the event
-# when the position appears, eliminating busy-wait polling (saves 300-1000ms per trade).
-_fill_events: dict[str, asyncio.Event] = {}
-_fill_results: dict[str, dict] = {}  # order_id -> {fill_price, fill_source, trade_id}
-_fill_monitor_started = False
-_fill_monitor_task: asyncio.Task | None = None
-_fill_monitor_lock = asyncio.Lock()
-
-async def _start_fill_monitor():
-    """Start the background fill monitor task (idempotent)."""
-    global _fill_monitor_started, _fill_monitor_task
-    async with _fill_monitor_lock:
-        if _fill_monitor_started:
-            return
-        _fill_monitor_started = True
-        _fill_monitor_task = asyncio.create_task(_fill_monitor_loop())
-
-async def _fill_monitor_loop():
-    """Background loop that watches terminal_state.positions for new fills.
-    
-    When a position with a tracked order_id appears, sets the corresponding
-    Event and stores the fill data. This eliminates the 300-1000ms busy-wait
-    polling in _execute_smart_order.
-    """
-    try:
-        while True:
-            await asyncio.sleep(0.05)  # 50ms check interval - much faster than 300ms poll
-            if not _fill_events or _metaapi_conn is None:
-                continue
-            try:
-                positions = _metaapi_conn.terminal_state.positions
-                if not positions:
-                    continue
-                for p in positions:
-                    pid = str(p.get('id', ''))
-                    if pid in _fill_events and pid not in _fill_results:
-                        open_price = p.get('openPrice')
-                        if open_price is not None:
-                            _fill_results[pid] = {
-                                'fill_price': float(open_price),
-                                'fill_source': 'confirmed_position',
-                                'trade_id': pid,
-                            }
-                            _fill_events[pid].set()
-            except Exception as e:
-                # Don't crash the monitor on transient errors
-                log_exception('_fill_monitor_loop', e)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        log_exception('_fill_monitor_loop crashed', e)
 
 async def set_connection_state(new_state: str, reason: str) -> None:
     global _last_state_notify_ts
@@ -1297,40 +1233,23 @@ def _gann_tf_sl(symbol: str, tf: str) -> int:
     return v if v > 0 else sym_state['gann_sl_points']
 
 def _gann_atr(candles: list, period: int) -> float | None:
-    """Compute ATR using pure NumPy (no pandas overhead).
-    If `candles` is None, returns None (cache miss)."""
-    if candles is None or len(candles) < period + 1:
-        return None
-    # Take only the last (period + 50) candles for efficiency
-    recent = candles[-(period + 50):]
-    n = len(recent)
-    high = np.empty(n, dtype=np.float64)
-    low = np.empty(n, dtype=np.float64)
-    close = np.empty(n, dtype=np.float64)
-    for i, c in enumerate(recent):
-        high[i] = c['high']
-        low[i] = c['low']
-        close[i] = c['close']
-    # True Range: max(high-low, |high-prev_close|, |low-prev_close|)
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]  # first element has no prev_close, use itself
-    tr1 = high - low
-    tr2 = np.abs(high - prev_close)
-    tr3 = np.abs(low - prev_close)
-    tr = np.maximum(np.maximum(tr1, tr2), tr3)
-    # Rolling mean of last `period` values
-    atr = float(np.mean(tr[-period:]))
-    return atr
+    if len(candles) < period + 1: return None
+    df = pd.DataFrame(candles[-(period + 50):])
+    df['prev_close'] = df['close'].shift(1)
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['prev_close']).abs(),
+        (df['low']  - df['prev_close']).abs(),
+    ], axis=1).max(axis=1)
+    val = tr.rolling(period).mean().iloc[-1]
+    return float(val) if not pd.isna(val) else None
 
 def _gann_calc_tpsl(symbol: str, entry: float, is_buy: bool, candles: list, tf: str = '') -> tuple[float, float]:
     sym_state = bot_state['symbol_state'][symbol]
     pv = SYMBOL_INFO[symbol]['pip_value']
     prec = SYMBOL_INFO[symbol]['prec']
     if sym_state['gann_tpsl_mode'] == 'atr':
-        # Try cached ATR first (pre-computed in gann_cycle_manager)
-        atr = sym_state.get('gann_atr_cache', {}).get(tf)
-        if atr is None and candles:
-            atr = _gann_atr(candles, sym_state['gann_atr_period'])  # fallback
+        atr = _gann_atr(candles, sym_state['gann_atr_period'])
         if not atr: atr = _gann_tf_sl(symbol, tf) * pv
         sl_dist = atr * sym_state['gann_atr_sl_mult']
         tp_dist = atr * sym_state['gann_atr_tp_mult']
@@ -1434,20 +1353,17 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
                                 max_slippage_points: int) -> dict:
     """Zero-slippage execution for Gann level touch trading.
 
-    Phase 1 — LIMIT (GTD 30s + cancel-on-move) with smart spread-aware placement.
-      Smart limit price = level_price ± spread/2 to capture midpoint fills.
-      Auto-cancels after 30s or if price moves > 2×margin away from level.
+    Phase 1 — LIMIT (GTD 3s) at the exact Gann level price.
+      Places a pending limit order that auto-cancels after 3 seconds if
+      unfilled.  MT5 requires the limit price to be on the valid side of
+      market (Buy Limit ≤ Ask, Sell Limit ≥ Bid), so the function checks
+      current bid/ask first and skips to Phase 2 if the level has already
+      been passed.
 
     Phase 2 — MARKET (FOK) with tight deviation guard.
-      Only reached if Phase 1 was skipped or expired without filling.
-      The FOK deviation cap limits max slippage to `max_slippage_points` broker points.
-
-    Phase 3 — Hybrid IOC Emulation (NEW).
-      If limit order not filled within 100ms, auto-send market FOK fallback.
-      This emulates true IOC behavior without broker IOC support.
-
-    Adaptive slippage budget: if rolling avg slippage > 2 pips, auto-widen
-    `max_slippage_points` for next 10 trades to prevent FOK rejections.
+      Only reached if Phase 1 was skipped or the GTD limit expired without
+      filling. The FOK deviation cap limits max slippage to
+      `max_slippage_points` broker points — a hard safety net.
 
     Returns dict with keys: success, trade_id, fill_price, fill_source,
                             latency_ms, method_used, error, ioc_fail_reason.
@@ -1461,31 +1377,14 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
     ioc_fail_reason = None
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 1 — LIMIT ORDER (GTD 30s + cancel-on-move + smart spread-aware)
+    # PHASE 1 — LIMIT ORDER (GTD 3s) AT EXACT GANN LEVEL PRICE
     # ═══════════════════════════════════════════════════════════
     # NOTE: MT5 rejects `fillingModes: ['ORDER_FILLING_IOC']` on pending
     # (limit) orders — IOC/FOK are market-order-only in MT5.  Instead we
-    # use a plain GTD limit with a 30-second expiration + active cancel-on-move.
+    # use a plain GTD limit with a 3-second expiration so the order
+    # auto-cancels if price has already moved past the level.
 
-    # Get current market spread for smart limit placement
-    q = live_quotes.get(symbol)
-    spread = None
-    if q and 'ask' in q and 'bid' in q:
-        spread = q['ask'] - q['bid']
-
-    # Smart limit price: for BUY use level_price - spread/2 (midpoint between level and ask)
-    # For SELL use level_price + spread/2 (midpoint between level and bid)
-    if spread and spread > 0:
-        smart_limit_price = level_price - spread / 2 if is_buy else level_price + spread / 2
-        # Ensure we don't place beyond the level (for BUY: smart_limit must be <= level_price)
-        if is_buy and smart_limit_price > level_price:
-            smart_limit_price = level_price
-        if not is_buy and smart_limit_price < level_price:
-            smart_limit_price = level_price
-    else:
-        smart_limit_price = level_price
-
-    limit_price = smart_limit_price
+    limit_price = level_price
     market_price = None
     try:
         q = live_quotes.get(symbol)
@@ -1509,14 +1408,11 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
             ioc_fail_reason = 'Skipped — level below market for sell limit'
             raise _SkipLimitPhase(ioc_fail_reason)
 
-    margin = bot_state['symbol_state'][symbol]['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
-    cancel_threshold = margin * 2  # cancel if price moves 2×margin away
-
     limit_opts = {
         'slippage': max_slippage_points,
         'comment': 'limit_buy_gann' if is_buy else 'limit_sell_gann',
         'expirationType': 'ORDER_TIME_SPECIFIED',
-        'expiration': datetime.utcnow() + timedelta(seconds=30),  # Extended GTD
+        'expiration': datetime.utcnow() + timedelta(seconds=3),
     }
 
     t_start = time.monotonic()
@@ -1536,31 +1432,24 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
 
         trade_id_candidate = str(res.get('positionId', res.get('orderId', '')))
 
-        # Event-driven fill detection with 100ms IOC emulation timer
-        await _start_fill_monitor()
-        fill_event = asyncio.Event()
-        _fill_events[trade_id_candidate] = fill_event
-        
-        # Hybrid IOC emulation: wait 100ms for limit fill, then auto-send market FOK
-        ioc_emulation_timeout = 0.1  # 100ms
-        try:
-            await asyncio.wait_for(fill_event.wait(), timeout=ioc_emulation_timeout)
-            fill_data = _fill_results.pop(trade_id_candidate, None)
-            if fill_data:
-                fill_price = fill_data['fill_price']
-                trade_id = fill_data['trade_id']
-                fill_source = fill_data['fill_source']
+        # Limit orders fill when price reaches the level — check position
+        for delay in (0, 0.3, 0.7):
+            if delay:
+                await asyncio.sleep(delay)
+            positions = _metaapi_conn.terminal_state.positions
+            match = next((p for p in positions if str(p.get('id')) == trade_id_candidate), None)
+            if match and match.get('openPrice') is not None:
+                fill_price = float(match['openPrice'])
+                trade_id = trade_id_candidate
+                fill_source = 'confirmed_position'
                 method_used = 'limit'
-            else:
-                fill_price = None
-        except asyncio.TimeoutError:
-            # IOC emulation timeout — limit didn't fill in 100ms, send market FOK fallback
-            fill_price = None
-            c_log(f"Phase 1 IOC emulation timeout ({ioc_emulation_timeout*1000:.0f}ms) — sending Phase 2 market FOK")
+                break
 
-        # Cleanup Phase 1 tracking
-        _fill_events.pop(trade_id_candidate, None)
-        _fill_results.pop(trade_id_candidate, None)
+        if fill_price is None and res.get('price') is not None:
+            fill_price = float(res['price'])
+            trade_id = trade_id_candidate
+            fill_source = 'order_response'
+            method_used = 'limit'
 
         if fill_price is not None:
             _exec_tracker.record(symbol, is_buy, level_price, fill_price,
@@ -1572,13 +1461,16 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
                 'error': None, 'ioc_fail_reason': None,
             }
 
-        # Phase 1 IOC emulation timed out — cancel the pending limit order
-        try:
-            await _metaapi_conn.delete_pending_order(trade_id_candidate)
-        except Exception:
-            pass
-
-        ioc_fail_reason = 'Limit IOC emulation timeout — price moved away from level'
+        # Limit did NOT fill (3s GTD expired or order not yet confirmed).
+        # Capture the reason, then fall through to the market-order fallback.
+        ioc_fail_reason = 'Limit GTD expired — price moved away from level'
+        if res.get('message'):
+            ioc_fail_reason += f' | Broker: {res["message"]}'
+        _exec_tracker.record(symbol, is_buy, level_price, None,
+                             None, latency_ms, 'limit', False,
+                             error=RuntimeError(ioc_fail_reason))
+        c_log(f"Limit did not fill for {symbol} at {level_price} "
+              f"(latency={latency_ms}ms) — {ioc_fail_reason}")
 
     except _SkipLimitPhase:
         ioc_fail_reason = ioc_fail_reason or 'Phase 1 skipped'
@@ -1591,21 +1483,10 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
         c_log(f"Limit order failed [{symbol}]: {e} — falling back to market order")
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 2 — MARKET ORDER (FOK) WITH ADAPTIVE SLIPPAGE BUDGET
+    # PHASE 2 — MARKET ORDER (FOK) WITH TIGHT DEVIATION GUARD
     # ═══════════════════════════════════════════════════════════
-    # Adaptive slippage budget: if rolling avg slippage > 2 pips,
-    # auto-widen max_slippage_points for next 10 trades to prevent FOK rejections.
-    avg_slip = _exec_tracker.avg_slippage(symbol, n=50)
-    adaptive_slip_pts = max_slippage_points
-    if avg_slip is not None:
-        pip_val = SYMBOL_INFO[symbol]['pip_value']
-        avg_slip_pips = avg_slip / pip_val if pip_val > 0 else 0
-        if avg_slip_pips > 2.0:
-            adaptive_slip_pts = int(max_slippage_points * 1.5)
-            c_log(f"Adaptive slippage: avg={avg_slip_pips:.1f} pips > 2.0, widening to {adaptive_slip_pts} pts")
-
     market_opts = {
-        'slippage': adaptive_slip_pts,
+        'slippage': max_slippage_points,
         'fillingModes': ['ORDER_FILLING_FOK'],
         'comment': 'market_buy_fbk' if is_buy else 'market_sell_fbk',
     }
@@ -1627,25 +1508,16 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
 
         trade_id = str(res.get('positionId', res.get('orderId', '')))
 
-        # Event-driven fill detection for market order (eliminates 500-1000ms polling)
-        await _start_fill_monitor()
-        fill_event = asyncio.Event()
-        _fill_events[trade_id] = fill_event
-        try:
-            await asyncio.wait_for(fill_event.wait(), timeout=2.0)
-            fill_data = _fill_results.pop(trade_id, None)
-            if fill_data:
-                fill_price = fill_data['fill_price']
-                fill_source = fill_data['fill_source']
-                trade_id = fill_data['trade_id']
+        for delay in (0, 0.5, 1.0):
+            if delay:
+                await asyncio.sleep(delay)
+            positions = _metaapi_conn.terminal_state.positions
+            match = next((p for p in positions if str(p.get('id')) == trade_id), None)
+            if match and match.get('openPrice') is not None:
+                fill_price = float(match['openPrice'])
+                fill_source = 'confirmed_position'
                 method_used = 'market_fallback'
-            else:
-                fill_price = None
-        except asyncio.TimeoutError:
-            fill_price = None
-        finally:
-            _fill_events.pop(trade_id, None)
-            _fill_results.pop(trade_id, None)
+                break
 
         if fill_price is None and res.get('price') is not None:
             fill_price = float(res['price'])
@@ -1708,19 +1580,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         if is_real:
             fresh_px, fresh_feed_source, fresh_feed_age_ms = await _lq_price_with_fallback(symbol)
         margin = sym_state['gann_touch_margin_pts'] * SYMBOL_INFO[symbol]['pip_value']
-        if fresh_px is None:
-            # WS feed stale — reject trade rather than fall back to slow OANDA REST
-            bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
-            c_log(f"REJECTED [{symbol} {tf}]: WS feed stale ({_QUOTE_STALE_SECONDS}s), "
-                  f"trade aborted to avoid {50}-{150}ms REST latency")
-            await send_tg_msg(
-                f"<b>⏭️ [{symbol} - جان {tf}]</b>  {reason}\n"
-                f"المستوى: {level['price']:.2f}\n"
-                f"تم رفض الصفقة — تغذية السعر غير محدثة (أكبر من {_QUOTE_STALE_SECONDS}ث).\n"
-                f"السبب: تجنب استدعاء OANDA REST البطيء ({50}-{150}ms) الذي يفسد السكالبينج."
-            )
-            return
-        if abs(fresh_px - level['price']) > margin:
+        if fresh_px is None or abs(fresh_px - level['price']) > margin:
             bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             # Detail requested: exactly how much the price moved, over how
             # long, and what the pre-existing code threshold is (the touch
@@ -3336,14 +3196,6 @@ async def gann_cycle_manager() -> None:
                     sym_state['gann_last_h1_time'] = now_utc
                     sym_state['gann_cycle_started_at'] = now_utc
                     sym_state['gann_level_status'] = {}
-                    # Pre-compute ATR for all enabled timeframes to avoid pandas overhead
-                    # in the hot path during trade execution
-                    sym_state['gann_atr_cache'] = {}
-                    for tf in sym_state['gann_monitor_tfs']:
-                        if sym_state['gann_monitor_tfs'].get(tf):
-                            tf_candles = await fetch_candles(symbol, tf, count=sym_state['gann_atr_period'] + 50)
-                            if tf_candles:
-                                sym_state['gann_atr_cache'][tf] = _gann_atr(tf_candles, sym_state['gann_atr_period'])
                     c_log(f'[{symbol}] Dynamic Gann recalculation at live_px={live_px}')
                     continue
 
