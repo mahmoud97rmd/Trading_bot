@@ -401,7 +401,7 @@ async def check_metaapi_status_command(chat_id: int):
 # ── Exact-match early handlers (async operations that spawn tasks) ──
 async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
     from execution import _consecutive_real_order_failures as _exec_failures
-    from market_data import _recon_consecutive_mismatches
+    from gann_monitor import _recon_consecutive_mismatches
 
     if d == 'check_metaapi_status':
         _safe_task(check_metaapi_status_command(chat_id), 'check_metaapi_status'); return
@@ -496,11 +496,10 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
             ]})
         return
     if d == 'manual_resume_confirm':
-        from execution import _consecutive_real_order_failures as _cf
-        from market_data import _recon_consecutive_mismatches as _rm
-        global _cf, _rm
         prior_state = bot_state.get('connection_state', CONN_RUNNING)
-        _rm = 0; _cf = 0
+        import execution; import gann_monitor
+        execution._consecutive_real_order_failures = 0
+        gann_monitor._recon_consecutive_mismatches = 0
         await set_connection_state(CONN_RUNNING, f"Manually resumed by operator (was {prior_state}).")
         await send_tg_msg("✅ تم الاستئناف اليدوي. البوت الآن RUNNING.")
         return
