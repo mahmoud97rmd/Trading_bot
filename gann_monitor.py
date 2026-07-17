@@ -30,8 +30,7 @@ from state import (
 )
 from market_data import (
     live_quotes, _metaapi_conn, _metaapi_account,
-    _bootstrap_metaapi_connection, _lq_subscribe_symbol,
-    _lq_is_stale, _lq_price_with_fallback, _force_full_reconnect,
+    _lq_price_with_fallback, _force_full_reconnect,
     _gann_cache, fetch_candles, fetch_master_price,
     _QUOTE_STALE_SECONDS, _WS_WATCHDOG_STALE_SECONDS, _last_any_tick_ts,
 )
@@ -60,9 +59,9 @@ async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
     while True:
         try:
-            if _metaapi_conn is None or _metaapi_account is None:
-                await _bootstrap_metaapi_connection()
-
+            # Stale tick watchdog: if no tick for >60s, trigger full reconnect.
+            # Connection management is in market_data.py (init_metaapi / _bootstrap).
+            # Scanner reads from the shared live_quotes cache ONLY.
             active_syms_now = [s for s, on in bot_state['active_symbols'].items() if on]
             if (_metaapi_conn is not None and active_syms_now and _is_market_hours_now()
                     and (time.monotonic() - _last_any_tick_ts) > _WS_WATCHDOG_STALE_SECONDS):
@@ -70,26 +69,6 @@ async def gann_monitor_scanner() -> None:
                     f"لا تيك واحد وصل منذ {time.monotonic() - _last_any_tick_ts:.0f}s "
                     f"(الحد: {_WS_WATCHDOG_STALE_SECONDS:.0f}s)"
                 )
-
-            if _metaapi_account and bot_state.get('connection_state') != CONN_RUNNING:
-                await set_connection_state(CONN_READ_ONLY, "MetaAPI connection lost — attempting reconnect.")
-                reconnected = False
-                for attempt in range(5):
-                    try:
-                        reconnected = await _bootstrap_metaapi_connection()
-                        if reconnected:
-                            c_log("MetaAPI Reconnected successfully.")
-                            break
-                    except Exception as e:
-                        log_exception(f"MetaAPI reconnect attempt {attempt+1}/5", e)
-                    await asyncio.sleep(2 ** attempt)
-                if not reconnected:
-                    c_log("MetaAPI reconnect exhausted 5 attempts this tick; will retry next cycle.")
-            elif _metaapi_conn is not None:
-                for sym, on in bot_state['active_symbols'].items():
-                    if on and _lq_is_stale(sym):
-                        c_log(f"Live quote feed stale for {sym} -- resubscribing.")
-                        await _lq_subscribe_symbol(sym)
 
             now_dt = datetime.now(timezone.utc)
             today_date = now_dt.date()

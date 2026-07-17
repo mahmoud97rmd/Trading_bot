@@ -143,6 +143,13 @@ _metaapi = None
 _metaapi_account = None
 _metaapi_conn = None
 
+# ── Strict Singleton: subscription set ──
+# Prevents duplicate subscribe_to_market_data() calls across the
+# entire bot lifecycle.  Once a symbol is subscribed it is NEVER
+# re-subscribed unless the connection is force-reconnected (in which
+# case the set is cleared).
+_active_subscriptions: set[str] = set()
+
 
 class _GannPriceListener(SynchronizationListener):
     async def on_symbol_price_updated(self, instance_index, price):
@@ -187,18 +194,22 @@ def _resolve_broker_symbol(symbol: str) -> str:
 
 
 async def _lq_subscribe_symbol(symbol: str) -> None:
+    global _active_subscriptions
     if _metaapi_conn is None:
         return
     broker_sym = _resolve_broker_symbol(symbol)
     _broker_to_data_symbol[broker_sym] = symbol
+    if broker_sym in _active_subscriptions:
+        return  # already subscribed — guard against duplicate API call
     try:
         await _metaapi_conn.subscribe_to_market_data(broker_sym)
+        _active_subscriptions.add(broker_sym)
     except Exception as e:
         log_exception(f"_lq_subscribe_symbol [{symbol} -> {broker_sym}]", e)
 
 
 async def _force_full_reconnect(reason: str) -> None:
-    global _metaapi_conn, _last_any_tick_ts
+    global _metaapi_conn, _last_any_tick_ts, _active_subscriptions
     c_log(f"WS WATCHDOG: forcing full reconnect -- {reason}")
     await set_connection_state(CONN_READ_ONLY, f"WS watchdog: {reason}")
     if _metaapi_account is None:
@@ -210,6 +221,7 @@ async def _force_full_reconnect(reason: str) -> None:
                 await asyncio.wait_for(_metaapi_conn.close(), timeout=15)
             except Exception as e:
                 log_exception('_force_full_reconnect: close old connection', e)
+        _active_subscriptions.clear()  # reset — re-subscribe below
         _metaapi_conn = _metaapi_account.get_streaming_connection()
         _metaapi_conn.add_synchronization_listener(_GannPriceListener())
         await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
