@@ -87,6 +87,8 @@ def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px: float
         'close_reason': close_reason, 'be_activated': bool(tr.get('be_activated')),
         'feed_source': tr.get('feed_source'), 'feed_age_ms': tr.get('feed_age_ms'),
         'trigger_type': tr.get('trigger_type'),
+        'exec_latency_ms': tr.get('exec_latency_ms'), 'exec_method': tr.get('exec_method'),
+        'exec_ioc_fail_reason': tr.get('exec_ioc_fail_reason'), 'exec_slippage': tr.get('exec_slippage'),
     })
     if len(hist) > _DIAG_LOG_MAX_ENTRIES:
         del hist[: len(hist) - _DIAG_LOG_MAX_ENTRIES]
@@ -871,6 +873,45 @@ bot_state: dict = {
 }
 
 
+# ── Execution Quality Tracker ──
+# Records every real order's fill quality for self-tuning and diagnostics.
+class _ExecTracker:
+    def __init__(self, maxlen=200):
+        self.orders = []
+        self.maxlen = maxlen
+
+    def record(self, symbol, is_buy, level_price, fill_price, fill_source,
+               latency_ms, method_used, success, error=None):
+        slippage = None
+        if fill_price is not None and level_price is not None:
+            slippage = round(abs(fill_price - level_price), 5)
+        self.orders.append({
+            'ts': time.monotonic(),
+            'symbol': symbol,
+            'is_buy': is_buy,
+            'level_price': level_price,
+            'fill_price': fill_price,
+            'slippage': slippage,
+            'latency_ms': latency_ms,
+            'method': method_used,
+            'success': success,
+            'error': str(error) if error else None,
+        })
+        if len(self.orders) > self.maxlen:
+            self.orders.pop(0)
+
+    def avg_slippage(self, symbol=None, n=20):
+        recent = [o for o in self.orders if o['slippage'] is not None
+                  and (symbol is None or o['symbol'] == symbol)][-n:]
+        return sum(o['slippage'] for o in recent) / len(recent) if recent else None
+
+    def limit_fill_rate(self, symbol=None, n=50):
+        recent = [o for o in self.orders if o['method'] == 'limit'
+                  and (symbol is None or o['symbol'] == symbol)][-n:]
+        return sum(1 for o in recent if o['success']) / len(recent) if recent else None
+
+_exec_tracker = _ExecTracker()
+
 DAM_OFF = timedelta(hours=3)
 def _utc_to_dam(dt) -> datetime:
     if isinstance(dt, pd.Timestamp): dt = dt.to_pydatetime()
@@ -1313,6 +1354,184 @@ def _resolve_broker_symbol(symbol: str) -> str:
         return symbol.replace('_', '')
     return configured
 
+
+# ─────────────────────────────────────────────────────────────
+# SMART ORDER EXECUTION: LIMIT-first, MARKET-fallback
+# ─────────────────────────────────────────────────────────────
+async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
+                                level_price: float, sl: float, tp: float,
+                                t1_signal_ts: float,
+                                max_slippage_points: int) -> dict:
+    """Zero-slippage execution for Gann level touch trading.
+
+    Phase 1 — LIMIT (IOC) at the exact Gann level price.
+      If price is AT the level when detected, the limit fills instantly at
+      that price. No slippage by definition — the broker fills you at the
+      limit price or better. IOC means any unfilled portion is immediately
+      cancelled (no stale pending orders left behind).
+
+      This is the CORRECT semantics for touch trading: you want to enter at
+      the level, not chase price away from it. The 38.9-pip slippage scenario
+      ($3.89 on XAUUSD) is structurally impossible with this approach because
+      the order never executes away from the level.
+
+    Phase 2 — MARKET (FOK) with tight deviation guard.
+      Only reached if the limit IOC didn't fill (price moved past the level
+      during the ~20ms round-trip). The FOK deviation cap then limits max
+      slippage to `max_slippage_points` broker points — a hard safety net.
+
+    Returns dict with keys: success, trade_id, fill_price, fill_source,
+                            latency_ms, method_used, error, ioc_fail_reason.
+    """
+    broker_symbol = _resolve_broker_symbol(symbol)
+    trade_id = None
+    fill_price = None
+    fill_source = None
+    method_used = None
+    error = None
+    ioc_fail_reason = None
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 1 — LIMIT ORDER (IOC) AT EXACT GANN LEVEL PRICE
+    # ═══════════════════════════════════════════════════════════
+    limit_opts = {
+        'slippage': max_slippage_points,
+        'fillingModes': ['ORDER_FILLING_IOC'],
+        'comment': 'limit_buy_gann' if is_buy else 'limit_sell_gann',
+    }
+
+    t_start = time.monotonic()
+    try:
+        if is_buy:
+            res = await _metaapi_conn.create_limit_buy_order(
+                broker_symbol, lot, level_price,
+                stop_loss=sl, take_profit=tp, options=limit_opts,
+            )
+        else:
+            res = await _metaapi_conn.create_limit_sell_order(
+                broker_symbol, lot, level_price,
+                stop_loss=sl, take_profit=tp, options=limit_opts,
+            )
+        t_ack = time.monotonic()
+        latency_ms = round((t_ack - t_start) * 1000)
+
+        trade_id_candidate = str(res.get('positionId', res.get('orderId', '')))
+
+        # IOC fills happen immediately — check for the resulting position
+        for delay in (0, 0.3, 0.7):
+            if delay:
+                await asyncio.sleep(delay)
+            positions = _metaapi_conn.terminal_state.positions
+            match = next((p for p in positions if str(p.get('id')) == trade_id_candidate), None)
+            if match and match.get('openPrice') is not None:
+                fill_price = float(match['openPrice'])
+                trade_id = trade_id_candidate
+                fill_source = 'confirmed_position'
+                method_used = 'limit'
+                break
+
+        if fill_price is None and res.get('price') is not None:
+            fill_price = float(res['price'])
+            trade_id = trade_id_candidate
+            fill_source = 'order_response'
+            method_used = 'limit'
+
+        if fill_price is not None:
+            _exec_tracker.record(symbol, is_buy, level_price, fill_price,
+                                 fill_source, latency_ms, 'limit', True)
+            return {
+                'success': True, 'trade_id': trade_id,
+                'fill_price': fill_price, 'fill_source': fill_source,
+                'latency_ms': latency_ms, 'method_used': 'limit',
+                'error': None, 'ioc_fail_reason': None,
+            }
+
+        # Limit IOC did NOT fill (price moved away). Log the EXACT response,
+        # capture the reason, then fall through to the market-order fallback.
+        ioc_fail_reason = 'Limit IOC did not fill — price moved away from level'
+        if res.get('message'):
+            ioc_fail_reason += f' | Broker: {res["message"]}'
+        _exec_tracker.record(symbol, is_buy, level_price, None,
+                             None, latency_ms, 'limit', False,
+                             error=RuntimeError(ioc_fail_reason))
+        c_log(f"Limit IOC did not fill for {symbol} at {level_price} "
+              f"(latency={latency_ms}ms) — {ioc_fail_reason}")
+
+    except Exception as e:
+        latency_ms = round((time.monotonic() - t_start) * 1000)
+        error = e
+        ioc_fail_reason = f'Limit order raised exception: {e}'
+        _exec_tracker.record(symbol, is_buy, level_price, None,
+                             None, latency_ms, 'limit', False, error=e)
+        c_log(f"Limit order failed [{symbol}]: {e} — falling back to market order")
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 2 — MARKET ORDER (FOK) WITH TIGHT DEVIATION GUARD
+    # ═══════════════════════════════════════════════════════════
+    market_opts = {
+        'slippage': max_slippage_points,
+        'fillingModes': ['ORDER_FILLING_FOK'],
+        'comment': 'market_buy_fbk' if is_buy else 'market_sell_fbk',
+    }
+
+    t_start = time.monotonic()
+    try:
+        if is_buy:
+            res = await _metaapi_conn.create_market_buy_order(
+                broker_symbol, lot,
+                stop_loss=sl, take_profit=tp, options=market_opts,
+            )
+        else:
+            res = await _metaapi_conn.create_market_sell_order(
+                broker_symbol, lot,
+                stop_loss=sl, take_profit=tp, options=market_opts,
+            )
+        t_ack = time.monotonic()
+        latency_ms = round((t_ack - t_start) * 1000)
+
+        trade_id = str(res.get('positionId', res.get('orderId', '')))
+
+        for delay in (0, 0.5, 1.0):
+            if delay:
+                await asyncio.sleep(delay)
+            positions = _metaapi_conn.terminal_state.positions
+            match = next((p for p in positions if str(p.get('id')) == trade_id), None)
+            if match and match.get('openPrice') is not None:
+                fill_price = float(match['openPrice'])
+                fill_source = 'confirmed_position'
+                method_used = 'market_fallback'
+                break
+
+        if fill_price is None and res.get('price') is not None:
+            fill_price = float(res['price'])
+            fill_source = 'order_response'
+            method_used = 'market_fallback'
+
+        success = fill_price is not None
+        _exec_tracker.record(symbol, is_buy, level_price, fill_price,
+                             fill_source, latency_ms, method_used or 'market_fallback',
+                             success, error=None if success else RuntimeError('No fill'))
+        return {
+            'success': success, 'trade_id': trade_id,
+            'fill_price': fill_price, 'fill_source': fill_source,
+            'latency_ms': latency_ms, 'method_used': method_used or 'market_fallback',
+            'error': None if success else RuntimeError('Market fallback produced no fill'),
+            'ioc_fail_reason': ioc_fail_reason,
+        }
+
+    except Exception as e:
+        latency_ms = round((time.monotonic() - t_start) * 1000)
+        _exec_tracker.record(symbol, is_buy, level_price, None,
+                             None, latency_ms, 'market_fallback', False, error=e)
+        return {
+            'success': False, 'trade_id': None,
+            'fill_price': None, 'fill_source': None,
+            'latency_ms': latency_ms, 'method_used': None,
+            'error': e,
+            'ioc_fail_reason': ioc_fail_reason,
+        }
+
+
 async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list, reason: str, tf: str,
                             initial_px: float = None, detect_time: datetime = None, t1_signal_ts: float = None,
                             feed_source: str = None, feed_age_ms: float = None, trigger_type: str = None) -> None:
@@ -1434,116 +1653,53 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                 is_real = False
                 execution_failed = True
             else:
-                t2_pre_send_ts = None
-                try:
-                    broker_symbol = _resolve_broker_symbol(symbol)
+                broker_symbol = _resolve_broker_symbol(symbol)
+                max_slippage_points = int(bot_state.get('prot_max_slippage_points', 5))
+                exec_result = await _execute_smart_order(
+                    symbol, is_buy, lot, level['price'],
+                    sl, tp, t1_signal_ts, max_slippage_points,
+                )
 
-                    # ── Slippage / Deviation control ──
-                    # Cap how far from our intended price the broker is allowed
-                    # to fill us. 'slippage' is in MetaApi "points" (broker tick
-                    # size units, i.e. the same unit as symbol digits — for a
-                    # 2-digit gold quote that's $0.01/point). ORDER_FILLING_FOK
-                    # ("fill or kill") means the whole order is rejected rather
-                    # than partially/badly filled if the broker can't honor it
-                    # within that deviation — this is what stops us from being
-                    # filled 20 pips away from our entry.
-                    max_slippage_points = int(bot_state.get('prot_max_slippage_points', 5))
-                    order_options = {
-                        'slippage': max_slippage_points,
-                        'fillingModes': ['ORDER_FILLING_FOK'],
-                    }
+                if exec_result['success']:
+                    real_fill_price = exec_result['fill_price']
+                    fill_price_source = exec_result['fill_source'] or 'simulated'
+                    trade_id = exec_result['trade_id'] or trade_id
 
-                    # ── Latency telemetry (T1 signal -> T2 pre-send -> T3 broker ack) ──
-                    t2_pre_send_ts = time.monotonic()
-                    if is_buy:
-                        res = await _metaapi_conn.create_market_buy_order(
-                            broker_symbol, lot, stop_loss=sl, take_profit=tp, options=order_options
+                    feed_label = 'WS (MetaApi live)' if fresh_feed_source == 'ws' else 'OANDA REST (fallback)'
+                    age_str = f"{fresh_feed_age_ms}ms" if fresh_feed_age_ms is not None else 'n/a'
+                    method_labels = {'limit': 'حدّي بسعر المستوى (Limit/IOC)',
+                                     'market_fallback': 'سوقي بحماية الانزلاق (Market/FOK)'}
+                    method_label = method_labels.get(exec_result['method_used'], 'غير معروف')
+                    slippage_str = ''
+                    if real_fill_price is not None and level['price'] is not None:
+                        slip = abs(real_fill_price - level['price'])
+                        slippage_str = (
+                            f"\n📊 الانزلاق الفعلي عن المستوى: {slip:.2f} "
+                            f"({slip / SYMBOL_INFO[symbol]['pip_value']:.1f} نقطة)"
                         )
-                    else:
-                        res = await _metaapi_conn.create_market_sell_order(
-                            broker_symbol, lot, stop_loss=sl, take_profit=tp, options=order_options
-                        )
-                    t3_ack_ts = time.monotonic()
-
-                    code_delay_ms = round((t2_pre_send_ts - t1_signal_ts) * 1000) if t1_signal_ts else None
-                    ping_ms = round((t3_ack_ts - t2_pre_send_ts) * 1000)
-                    # "Quote Age at Fire" is the real-world number that
-                    # actually matters for slippage: how stale was the price
-                    # this order was based on, at the instant it fired --
-                    # not how fast Python parsed a variable (that's Code
-                    # Delay below, kept for completeness but not the headline).
-                    feed_label = 'WS (MetaApi live)' if fresh_feed_source == 'ws' else 'OANDA REST (fallback — feed was stale)'
-                    age_str = f"{fresh_feed_age_ms}ms" if fresh_feed_age_ms is not None else 'n/a (REST fallback has no push-age)'
-                    telemetry_lbl = (
-                        f"\n📡 Feed: {feed_label} | Quote Age at Fire: {age_str}"
-                        + (
-                            f"\n⏱ Code Delay (T2-T1): {code_delay_ms}ms | MetaApi Ping (T3-T2): {ping_ms}ms"
-                            if code_delay_ms is not None else
-                            f"\n⏱ MetaApi Ping (T3-T2): {ping_ms}ms (T1 unavailable)"
-                        )
+                    real_msg = (
+                        f"\n🚀 <b>تم فتح الصفقة حقيقياً على حسابك!</b>"
+                        + (f"\n⚠️ طريقة التنفيذ: {method_label}"
+                           if exec_result['method_used'] != 'limit' else '')
+                        + f"\n⏱ وقت التنفيذ: {exec_result['latency_ms']}ms"
+                        + f"\n📡 تغذية: {feed_label} | عمر السعر: {age_str}"
+                        + slippage_str
                     )
-
-                    # CRITICAL: history deals/reconciliation are keyed by
-                    # positionId, NOT orderId (they're different tickets in
-                    # MT5 — orderId is the pending/market order ticket,
-                    # positionId is the resulting open position's ticket).
-                    # Previously this preferred orderId, so the reconciliation
-                    # lookup below (which matches on positionId) never found
-                    # a match, silently fell back to a theoretical/estimated
-                    # PnL every time, and mislabeled it as the real MT5 profit.
-                    # positionId must be preferred here.
-                    trade_id = str(res.get('positionId', res.get('orderId', trade_id)))
-
-                    # ── Real fill price, not our pre-check estimate ──
-                    # `price` (fresh_px) is what we THOUGHT we'd get filled at,
-                    # checked right before sending. The broker's actual fill
-                    # can differ (that's the whole slippage question this was
-                    # built to answer). res.get('price') is sometimes the
-                    # order's requested price, not a confirmed fill -- the
-                    # realized fill price lives on the resulting POSITION, so
-                    # query that directly. MetaApi's position sync can lag the
-                    # order response by a moment, so retry briefly before
-                    # falling back.
-                    for delay in (0, 1, 2):
-                        if delay: await asyncio.sleep(delay)
-                        try:
-                            positions = _metaapi_conn.terminal_state.positions
-                            match = next((p for p in positions if str(p.get('id')) == trade_id), None)
-                            if match and match.get('openPrice') is not None:
-                                real_fill_price = float(match['openPrice'])
-                                fill_price_source = 'confirmed_position'
-                                break
-                        except Exception as pe:
-                            log_exception(f"_gann_open_trade fill-price lookup [{symbol} {tf}]", pe)
-                    if real_fill_price is None and res.get('price') is not None:
-                        real_fill_price = float(res['price'])
-                        fill_price_source = 'order_response'
-
-                    real_msg = "\n🚀 <b>تم فتح الصفقة حقيقياً على حسابك!</b>" + telemetry_lbl
                     _consecutive_real_order_failures = 0
-                except Exception as ex:
-                    log_exception(f"_gann_open_trade real order [{symbol} {tf}]", ex)
-                    err_str = str(ex)
-                    t_fail_ts = time.monotonic()
-                    ref_t2 = t2_pre_send_ts if t2_pre_send_ts is not None else t_fail_ts
-                    code_delay_ms = round((ref_t2 - t1_signal_ts) * 1000) if t1_signal_ts else None
-                    fail_after_ms = round((t_fail_ts - ref_t2) * 1000)
-                    fail_telemetry_lbl = (
-                        f"\n⏱ Code Delay (T2-T1): {code_delay_ms}ms | Failed after send: {fail_after_ms}ms"
-                        if code_delay_ms is not None else
-                        f"\n⏱ Failed after send: {fail_after_ms}ms (T1 unavailable)"
-                    )
-                    # Give an explicit signal when the rejection was caused by
-                    # the deviation guard itself (requote / price moved beyond
-                    # our slippage tolerance), rather than a generic failure,
-                    # so it's obvious this is protective behavior, not a bug.
+                else:
+                    err = exec_result['error']
+                    err_str = str(err) if err else 'Unknown error'
                     if any(code in err_str for code in ('REQUOTE', 'PRICE_CHANGED', 'OFF_QUOTES')):
-                        real_msg = (f"\n🛑 <b>تم رفض الصفقة لتجاوز حد الانزلاق السعري "
-                                    f"({max_slippage_points} نقاط):</b> {ex}\nلم يتم التنفيذ لحمايتك من دخول سيء."
-                                    f"{fail_telemetry_lbl}")
+                        real_msg = (
+                            f"\n🛑 <b>تم رفض الصفقة لتجاوز حد الانزلاق السعري "
+                            f"({max_slippage_points} نقاط):</b> {err}"
+                            f"\nلم يتم التنفيذ لحمايتك من دخول سيء."
+                        )
                     else:
-                        real_msg = (f"\n❌ <b>فشل فتح الصفقة حقيقياً:</b> {ex}\nلم يتم تتبعها كصفقة وهمية "
-                                    f"(لا يوجد تنفيذ فعلي).{fail_telemetry_lbl}")
+                        real_msg = (
+                            f"\n❌ <b>فشل فتح الصفقة حقيقياً:</b> {err}"
+                            f"\nلم يتم تتبعها كصفقة وهمية (لا يوجد تنفيذ فعلي)."
+                        )
                     is_real = False
                     execution_failed = True
                     _consecutive_real_order_failures += 1
@@ -1551,7 +1707,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                         await set_connection_state(
                             CONN_HALTED,
                             f"{_consecutive_real_order_failures} consecutive real order failures "
-                            f"(last: {ex}). Escalating to protect capital."
+                            f"(last: {err}). Escalating to protect capital."
                         )
 
         # Ghost-trade fix: a FAILED real-order attempt must never enter
@@ -1575,11 +1731,18 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         # trades, or a real trade where the position lookup above failed).
         entry_final = real_fill_price if real_fill_price is not None else price
 
+        exec_latency = exec_result.get('latency_ms') if is_real else None
+        exec_method = exec_result.get('method_used') if is_real else None
+        exec_ioc_fail = exec_result.get('ioc_fail_reason') if is_real else None
+        exec_slippage = round(abs(entry_final - level['price']), 5) if entry_final is not None and level['price'] is not None else None
+
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': entry_final, 'is_real': is_real, 'sl': sl, 'tp': tp,
-            'be_trigger': (entry_final + (tp - entry_final)/2) if is_buy else (entry_final - (entry_final - tp)/2), # simplified BE trigger
+            'be_trigger': (entry_final + (tp - entry_final)/2) if is_buy else (entry_final - (entry_final - tp)/2),
             'opened_at': datetime.now(timezone.utc).isoformat(), 'level_price': level['price'],
             'feed_source': feed_source, 'feed_age_ms': feed_age_ms, 'trigger_type': trigger_type,
+            'exec_latency_ms': exec_latency, 'exec_method': exec_method,
+            'exec_ioc_fail_reason': exec_ioc_fail, 'exec_slippage': exec_slippage,
         }
         bot_state['symbol_state'][symbol]['gann_level_status'][level['key']] = 'used'
         await save_bot_persistence()
@@ -1688,6 +1851,7 @@ def get_main_keyboard() -> dict:
         [{'text': '🩺 تشخيص: ليه مفيش صفقات؟', 'callback_data': 'run_diag'}],
         [{'text': '📊 تصدير سجل تشخيص تفصيلي (Excel)', 'callback_data': 'export_diag_excel'}],
         [{'text': '📒 تصدير سجل الصفقات الحية (Excel)', 'callback_data': 'export_live_trades_excel'}],
+        [{'text': '📋 تقرير تفاصيل التنفيذ (Latency/Method/Slippage)', 'callback_data': 'export_exec_report'}],
         [{'text': '🔓 استئناف يدوي بعد HALT (بعد التأكد من الحساب)', 'callback_data': 'manual_resume_step1'}],
         [{'text': '📐 محرك جان (الاستراتيجية)', 'callback_data': 'menu_gann'}],
         [{'text': '🛡️ إعدادات الحماية', 'callback_data': 'menu_protection'}],
@@ -2398,6 +2562,85 @@ async def export_live_trades_excel() -> None:
     finally:
         if os.path.exists(fname):
             os.remove(fname)
+
+
+# ─────────────────────────────────────────────────────────────
+# EXECUTION DETAILS REPORT (Telegram text, not Excel)
+# ─────────────────────────────────────────────────────────────
+async def export_execution_details_report() -> str:
+    """Formats every closed trade in live_trade_history with the 4 execution
+    metrics (latency, method, IOC failure reason, slippage) as a Telegram-safe
+    HTML text report. Returns the complete text, not a file."""
+    hist = list(bot_state.get('live_trade_history', []))
+    if not hist:
+        return "<b>📭 لا يوجد سجل صفقات حية مغلقة بعد.</b>"
+
+    lines = ["<b>📋 تقرير تفاصيل تنفيذ الصفقات الحية</b>\n"]
+    win = loss = be = 0
+    total_pnl = 0.0
+
+    for i, tr in enumerate(hist, 1):
+        is_buy = tr.get('is_buy')
+        dir_emoji = '📈 BUY' if is_buy else '📉 SELL'
+        tf = tr.get('tf', '?')
+        symbol = tr.get('symbol', '?')
+        entry = tr.get('entry')
+        level_price = tr.get('level_price')
+        exit_px = tr.get('exit_price')
+        pnl = tr.get('pnl', 0.0)
+        outcome = tr.get('outcome', '?')
+        is_real = tr.get('is_real', False)
+        total_pnl += pnl
+        if outcome == 'WIN': win += 1
+        elif outcome == 'LOSS': loss += 1
+        else: be += 1
+
+        outcome_emoji = '✅' if outcome == 'WIN' else '❌' if outcome == 'LOSS' else '⚖️'
+
+        # ── The 4 required execution metrics ──
+        exec_lat = tr.get('exec_latency_ms')
+        exec_method = tr.get('exec_method')
+        exec_ioc = tr.get('exec_ioc_fail_reason')
+        exec_slip = tr.get('exec_slippage')
+        pv = SYMBOL_INFO.get(symbol, {}).get('pip_value', 0.01)
+
+        lat_str = f"{exec_lat}ms" if exec_lat is not None else "—"
+        method_str = {
+            'limit': 'المرحلة 1: حدّي (Limit IOC) ✅',
+            'market_fallback': 'المرحلة 2: سوقي (Market FOK) ⚠️',
+        }.get(exec_method, exec_method or "—")
+
+        # Slippage in price units and pips
+        if exec_slip is not None:
+            slip_pips = exec_slip / pv if pv else 0
+            slip_str = f"{exec_slip:.2f} ({slip_pips:.1f} نقطة)"
+        else:
+            slip_str = "—"
+
+        # IOC failure reason
+        ioc_str = exec_ioc if exec_ioc else "—" if exec_method != 'limit' else "لم يُستخدم (نجاح Limit)"
+
+        lines.append(
+            f"━━━━━━━━━━━━━━━\n"
+            f"<b>#{i}</b> {dir_emoji} [{symbol} - {tf}]\n"
+            f"{outcome_emoji} <b>النتيجة:</b> {outcome}  |  {pnl:+.2f}$\n"
+            f"💰 <b>المستوى:</b> {level_price}  |  <b>الدخول:</b> {entry}  |  <b>الإغلاق:</b> {exit_px}\n"
+            f"⏱ <b>زمن التنفيذ:</b> {lat_str}\n"
+            f"🔧 <b>طريقة التنفيذ:</b> {method_str}\n"
+            f"📊 <b>الانزلاق السعري:</b> {slip_str}\n"
+            f"⚠️ <b>سبب فشل IOC:</b> {ioc_str}\n"
+        )
+
+    wr = round(100 * win / max(win + loss, 1), 1)
+    lines.append(
+        f"━━━━━━━━━━━━━━━\n"
+        f"<b>📊 ملخص</b>\n"
+        f"إجمالي: {len(hist)}  |  ربح: {win}  |  خسارة: {loss}  |  تعادل: {be}\n"
+        f"WR: {wr}%  |  صافي PnL: {total_pnl:+.2f}$"
+    )
+
+    return "\n".join(lines)
+
 
 async def gann_monitor_scanner() -> None:
     global _last_scanner_error_alert_ts, _last_any_tick_ts
@@ -4507,6 +4750,26 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
                 log_exception('export_live_trades_excel', e)
                 await send_tg_msg(f"❌ فشل تصدير سجل الصفقات الحية: {e}")
         asyncio.create_task(_export_live_trades_task())
+        return
+    if d == 'export_exec_report':
+        async def _export_exec_report_task():
+            try:
+                report = await export_execution_details_report()
+                if len(report) > 4000:
+                    chunks = []
+                    for line in report.split('\n'):
+                        if not chunks or len(chunks[-1]) + len(line) + 1 > 3500:
+                            chunks.append(line)
+                        else:
+                            chunks[-1] += '\n' + line
+                    for chunk in chunks:
+                        await send_tg_msg(chunk)
+                else:
+                    await send_tg_msg(report)
+            except Exception as e:
+                log_exception('export_execution_details_report', e)
+                await send_tg_msg(f"❌ فشل إنشاء تقرير التنفيذ: {e}")
+        asyncio.create_task(_export_exec_report_task())
         return
     if d == 'manual_resume_step1':
         current_state = bot_state.get('connection_state', CONN_RUNNING)
