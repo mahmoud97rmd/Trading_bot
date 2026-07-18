@@ -139,6 +139,12 @@ _QUOTE_STALE_SECONDS = 5.0
 _last_any_tick_ts = time.monotonic()
 _WS_WATCHDOG_STALE_SECONDS = 60.0
 
+# ── Live-Twin tick bridge ──
+# Shared asyncio.Queue fed by _GannPriceListener and consumed by the
+# real-time forward paper-trading loop in backtest.py.  Queue is
+# write-discard (put_nowait) so it never blocks the price listener.
+_live_twin_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+
 _metaapi = None
 _metaapi_account = None
 _metaapi_conn = None
@@ -166,6 +172,15 @@ class _GannPriceListener(SynchronizationListener):
         live_quotes[data_sym] = {'bid': bid, 'ask': ask, 'mid': mid, 'ts': time.monotonic()}
         from execution import _gann_tick_fire_check
         _safe_task(_gann_tick_fire_check(data_sym, mid, 0.0), 'tick_fire_check')
+        from state import bot_state as _bs
+        if _bs.get('is_live_twin_running', False):
+            try:
+                _live_twin_queue.put_nowait({
+                    'symbol': data_sym, 'bid': bid, 'ask': ask, 'mid': mid,
+                    'ts': time.monotonic()
+                })
+            except asyncio.QueueFull:
+                pass
 
     async def on_connected(self, instance_index, replicas):
         c_log("MetaAPI streaming connection established (price feed live).")

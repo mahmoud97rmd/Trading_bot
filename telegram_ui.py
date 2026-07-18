@@ -911,8 +911,10 @@ async def _pfx_lt(d, chat_id, msg_id, sym, sym_state):
         days = int(d.split('_')[1]); end_dt = datetime.now(timezone.utc); start_dt = end_dt - timedelta(days=days)
         if not bot_state['is_live_twin_running']:
             bot_state['is_live_twin_running'] = True
-            from backtest import run_live_twin_simulation
+            from backtest import run_live_twin_simulation, run_live_twin_forward
             _safe_task(run_live_twin_simulation(start_dt, end_dt), 'livetwin_preset')
+            if bot_state.get('lt_mode', 'realistic') == 'realistic':
+                _safe_task(run_live_twin_forward(), 'livetwin_forward')
         await _show(chat_id, msg_id, '⏳ Live-Twin يعمل...', get_live_twin_keyboard())
     except ValueError: pass
 
@@ -1034,8 +1036,10 @@ async def process_tg_update(update: dict) -> None:
                     dt = (dam_midnight - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_live_twin_running']:
                         bot_state['is_live_twin_running'] = True
-                        from backtest import run_live_twin_simulation
+                        from backtest import run_live_twin_simulation, run_live_twin_forward
                         _safe_task(run_live_twin_simulation(dt, dt + timedelta(days=1)), 'livetwin_cmd')
+                        if bot_state.get('lt_mode', 'realistic') == 'realistic':
+                            _safe_task(run_live_twin_forward(), 'livetwin_forward')
                     await send_tg_msg(f"⏳ جاري Live-Twin ليوم {parts[1]}...")
                     return
                 elif len(parts) == 3:
@@ -1045,8 +1049,10 @@ async def process_tg_update(update: dict) -> None:
                     dt2 = (dam_midnight2 - DAM_OFF).replace(tzinfo=timezone.utc)
                     if not bot_state['is_live_twin_running']:
                         bot_state['is_live_twin_running'] = True
-                        from backtest import run_live_twin_simulation
+                        from backtest import run_live_twin_simulation, run_live_twin_forward
                         _safe_task(run_live_twin_simulation(dt1, dt2), 'livetwin_range_cmd')
+                        if bot_state.get('lt_mode', 'realistic') == 'realistic':
+                            _safe_task(run_live_twin_forward(), 'livetwin_forward')
                     await send_tg_msg(f"⏳ جاري Live-Twin من {parts[1]} إلى {parts[2]}...")
                     return
             except Exception:
