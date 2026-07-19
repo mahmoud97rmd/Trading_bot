@@ -21,10 +21,16 @@ from state import (
     _debounced_persist_save, save_bot_persistence, log_exception, c_log,
     is_trading_allowed, set_connection_state, _record_closed_trade_history,
 )
+import market_data
 from market_data import (
-    live_quotes, _metaapi_conn, _metaapi_account, _lq_price_with_fallback,
+    live_quotes, _lq_price_with_fallback,
     _resolve_broker_symbol, _tick_semaphore, _gann_cache,
 )
+# NOTE: _metaapi_conn is intentionally NOT imported via `from market_data import
+# _metaapi_conn` -- that freezes a stale copy (None, since market_data hasn't
+# connected yet at import time) that never updates when market_data.py later
+# reassigns its own global. Every function below that needs the live connection
+# re-reads `market_data._metaapi_conn` fresh instead.
 from strategy import (
     _gann_calc_tpsl, _gann_tf_tp, _gann_tf_sl,
     core_eval_break_even, core_eval_outcome,
@@ -85,6 +91,7 @@ async def _fill_monitor_loop():
     try:
         while True:
             await asyncio.sleep(0.05)
+            _metaapi_conn = market_data._metaapi_conn
             if not _fill_events or _metaapi_conn is None:
                 continue
             try:
@@ -124,6 +131,7 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
                                 level_price: float, sl: float, tp: float,
                                 t1_signal_ts: float,
                                 max_slippage_points: int) -> dict:
+    _metaapi_conn = market_data._metaapi_conn
     broker_symbol = _resolve_broker_symbol(symbol)
     trade_id = None; fill_price = None; fill_source = None
     method_used = None; error = None; ioc_fail_reason = None
@@ -324,6 +332,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                             feed_source: str = None, feed_age_ms: float = None,
                             trigger_type: str = None, combo_key: str = None) -> None:
     global _consecutive_real_order_failures
+    _metaapi_conn = market_data._metaapi_conn
     sym_state = bot_state['symbol_state'][symbol]
 
     if not await is_trading_allowed():
@@ -607,6 +616,7 @@ async def _gann_tick_fire_check(symbol: str, live_px: float, feed_age_ms: float)
 
 # ── Trade Closure ──
 async def _close_metaapi_trade(symbol: str, tid: str, sym_state: dict) -> bool:
+    _metaapi_conn = market_data._metaapi_conn
     if not _metaapi_conn:
         from telegram_ui import send_tg_msg
         await send_tg_msg(f"🛑 <b>تعذّر إغلاق صفقة {symbol} ({tid}):</b> لا يوجد اتصال MetaAPI.")
@@ -648,6 +658,7 @@ async def _close_metaapi_trades_batch(closures: list) -> None:
 
     if not closures:
         return
+    _metaapi_conn = market_data._metaapi_conn
     if not _metaapi_conn:
         from telegram_ui import send_tg_msg
         detail = "\n\n".join(f"{symbol}: {_trade_detail_line(tr)}" for symbol, _, _, tr in closures)

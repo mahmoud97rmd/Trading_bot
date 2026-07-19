@@ -31,10 +31,14 @@ from state import (
     save_bot_persistence, set_connection_state, _write_presets_file_sync,
 )
 from market_data import (
-    _lq_subscribe_symbol, _metaapi_conn, _metaapi_account,
+    _lq_subscribe_symbol,
     init_metaapi, _bootstrap_metaapi_connection, live_quotes,
     _QUOTE_STALE_SECONDS, _lq_price_with_fallback,
 )
+# _metaapi_conn / _metaapi_account are deliberately not imported by value here --
+# see the note at the top of gann_monitor.py. If this file ever needs the live
+# connection object, use `import market_data` and read `market_data._metaapi_conn`
+# fresh at the point of use.
 from strategy import (
     _anchor_label, _anchor_hours, gann_calc_levels, gann_active_levels,
     _gann_fmt_levels_msg, _gann_fetch_last_closed_anchor,
@@ -195,6 +199,7 @@ def get_gann_keyboard() -> dict:
         [{'text': '🛡️ إعدادات الحماية المتقدمة', 'callback_data': 'menu_protection'}],
         [{'text': f'📐 {sym} — دورة: {cyc}  |  صفقات: {open_n}', 'callback_data': 'noop'}],
         [{'text': '🔄 عرض الدعوم والمقاومات الحالية', 'callback_data': 'gann_show_levels'}],
+        [{'text': '🚀 بدء دورة جديدة الآن (يدوياً)', 'callback_data': 'gann_force_new_cycle'}],
         [{'text': '🕯️ تشخيص: آخر 10 شموع', 'callback_data': 'gann_show_last10'}],
         [{'text': '── أزواج التداول ──', 'callback_data': 'noop'}],
     ]
@@ -676,6 +681,54 @@ async def _cb_gann_show_levels(chat_id, msg_id, sym, sym_state):
         else:
             await send_tg_msg('❌ تعذّر جلب البيانات.'); return
     await send_tg_msg(_gann_fmt_levels_msg(sym, sym_state['gann_close_used']))
+    await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
+
+@_exact('gann_force_new_cycle')
+async def _cb_gann_force_new_cycle(chat_id, msg_id, sym, sym_state):
+    """Manually force-start a brand new Gann cycle right now for the selected
+    symbol, instead of waiting for the next anchor-timeframe candle to close.
+    Mirrors the logic in gann_cycle_manager (both the static_h1 and
+    dynamic_live paths) so the manually-built cycle behaves identically to
+    an automatically-built one."""
+    calc_mode = bot_state.get('gann_calculation_mode', 'static_h1')
+    now_utc = datetime.now(timezone.utc)
+
+    if calc_mode == 'dynamic_live':
+        live_px, _src, _age = await _lq_price_with_fallback(sym)
+        if live_px is None:
+            await send_tg_msg(f'❌ تعذّر جلب سعر حي لـ {sym} حالياً، حاول لاحقاً.')
+            return
+        close_used = live_px
+        h1_time = now_utc
+    else:
+        await send_tg_msg(f'⏳ جاري جلب آخر شمعة {_anchor_label()} لـ {sym}...')
+        last_anchor = await _gann_fetch_last_closed_anchor(sym)
+        if not last_anchor:
+            await send_tg_msg('❌ تعذّر جلب البيانات.'); return
+        close_used = float(last_anchor['close'])
+        h1_time = last_anchor['time']
+
+    sym_state['gann_levels'] = gann_calc_levels(sym, close_used)
+    sym_state['gann_close_used'] = close_used
+    sym_state['gann_last_h1_time'] = h1_time
+    sym_state['gann_cycle_started_at'] = now_utc
+    sym_state['gann_level_status'] = {}
+    sym_state['gann_cycle_active'] = True
+
+    if calc_mode == 'dynamic_live':
+        from market_data import fetch_candles as _fc
+        from strategy import _gann_atr as _atr
+        sym_state['gann_atr_cache'] = {}
+        for tf in sym_state['gann_monitor_tfs']:
+            if sym_state['gann_monitor_tfs'].get(tf):
+                tf_candles = await _fc(sym, tf, count=sym_state['gann_atr_period'] + 50)
+                if tf_candles:
+                    sym_state['gann_atr_cache'][tf] = _atr(tf_candles, sym_state['gann_atr_period'])
+
+    await save_bot_persistence()
+    c_log(f'[{sym}] Manual cycle force-restart at close_used={close_used}')
+    await send_tg_msg(f"🚀 <b>تم بدء دورة جديدة يدوياً لـ {sym}</b>\n"
+                       + _gann_fmt_levels_msg(sym, close_used))
     await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
 
 @_exact('gann_show_last10')

@@ -28,12 +28,24 @@ from state import (
     log_exception, c_log, is_trading_allowed, set_connection_state,
     _record_closed_trade_history, _trade_history_lock,
 )
+import market_data
 from market_data import (
-    live_quotes, _metaapi_conn, _metaapi_account,
+    live_quotes,
     _lq_price_with_fallback, _force_full_reconnect,
     _gann_cache, fetch_candles, fetch_master_price,
-    _QUOTE_STALE_SECONDS, _WS_WATCHDOG_STALE_SECONDS, _last_any_tick_ts,
+    _QUOTE_STALE_SECONDS, _WS_WATCHDOG_STALE_SECONDS,
 )
+# NOTE: _metaapi_conn / _metaapi_account / _last_any_tick_ts are deliberately
+# NOT imported with `from market_data import ...` here. That syntax copies the
+# value that name pointed to AT IMPORT TIME into this module's namespace.
+# market_data.py later reassigns them with `global _metaapi_conn; _metaapi_conn = ...`
+# inside its own functions -- that only rebinds market_data's own copy, it never
+# updates the frozen copy that would live here. The result: this module would
+# see _metaapi_conn as permanently None and _last_any_tick_ts as whatever it was
+# the instant this module was first imported (long before the connection was
+# ever established) -- so the watchdog below would never fire.
+# Always read `market_data._metaapi_conn` / `market_data._last_any_tick_ts`
+# fresh at the point of use instead.
 from strategy import (
     gann_calc_levels, gann_active_levels, _gann_atr, _gann_fetch_last_closed_anchor,
     _gann_tf_tp, _gann_tf_sl, _anchor_label, _anchor_hours,
@@ -55,13 +67,17 @@ RECONCILIATION_INTERVAL_SECONDS = 300
 # ── Live Scanner ──
 async def gann_monitor_scanner() -> None:
     global _last_scanner_error_alert_ts
-    from market_data import _last_any_tick_ts
     c_log('Gann live scanner started.')
     while True:
         try:
             # Stale tick watchdog: if no tick for >60s, trigger full reconnect.
             # Connection management is in market_data.py (init_metaapi / _bootstrap).
             # Scanner reads from the shared live_quotes cache ONLY.
+            # Read these fresh from the market_data module every iteration --
+            # see the comment at the top of this file for why a plain
+            # `from market_data import _metaapi_conn` would freeze them.
+            _metaapi_conn = market_data._metaapi_conn
+            _last_any_tick_ts = market_data._last_any_tick_ts
             active_syms_now = [s for s, on in bot_state['active_symbols'].items() if on]
             if (_metaapi_conn is not None and active_syms_now and _is_market_hours_now()
                     and (time.monotonic() - _last_any_tick_ts) > _WS_WATCHDOG_STALE_SECONDS):
@@ -432,6 +448,7 @@ async def global_ledger_reconciliation() -> None:
     while True:
         try:
             await asyncio.sleep(RECONCILIATION_INTERVAL_SECONDS)
+            _metaapi_conn = market_data._metaapi_conn
             if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING or not _metaapi_conn:
                 continue
             try:
