@@ -33,7 +33,7 @@ from state import (
 from market_data import (
     _lq_subscribe_symbol,
     init_metaapi, _bootstrap_metaapi_connection, live_quotes,
-    _QUOTE_STALE_SECONDS, _lq_price_with_fallback,
+    _QUOTE_STALE_SECONDS, _lq_price_with_fallback, fetch_master_price,
 )
 # _metaapi_conn / _metaapi_account are deliberately not imported by value here --
 # see the note at the top of gann_monitor.py. If this file ever needs the live

@@ -259,7 +259,7 @@ async def _restart_oanda_stream() -> None:
         _oanda_stream_task.cancel()
         try:
             await asyncio.wait_for(_oanda_stream_task, timeout=5)
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             pass
     _oanda_stream_task = _safe_task(_oanda_price_stream_loop(), 'oanda_price_stream')
 
@@ -296,10 +296,16 @@ async def init_oanda_price_feed() -> None:
     for sym, on in bot_state['active_symbols'].items():
         if on:
             _oanda_stream_symbols.add(sym)
-    if _oanda_stream_symbols:
-        await _restart_oanda_stream()
-    else:
+    if not _oanda_stream_symbols:
         c_log("init_oanda_price_feed: no active symbols yet -- stream starts once one is activated.")
+    elif _oanda_stream_task is not None and not _oanda_stream_task.done():
+        # _bootstrap_metaapi_connection() (called from init_metaapi(), earlier
+        # in startup) already brought the stream up via _lq_subscribe_symbol ->
+        # _ensure_oanda_stream_symbol. Don't cancel/restart a stream that's
+        # already connected and healthy.
+        c_log("init_oanda_price_feed: stream already running from startup subscription -- skipping restart.")
+    else:
+        await _restart_oanda_stream()
 
 
 # ---------------------------------------------------------------------------
