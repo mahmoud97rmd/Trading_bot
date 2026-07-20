@@ -156,6 +156,10 @@ def get_protection_keyboard() -> dict:
         [{'text': '── الحماية المتقدمة ──', 'callback_data': 'noop'}],
         [{'text': f"مزامنة MT4: {'✅' if bot_state.get('prot_true_sync', True) else '🔴'}", 'callback_data': 'tg_prot_sync'}],
         [{'text': f"إلغاء الدورة وقت الانفجار: {'✅' if bot_state.get('prot_cycle_inval', True) else '🔴'}", 'callback_data': 'tg_prot_inval'}],
+        [{'text': f"فلتر انفجار السعر عند الدخول (Hybrid): {'✅' if bot_state.get('prot_spike_filter', True) else '🔴'}", 'callback_data': 'tg_prot_spike'}],
+        [{'text': f"حد الانفجار عند الدخول: {bot_state.get('gann_spike_limit_pts', 20)} نقطة", 'callback_data': 'noop'}],
+        [{'text': '➖ 5 نقاط', 'callback_data': 'gann_dec_spike'},
+         {'text': '➕ 5 نقاط', 'callback_data': 'gann_inc_spike'}],
         [{'text': f"BE شامل التكلفة: {'✅' if bot_state.get('prot_cost_be', True) else '🔴'}", 'callback_data': 'tg_prot_cost'}],
         [{'text': f"فلتر البيانات المتأخرة: {'✅' if bot_state.get('prot_stale_filter', True) else '🔴'}", 'callback_data': 'tg_prot_stale'}],
         [{'text': f"إطار مرجعي للجان: {bot_state.get('gann_anchor_tf', '1h').upper()}", 'callback_data': 'tg_prot_anchor'}],
@@ -612,6 +616,21 @@ async def _cb_tg_prot_sync(chat_id, msg_id, sym, sym_state):
 @_exact('tg_prot_inval')
 async def _cb_tg_prot_inval(chat_id, msg_id, sym, sym_state):
     bot_state['prot_cycle_inval'] = not bot_state.get('prot_cycle_inval', True)
+    await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+
+@_exact('tg_prot_spike')
+async def _cb_tg_prot_spike(chat_id, msg_id, sym, sym_state):
+    bot_state['prot_spike_filter'] = not bot_state.get('prot_spike_filter', True)
+    await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+
+@_exact('gann_dec_spike')
+async def _cb_gann_dec_spike(chat_id, msg_id, sym, sym_state):
+    bot_state['gann_spike_limit_pts'] = max(5, bot_state.get('gann_spike_limit_pts', 20) - 5)
+    await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+
+@_exact('gann_inc_spike')
+async def _cb_gann_inc_spike(chat_id, msg_id, sym, sym_state):
+    bot_state['gann_spike_limit_pts'] = min(200, bot_state.get('gann_spike_limit_pts', 20) + 5)
     await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
 
 @_exact('tg_prot_cost')

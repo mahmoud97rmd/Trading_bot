@@ -244,6 +244,8 @@ async def gann_monitor_scanner() -> None:
                         trade_pl = round(diff * sym_state['lot_size'] * cs, 2)
                         tr['last_known_pl'] = trade_pl
 
+                        broker_confirmed_still_open = (is_real and bot_state.get('prot_true_sync', True)
+                                                        and _metaapi_conn and tid in actual_positions)
                         if is_real and bot_state.get('prot_true_sync', True) and _metaapi_conn:
                             if tid not in actual_positions:
                                 exact_pnl = trade_pl; found_deal = False
@@ -274,7 +276,22 @@ async def gann_monitor_scanner() -> None:
                                 trade_pl = _safe_float(actual_positions[tid].get('unrealizedProfit'), trade_pl)
 
                         from strategy import core_eval_outcome, core_eval_break_even
-                        outcome = core_eval_outcome(is_buy, active_px, tp, sl)
+                        # CRITICAL: for a real trade the broker itself confirms is still
+                        # open (broker_confirmed_still_open), we must NEVER decide it
+                        # "hit TP/SL" from this OANDA 1m-candle proxy price. OANDA and
+                        # the broker's own live price can genuinely disagree (different
+                        # feed, different spread) -- if OANDA's price looks like it
+                        # crossed TP while the broker's real price hasn't, this branch
+                        # would mark the trade closed/WIN internally and stop tracking
+                        # it, while the REAL position stays open and unmonitored on the
+                        # broker and can go on to hit a REAL stop-loss later (this is
+                        # exactly what produced a live report showing "WIN" on a trade
+                        # that MT5's own history shows closed at the stop-loss price).
+                        # The broker (via actual_positions / history_deals above) is the
+                        # only authority allowed to close a broker-confirmed-open real
+                        # trade. This simulated check is only valid for a VIRTUAL trade,
+                        # or a real trade we currently have no broker confirmation for.
+                        outcome = None if broker_confirmed_still_open else core_eval_outcome(is_buy, active_px, tp, sl)
                         if bot_state.get('prot_cost_be', True) and sym_state.get('break_even_enabled') and not tr.get('be_activated'):
                             be_pts = sym_state.get('gann_be_trigger_points', 40)
                             net_be = core_eval_break_even(is_buy, entry, active_px,
@@ -652,7 +669,7 @@ async def gann_run_diagnostics() -> str:
                 if abs(closed_close - nearest['price']) > margin:
                     reason_blocked.append(f"وضع Close: الإغلاق بعيد")
             elif within_margin and exec_mode == 'hybrid':
-                if abs(live_px - closed_close) > spike_limit:
+                if bot_state.get('prot_spike_filter', True) and abs(live_px - closed_close) > spike_limit:
                     reason_blocked.append(f"وضع Hybrid: قفزة سعرية")
             status_icon = '✅ جاهز للدخول' if (within_margin and not reason_blocked) else ('🛑 ' + ' | '.join(reason_blocked))
             dir_lbl = 'دعم/شراء 🟢' if nearest['is_buy'] else 'مقاومة/بيع 🔴'

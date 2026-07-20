@@ -424,7 +424,7 @@ async def run_gann_backtest(start_dt: datetime, end_dt: datetime) -> None:
                                     if abs(bar_close - lv['price']) > margin: continue
                                 elif channel == 'hybrid':
                                     if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
-                                    if abs(bar_close - lv['price']) > spike_limit: continue
+                                    if bot_state.get('prot_spike_filter', True) and abs(bar_close - lv['price']) > spike_limit: continue
                                 else:
                                     if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
 
@@ -891,7 +891,7 @@ async def run_live_twin_simulation(start_dt: datetime, end_dt: datetime) -> None
                                     if abs(bar_close - lv['price']) > margin: continue
                                 elif channel == 'hybrid':
                                     if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
-                                    if prev_bar_close is not None and abs(bar_close - prev_bar_close) > spike_limit: continue
+                                    if bot_state.get('prot_spike_filter', True) and prev_bar_close is not None and abs(bar_close - prev_bar_close) > spike_limit: continue
                                 else:
                                     if not (bar_low - margin <= lv['price'] <= bar_high + margin): continue
 

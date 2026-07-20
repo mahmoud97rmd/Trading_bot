@@ -174,7 +174,6 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
 
     limit_opts = {
         'slippage': max_slippage_points,
-        'comment': 'limit_buy_gann' if is_buy else 'limit_sell_gann',
         'expirationType': 'ORDER_TIME_SPECIFIED',
         'expiration': datetime.utcnow() + timedelta(seconds=30),
     }
@@ -267,7 +266,6 @@ async def _execute_smart_order(symbol: str, is_buy: bool, lot: float,
     market_opts = {
         'slippage': adaptive_slip_pts,
         'fillingModes': ['ORDER_FILLING_FOK'],
-        'comment': 'market_buy_fbk' if is_buy else 'market_sell_fbk',
     }
 
     t_start = time.monotonic()
@@ -426,6 +424,28 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                     real_fill_price = exec_result['fill_price']
                     fill_price_source = exec_result['fill_source'] or 'simulated'
                     trade_id = exec_result['trade_id'] or trade_id
+
+                    # Rebase TP/SL onto the ACTUAL broker fill price. Until now
+                    # tp/sl were computed from `price` (the live quote at signal
+                    # time, BEFORE the order was sent) and never revisited --
+                    # if the real fill slipped away from `price`, the true
+                    # risk/reward the broker is enforcing silently drifted from
+                    # what was intended (e.g. a worse buy fill quietly shrinks
+                    # the real SL distance and widens the real TP distance).
+                    # Keep the same point-distance from entry, just re-anchor it
+                    # on the real fill, and push the correction to the broker so
+                    # its enforced TP/SL actually matches what we intended.
+                    if real_fill_price is not None and abs(real_fill_price - price) > 1e-9:
+                        tp_d = abs(tp - price); sl_d = abs(price - sl)
+                        tp = round(real_fill_price + tp_d, SYMBOL_INFO[symbol]['prec']) if is_buy else \
+                             round(real_fill_price - tp_d, SYMBOL_INFO[symbol]['prec'])
+                        sl = round(real_fill_price - sl_d, SYMBOL_INFO[symbol]['prec']) if is_buy else \
+                             round(real_fill_price + sl_d, SYMBOL_INFO[symbol]['prec'])
+                        try:
+                            await _metaapi_conn.modify_position(trade_id, stop_loss=sl, take_profit=tp)
+                        except Exception as e:
+                            log_exception(f'TP/SL rebase-on-fill modify_position [{symbol}/{trade_id}]', e)
+
                     from telegram_ui import send_tg_msg
                     slippage_str = ''
                     if real_fill_price is not None and level['price'] is not None:
@@ -588,7 +608,7 @@ async def _gann_tick_fire_check(symbol: str, live_px: float, feed_age_ms: float)
                             if abs(closed_close - lv['price']) > margin: continue
                         elif channel == 'hybrid':
                             if abs(check_px - lv['price']) > margin: continue
-                            if abs(check_px - closed_close) > spike_limit: continue
+                            if bot_state.get('prot_spike_filter', True) and abs(check_px - closed_close) > spike_limit: continue
                         else:
                             if abs(check_px - lv['price']) > margin: continue
 
