@@ -695,10 +695,20 @@ def _lt_first_hit(path: np.ndarray, is_buy: bool, sl_px: float, tp_px: float) ->
 
 
 def _lt_slippage(bar_range: float, atr_val: float | None, rng: random.Random) -> float:
+    # Realistic retail slippage for a small XAU order is typically a few
+    # points, occasionally more in a fast market -- NOT a double-digit-dollar
+    # move. The previous constants (base=ref*0.06, cap=ref*0.5) meant slippage
+    # scaled almost linearly with, and routinely saturated at HALF of, the
+    # current single 1-minute candle's range. Any genuinely volatile bar
+    # (which a session like this one had many of) then produced $6-7+ of
+    # "slippage" on nearly every trade -- 10-50x larger than realistic
+    # execution slippage. Anchor the estimate to a small fixed floor (a
+    # realistic worst-case tick-level slippage) plus a much smaller fraction
+    # of volatility, and cap it far below the full bar range.
     ref = atr_val if atr_val and atr_val > 0 else max(bar_range, 0.05)
-    base = ref * 0.06
+    base = max(ref * 0.008, 0.015)
     tail = abs(rng.gauss(0, base))
-    return min(tail, ref * 0.5)
+    return min(tail, ref * 0.08, 0.60)
 
 
 def _lt_latency_shift(path: np.ndarray, steps: int, rng: random.Random) -> float:
