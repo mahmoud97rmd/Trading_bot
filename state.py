@@ -328,6 +328,8 @@ async def _record_closed_trade_history(symbol: str, tid: str, tr: dict, exit_px:
                 'exec_latency_ms': tr.get('exec_latency_ms'),
                 'exec_method': tr.get('exec_method'),
                 'exec_ioc_fail_reason': tr.get('exec_ioc_fail_reason'),
+                'conn_blocked_first_seen': tr.get('conn_blocked_first_seen'),
+                'conn_blocked_delay_min': tr.get('conn_blocked_delay_min'),
                 'exec_slippage': tr.get('exec_slippage'),
             })
             if len(hist) > _DIAG_LOG_MAX_ENTRIES:
@@ -395,6 +397,7 @@ def _make_symbol_state() -> dict:
         'gann_atr_period': 14,
         'gann_atr_sl_mult': 1.5,
         'gann_atr_tp_mult': 2,
+        'gann_pending_touch_blocked': {},  # level_key -> {'first_seen': iso str, 'price': float}
     }
 
 

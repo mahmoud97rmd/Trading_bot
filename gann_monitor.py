@@ -133,6 +133,42 @@ async def gann_monitor_scanner() -> None:
                         c_log(f"Live quote feed stale for {sym} -- resubscribing.")
                         await _lq_subscribe_symbol(sym)
 
+            # ── Connection-blocked touch detector ──
+            # Even while connection_state != CONN_RUNNING (so tick-driven
+            # entry detection in _gann_tick_fire_check can't fire, or simply
+            # isn't receiving ticks), independently sample price via the
+            # OANDA-backed fallback and check it against each symbol's active
+            # (untouched) Gann levels. If price is already within the entry
+            # margin of a level while we're blocked, record the FIRST moment
+            # this was true. Once the trade for that level eventually opens
+            # (after the connection recovers), _gann_open_trade looks this up
+            # and stamps the trade with how long it sat "ready but blocked" --
+            # this is what makes the delay visible/provable in the exported
+            # trade log instead of just being an unexplained late timestamp.
+            if bot_state.get('connection_state') != CONN_RUNNING:
+                for symbol in [s for s, on in bot_state['active_symbols'].items() if on]:
+                    sym_state = bot_state['symbol_state'][symbol]
+                    if not sym_state.get('gann_cycle_active'):
+                        continue
+                    try:
+                        chk_px, _src, _age = await _lq_price_with_fallback(symbol)
+                    except Exception:
+                        chk_px = None
+                    if chk_px is None:
+                        continue
+                    pv = SYMBOL_INFO[symbol]['pip_value']
+                    margin = sym_state.get('gann_touch_margin_pts', 5) * pv
+                    pending = sym_state.setdefault('gann_pending_touch_blocked', {})
+                    for lv in gann_active_levels(symbol):
+                        lkey = lv.get('key') or f"{lv.get('name')}_{lv['price']}"
+                        if abs(chk_px - lv['price']) <= margin and lkey not in pending:
+                            pending[lkey] = {
+                                'first_seen': datetime.now(timezone.utc).isoformat(),
+                                'price': chk_px,
+                            }
+                            c_log(f"[{symbol}] Level {lkey} touchable per fallback price ({chk_px}) "
+                                  f"but connection_state={bot_state.get('connection_state')} -- blocked.")
+
             now_dt = datetime.now(timezone.utc)
             today_date = now_dt.date()
             if bot_state.get('live_daily_date') != today_date:
@@ -173,6 +209,7 @@ async def gann_monitor_scanner() -> None:
                         if dist > inval_pts:
                             sym_state['gann_levels'] = []
                             sym_state['gann_close_used'] = None
+                            sym_state['gann_pending_touch_blocked'] = {}
                             from telegram_ui import send_tg_msg
                             await send_tg_msg(f"🚨 <b>إلغاء دورة {symbol}:</b> السعر تحرك بحدة!")
 
@@ -477,6 +514,7 @@ async def gann_cycle_manager() -> None:
                     sym_state['gann_last_h1_time'] = now_utc
                     sym_state['gann_cycle_started_at'] = now_utc
                     sym_state['gann_level_status'] = {}
+                    sym_state['gann_pending_touch_blocked'] = {}
                     sym_state['gann_atr_cache'] = {}
                     for tf in sym_state['gann_monitor_tfs']:
                         if sym_state['gann_monitor_tfs'].get(tf):
@@ -497,6 +535,7 @@ async def gann_cycle_manager() -> None:
                             sym_state['gann_last_h1_time'] = h1_time
                             sym_state['gann_cycle_started_at'] = now_utc
                             sym_state['gann_level_status'] = {}
+                            sym_state['gann_pending_touch_blocked'] = {}
                             c_log(f'[{symbol}] New {cycle_h}h cycle started at {h1_close}')
                             from telegram_ui import send_tg_msg
                             await send_tg_msg(f"🔄 <b>تحديث دورة جان ({cycle_h}h)</b>\nالزوج: {symbol}\nإغلاق {_anchor_label()}: {h1_close:.5f}")
@@ -715,7 +754,8 @@ async def export_live_trades_excel() -> None:
     headers = ["الزوج", "TF", "حقيقية/وهمية", "اتجاه", "وقت الفتح (DAM)", "وقت الإغلاق (DAM)",
                "المدة (د)", "مستوى الدخول", "الدخول الفعلي", "انزلاق الدخول", "TP", "SL",
                "سعر الإغلاق", "النتيجة", "ربح ($)", "مؤكد من الوسيط؟", "سبب الإغلاق",
-               "BE مفعّل؟", "مصدر التغذية", "عمر التغذية (ms)", "نوع التنفيذ"]
+               "BE مفعّل؟", "مصدر التغذية", "عمر التغذية (ms)", "نوع التنفيذ",
+               "⚠️ لامس والاتصال مقطوع؟", "تأخر الاتصال (د)"]
     ws.append(headers)
     gray_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
     for cell in ws[1]: cell.fill = gray_fill; cell.font = Font(bold=True)
@@ -736,6 +776,7 @@ async def export_live_trades_excel() -> None:
             try:
                 dt = datetime.fromisoformat(iso); return _utc_to_dam(dt).strftime('%Y-%m-%d %H:%M:%S')
             except Exception: return str(iso)
+        conn_delay = tr.get('conn_blocked_delay_min')
         row = [tr.get('symbol'), tr.get('tf'), 'حقيقية' if tr.get('is_real') else 'وهمية',
                'BUY 📈' if tr.get('is_buy') else 'SELL 📉', _dam(tr.get('opened_at')), _dam(tr.get('closed_at')),
                tr.get('duration_min'), tr.get('level_price'), tr.get('entry'), tr.get('entry_slippage'),
@@ -743,11 +784,16 @@ async def export_live_trades_excel() -> None:
                '✅' if tr.get('pnl_confirmed_from_broker') else '⚠️ تقديري',
                tr.get('close_reason'), '✅' if tr.get('be_activated') else '—',
                tr.get('feed_source') or '—', tr.get('feed_age_ms'),
-               _TRIGGER_DISPLAY.get(tr.get('trigger_type'), 'غير مسجَّل')]
+               _TRIGGER_DISPLAY.get(tr.get('trigger_type'), 'غير مسجَّل'),
+               '🛑 نعم' if conn_delay else '—', conn_delay if conn_delay else '—']
         ws.append(row)
         fill = green_fill if outcome == 'WIN' else red_fill if outcome == 'LOSS' else be_fill if outcome == 'BREAK_EVEN' else None
         if fill:
             for col in range(1, len(headers) + 1): ws.cell(row=ws.max_row, column=col).fill = fill
+        if conn_delay:
+            orange_fill = PatternFill(start_color="FFD9A0", end_color="FFD9A0", fill_type="solid")
+            ws.cell(row=ws.max_row, column=len(headers) - 1).fill = orange_fill
+            ws.cell(row=ws.max_row, column=len(headers)).fill = orange_fill
     thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
                           top=Side(style='thin'), bottom=Side(style='thin'))
     for row in ws.iter_rows():

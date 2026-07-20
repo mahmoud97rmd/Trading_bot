@@ -336,6 +336,13 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
     if not await is_trading_allowed():
         if bot_state.get('connection_state', CONN_RUNNING) != CONN_RUNNING:
             c_log(f"Skipped entry [{symbol} {tf}]: connection_state={bot_state.get('connection_state')}")
+            _lk_blocked = combo_key or level['key']
+            pending = sym_state.setdefault('gann_pending_touch_blocked', {})
+            if _lk_blocked not in pending:
+                pending[_lk_blocked] = {
+                    'first_seen': (detect_time or datetime.now(timezone.utc)).isoformat(),
+                    'price': initial_px,
+                }
         else:
             c_log(f"Skipped entry [{symbol} {tf}]: inside restricted DAM trading window")
         return
@@ -500,13 +507,27 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
         exec_ioc_fail = exec_result.get('ioc_fail_reason') if is_real and exec_result else None
         exec_slippage = round(abs(entry_final - level['price']), 5) if entry_final is not None and level['price'] is not None else None
 
+        opened_at_dt = datetime.now(timezone.utc)
+        pending = bot_state['symbol_state'][symbol].setdefault('gann_pending_touch_blocked', {})
+        blocked_info = pending.pop(_lk, None)
+        conn_blocked_first_seen = blocked_info['first_seen'] if blocked_info else None
+        conn_blocked_delay_min = None
+        if blocked_info:
+            try:
+                first_seen_dt = datetime.fromisoformat(blocked_info['first_seen'])
+                conn_blocked_delay_min = round((opened_at_dt - first_seen_dt).total_seconds() / 60, 1)
+            except Exception:
+                pass
+
         bot_state['symbol_state'][symbol]['gann_open_trades'][trade_id] = {
             'tf': tf, 'is_buy': is_buy, 'entry': entry_final, 'is_real': is_real,
-            'sl': sl, 'tp': tp, 'opened_at': datetime.now(timezone.utc).isoformat(),
+            'sl': sl, 'tp': tp, 'opened_at': opened_at_dt.isoformat(),
             'level_price': level['price'], 'feed_source': feed_source,
             'feed_age_ms': feed_age_ms, 'trigger_type': trigger_type,
             'exec_latency_ms': exec_latency, 'exec_method': exec_method,
             'exec_ioc_fail_reason': exec_ioc_fail, 'exec_slippage': exec_slippage,
+            'conn_blocked_first_seen': conn_blocked_first_seen,
+            'conn_blocked_delay_min': conn_blocked_delay_min,
         }
         bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
         await _debounced_persist_save()
@@ -523,12 +544,15 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
 
         close_used = bot_state['symbol_state'][symbol].get('gann_close_used')
         close_label = f'{close_used:.5f}' if close_used is not None else '-'
+        conn_delay_line = (f"⚠️ كان السعر لامساً منذ {conn_blocked_delay_min:.1f} دقيقة لكن الاتصال لم يكن متاحاً — "
+                           f"تأخر الفتح لهذا السبب.\n") if conn_blocked_delay_min else ""
 
         await send_tg_msg(
             f"<b>✅ {reason}</b>\n\n"
             f"المستوى: {level['price']:.2f}  |  الدخول: {entry_final:.2f}{entry_note}\n\n"
             f"TP: {tp}  SL: {sl}  |  {tpsl_lbl}{be_lbl}\n"
             f"{slippage_line}"
+            f"{conn_delay_line}"
             f"إغلاق {bot_state.get('gann_anchor_tf', '1h').upper()}: {close_label}\n"
             f"{real_msg}"
         )

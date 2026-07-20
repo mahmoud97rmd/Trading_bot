@@ -676,6 +676,7 @@ async def _cb_prot_reset_all(chat_id, msg_id, sym, sym_state):
         if ss.get('gann_close_used') is None and not ss.get('gann_levels'): continue
         frozen_symbols.append(sname); ss['gann_levels'] = []; ss['gann_close_used'] = None
         ss['gann_last_h1_time'] = None; ss['gann_cycle_started_at'] = None
+        ss['gann_pending_touch_blocked'] = {}
     await save_bot_persistence()
     await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
     summary = []
@@ -742,6 +743,7 @@ async def _cb_gann_force_new_cycle(chat_id, msg_id, sym, sym_state):
     sym_state['gann_last_h1_time'] = h1_time
     sym_state['gann_cycle_started_at'] = now_utc
     sym_state['gann_level_status'] = {}
+    sym_state['gann_pending_touch_blocked'] = {}
     sym_state['gann_cycle_active'] = True
 
     from market_data import fetch_candles as _fc
