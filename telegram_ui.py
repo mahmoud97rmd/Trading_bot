@@ -687,26 +687,36 @@ async def _cb_gann_show_levels(chat_id, msg_id, sym, sym_state):
 async def _cb_gann_force_new_cycle(chat_id, msg_id, sym, sym_state):
     """Manually force-start a brand new Gann cycle right now for the selected
     symbol, instead of waiting for the next anchor-timeframe candle to close.
-    Mirrors the logic in gann_cycle_manager (both the static_h1 and
-    dynamic_live paths) so the manually-built cycle behaves identically to
-    an automatically-built one."""
+
+    IMPORTANT: in static_h1 mode this does NOT anchor on the last closed H1/H4
+    candle's close price. That candle is very often the exact price the spike
+    -invalidation protection (prot_cycle_inval) just measured the live price
+    as being too far from -- reusing it would rebuild levels that are already
+    invalid, and the very next scanner tick would immediately cancel the cycle
+    again with "السعر تحرك بحدة" even though price hasn't moved again. Instead
+    we anchor on the CURRENT live price (what "start now" should mean), while
+    still recording the true last-closed-anchor time so the normal automatic
+    hourly re-anchor in gann_cycle_manager keeps working correctly afterward.
+    """
     calc_mode = bot_state.get('gann_calculation_mode', 'static_h1')
     now_utc = datetime.now(timezone.utc)
 
-    if calc_mode == 'dynamic_live':
-        live_px, _src, _age = await _lq_price_with_fallback(sym)
-        if live_px is None:
-            await send_tg_msg(f'❌ تعذّر جلب سعر حي لـ {sym} حالياً، حاول لاحقاً.')
-            return
-        close_used = live_px
-        h1_time = now_utc
-    else:
-        await send_tg_msg(f'⏳ جاري جلب آخر شمعة {_anchor_label()} لـ {sym}...')
+    h1_time = None
+    if calc_mode != 'dynamic_live':
         last_anchor = await _gann_fetch_last_closed_anchor(sym)
-        if not last_anchor:
-            await send_tg_msg('❌ تعذّر جلب البيانات.'); return
-        close_used = float(last_anchor['close'])
-        h1_time = last_anchor['time']
+        if last_anchor:
+            h1_time = last_anchor['time']
+
+    live_px, _src, _age = await _lq_price_with_fallback(sym)
+    if live_px is None:
+        await send_tg_msg(f'⏳ لا يوجد سعر حي متاح لـ {sym} الآن، جاري الجلب من OANDA...')
+        live_px = await fetch_master_price(sym)
+    if live_px is None:
+        await send_tg_msg(f'❌ تعذّر جلب سعر حالي لـ {sym}، حاول لاحقاً.')
+        return
+    close_used = live_px
+    if h1_time is None:
+        h1_time = sym_state.get('gann_last_h1_time') or now_utc
 
     sym_state['gann_levels'] = gann_calc_levels(sym, close_used)
     sym_state['gann_close_used'] = close_used
@@ -715,19 +725,18 @@ async def _cb_gann_force_new_cycle(chat_id, msg_id, sym, sym_state):
     sym_state['gann_level_status'] = {}
     sym_state['gann_cycle_active'] = True
 
-    if calc_mode == 'dynamic_live':
-        from market_data import fetch_candles as _fc
-        from strategy import _gann_atr as _atr
-        sym_state['gann_atr_cache'] = {}
-        for tf in sym_state['gann_monitor_tfs']:
-            if sym_state['gann_monitor_tfs'].get(tf):
-                tf_candles = await _fc(sym, tf, count=sym_state['gann_atr_period'] + 50)
-                if tf_candles:
-                    sym_state['gann_atr_cache'][tf] = _atr(tf_candles, sym_state['gann_atr_period'])
+    from market_data import fetch_candles as _fc
+    from strategy import _gann_atr as _atr
+    sym_state['gann_atr_cache'] = {}
+    for tf in sym_state['gann_monitor_tfs']:
+        if sym_state['gann_monitor_tfs'].get(tf):
+            tf_candles = await _fc(sym, tf, count=sym_state['gann_atr_period'] + 50)
+            if tf_candles:
+                sym_state['gann_atr_cache'][tf] = _atr(tf_candles, sym_state['gann_atr_period'])
 
     await save_bot_persistence()
-    c_log(f'[{sym}] Manual cycle force-restart at close_used={close_used}')
-    await send_tg_msg(f"🚀 <b>تم بدء دورة جديدة يدوياً لـ {sym}</b>\n"
+    c_log(f'[{sym}] Manual cycle force-restart at close_used={close_used} (live price)')
+    await send_tg_msg(f"🚀 <b>تم بدء دورة جديدة يدوياً لـ {sym} (بالسعر الحالي)</b>\n"
                        + _gann_fmt_levels_msg(sym, close_used))
     await _show(chat_id, msg_id, 'إعدادات جان:', get_gann_keyboard())
 

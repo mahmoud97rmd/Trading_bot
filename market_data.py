@@ -148,6 +148,7 @@ _live_twin_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
 _metaapi = None
 _metaapi_account = None
 _metaapi_conn = None
+_last_reconnect_alert_ts = 0.0  # throttles repeated Telegram alerts while stuck reconnecting
 
 # ── Strict Singleton: subscription set ──
 # Prevents duplicate subscribe_to_market_data() calls across the
@@ -224,12 +225,9 @@ async def _lq_subscribe_symbol(symbol: str) -> None:
 
 
 async def _force_full_reconnect(reason: str) -> None:
-    global _metaapi_conn, _last_any_tick_ts, _active_subscriptions
+    global _metaapi, _metaapi_account, _metaapi_conn, _last_any_tick_ts, _active_subscriptions, _last_reconnect_alert_ts
     c_log(f"WS WATCHDOG: forcing full reconnect -- {reason}")
     await set_connection_state(CONN_READ_ONLY, f"WS watchdog: {reason}")
-    if _metaapi_account is None:
-        c_log("WS WATCHDOG: _metaapi_account is None — cannot reconnect")
-        return
     try:
         if _metaapi_conn is not None:
             try:
@@ -237,6 +235,25 @@ async def _force_full_reconnect(reason: str) -> None:
             except Exception as e:
                 log_exception('_force_full_reconnect: close old connection', e)
         _active_subscriptions.clear()  # reset — re-subscribe below
+
+        # IMPORTANT: rebuild the ENTIRE MetaApi client + account object, not just
+        # the streaming connection. If the underlying websocket transport that
+        # `_metaapi` (and therefore `_metaapi_account`) was created on has died
+        # or degraded (e.g. after a long network blip), every new streaming
+        # connection built on top of that same stale client will keep hanging
+        # on connect()/wait_synchronized() and time out forever — even though a
+        # brand-new MetaApi client (like the one "فحص حالة الحساب" button
+        # creates) connects fine immediately. Recreating the client here from
+        # scratch is what actually fixes a stuck reconnect loop.
+        _metaapi = MetaApi(METAAPI_TOKEN)
+        _metaapi_account = await asyncio.wait_for(
+            _metaapi.metatrader_account_api.get_account(ACCOUNT_ID), timeout=20
+        )
+        if _metaapi_account.state != 'DEPLOYED':
+            c_log(f"WS WATCHDOG: account not DEPLOYED (state={_metaapi_account.state}) — will retry next scan cycle.")
+            await set_connection_state(CONN_READ_ONLY, f"WS watchdog: account state={_metaapi_account.state}")
+            return
+
         _metaapi_conn = _metaapi_account.get_streaming_connection()
         _metaapi_conn.add_synchronization_listener(_GannPriceListener())
         await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
@@ -251,15 +268,22 @@ async def _force_full_reconnect(reason: str) -> None:
         await send_tg_msg(f"🔁 <b>Watchdog: أعيد الاتصال تلقائياً بـ MetaApi</b>\nالسبب: {reason}")
     except asyncio.TimeoutError:
         c_log("WS WATCHDOG: reconnect attempt timed out -- will retry next scan cycle (~15s).")
-        from telegram_ui import send_tg_msg
-        await send_tg_msg(
-            f"🛑 <b>Watchdog: انتهت مهلة إعادة الاتصال (30s)</b>\nالسبب الأصلي: {reason}\n"
-            f"سيُعاد المحاولة تلقائياً بدورة فحص جديدة خلال ~15 ثانية."
-        )
+        now = time.monotonic()
+        if now - _last_reconnect_alert_ts > 180:  # throttle: at most one alert / 3 min
+            _last_reconnect_alert_ts = now
+            from telegram_ui import send_tg_msg
+            await send_tg_msg(
+                f"🛑 <b>Watchdog: انتهت مهلة إعادة الاتصال</b>\nالسبب الأصلي: {reason}\n"
+                f"سيُعاد المحاولة تلقائياً كل ~15 ثانية (تمت إعادة بناء عميل MetaApi بالكامل).\n"
+                f"⚠️ إذا استمر هذا لأكثر من بضع دقائق، قد تحتاج لإعادة تشغيل البوت يدوياً."
+            )
     except Exception as e:
         log_exception('_force_full_reconnect', e)
-        from telegram_ui import send_tg_msg
-        await send_tg_msg(f"🛑 <b>Watchdog: فشلت محاولة إعادة الاتصال التلقائي</b>\nالسبب الأصلي: {reason}\nالخطأ: {e}")
+        now = time.monotonic()
+        if now - _last_reconnect_alert_ts > 180:
+            _last_reconnect_alert_ts = now
+            from telegram_ui import send_tg_msg
+            await send_tg_msg(f"🛑 <b>Watchdog: فشلت محاولة إعادة الاتصال التلقائي</b>\nالسبب الأصلي: {reason}\nالخطأ: {e}")
 
 
 # ---------------------------------------------------------------------------
