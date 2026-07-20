@@ -31,7 +31,8 @@ from state import (
 import market_data
 from market_data import (
     live_quotes,
-    _lq_price_with_fallback, _force_full_reconnect,
+    _lq_price_with_fallback, _force_full_reconnect, _bootstrap_metaapi_connection,
+    _lq_is_stale, _lq_subscribe_symbol,
     _gann_cache, fetch_candles, fetch_master_price,
     _QUOTE_STALE_SECONDS, _WS_WATCHDOG_STALE_SECONDS,
 )
@@ -70,6 +71,16 @@ async def gann_monitor_scanner() -> None:
     c_log('Gann live scanner started.')
     while True:
         try:
+            # ── Cold-start self-heal ──
+            # If _metaapi_conn (or _metaapi_account) is still None, neither of
+            # the watchdogs below can do anything -- both require a connection
+            # object to already exist. This closes the gap where a transient
+            # MetaApi/broker hiccup during the ONE startup attempt would leave
+            # the bot in silent, permanent READ_ONLY forever. Retry from
+            # scratch here, every scanner tick, until it succeeds.
+            if market_data._metaapi_conn is None or market_data._metaapi_account is None:
+                await _bootstrap_metaapi_connection()
+
             # Stale tick watchdog: if no tick for >60s, trigger full reconnect.
             # Connection management is in market_data.py (init_metaapi / _bootstrap).
             # Scanner reads from the shared live_quotes cache ONLY.
@@ -85,6 +96,42 @@ async def gann_monitor_scanner() -> None:
                     f"لا تيك واحد وصل منذ {time.monotonic() - _last_any_tick_ts:.0f}s "
                     f"(الحد: {_WS_WATCHDOG_STALE_SECONDS:.0f}s)"
                 )
+
+            # ── MT5 Zombie Singleton Heartbeat ──
+            # Catches the case where connection_state is stuck away from
+            # CONN_RUNNING (e.g. _force_full_reconnect above keeps timing out)
+            # and escalates to a FULL client+account rebuild via
+            # _bootstrap_metaapi_connection(), with up to 5 attempts and
+            # exponential backoff (1s, 2s, 4s, 8s, 16s) within this one tick.
+            # This is intentionally heavier and rarer than the tick-silence
+            # watchdog above -- it only runs while genuinely stuck, not every
+            # 15s scan cycle, so it does not add meaningful extra MetaApi API
+            # traffic during a normal transient blip.
+            _metaapi_account = market_data._metaapi_account
+            if _metaapi_account and bot_state.get('connection_state') != CONN_RUNNING:
+                await set_connection_state(CONN_READ_ONLY, "MetaAPI connection lost — attempting reconnect.")
+                reconnected = False
+                for attempt in range(5):
+                    try:
+                        reconnected = await _bootstrap_metaapi_connection()
+                        if reconnected:
+                            c_log("MetaAPI Reconnected successfully (live quotes resubscribed).")
+                            break
+                    except Exception as e:
+                        log_exception(f"MetaAPI reconnect attempt {attempt+1}/5", e)
+                    await asyncio.sleep(2 ** attempt)
+                if not reconnected:
+                    c_log("MetaAPI reconnect exhausted 5 attempts this tick; will retry next cycle.")
+            # Feed-level staleness watchdog: connection_status can still say
+            # CONNECTED while a symbol's subscription silently dropped (no
+            # more ticks arriving). Caught independently of the connection-
+            # level check above, and just re-subscribes rather than tearing
+            # down the whole connection.
+            elif _metaapi_conn is not None:
+                for sym, on in bot_state['active_symbols'].items():
+                    if on and _lq_is_stale(sym):
+                        c_log(f"Live quote feed stale for {sym} -- resubscribing.")
+                        await _lq_subscribe_symbol(sym)
 
             now_dt = datetime.now(timezone.utc)
             today_date = now_dt.date()
