@@ -1,17 +1,22 @@
 """
-market_data.py — OANDA REST data fetching, MetaApi WebSocket streaming,
-live-quote cache, and connection management.
+market_data.py — OANDA REST data fetching + OANDA live price streaming,
+MetaApi execution-connection lifecycle, live-quote cache.
 
 Owns:
   - OANDA candle fetcher (fetch_candles, fetch_master_price)
-  - MetaApi connection bootstrap & lifecycle
-  - _GannPriceListener (WebSocket tick listener)
+  - OANDA live pricing stream (_oanda_price_stream_loop) -- this is the ONLY
+    source of live_quotes / tick-driven entry detection. Independent of
+    MetaApi entirely: reconnecting it never calls MetaApi and never touches
+    its quota.
+  - MetaApi connection bootstrap & lifecycle -- used ONLY for order
+    execution (placing/closing trades, reading open positions). It no
+    longer carries price ticks.
   - live_quotes cache, _gann_cache, tick semaphore
-  - WebSocket watchdog (_force_full_reconnect, _lq_subscribe_symbol)
   - Broker symbol resolution
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta, timezone, time as dtime
 
@@ -22,6 +27,7 @@ from metaapi_cloud_sdk import MetaApi, SynchronizationListener
 
 from state import (
     bot_state, METAAPI_TOKEN, ACCOUNT_ID, OANDA_TOKEN, OANDA_BASE_URL,
+    OANDA_ACCOUNT, OANDA_STREAM_URL,
     SYMBOL_INFO, CONN_RUNNING, CONN_READ_ONLY, CONN_HALTED,
     _state_lock, get_http, log_exception, c_log, _safe_task,
     set_connection_state,
@@ -129,65 +135,18 @@ async def fetch_master_price(symbol: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# LIVE QUOTES & WEBSOCKET
+# LIVE QUOTES CACHE (shared by both feeds, but only OANDA writes to it now)
 # ---------------------------------------------------------------------------
 live_quotes: dict[str, dict] = {}
-_broker_to_data_symbol: dict[str, str] = {}
 _tick_semaphore = asyncio.Semaphore(5)
 _gann_cache: dict[str, dict] = {}
 _QUOTE_STALE_SECONDS = 5.0
-_last_any_tick_ts = time.monotonic()
-_WS_WATCHDOG_STALE_SECONDS = 60.0
 
 # ── Live-Twin tick bridge ──
-# Shared asyncio.Queue fed by _GannPriceListener and consumed by the
+# Shared asyncio.Queue fed by the OANDA price stream and consumed by the
 # real-time forward paper-trading loop in backtest.py.  Queue is
 # write-discard (put_nowait) so it never blocks the price listener.
 _live_twin_queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
-
-_metaapi = None
-_metaapi_account = None
-_metaapi_conn = None
-_last_reconnect_alert_ts = 0.0  # throttles repeated Telegram alerts while stuck reconnecting
-
-# ── Strict Singleton: subscription set ──
-# Prevents duplicate subscribe_to_market_data() calls across the
-# entire bot lifecycle.  Once a symbol is subscribed it is NEVER
-# re-subscribed unless the connection is force-reconnected (in which
-# case the set is cleared).
-_active_subscriptions: set[str] = set()
-
-
-class _GannPriceListener(SynchronizationListener):
-    async def on_symbol_price_updated(self, instance_index, price):
-        global _last_any_tick_ts
-        _last_any_tick_ts = time.monotonic()
-        broker_sym = price.get('symbol')
-        data_sym = _broker_to_data_symbol.get(broker_sym)
-        if not data_sym:
-            return
-        bid = price.get('bid'); ask = price.get('ask')
-        if bid is None or ask is None:
-            return
-        mid = (bid + ask) / 2
-        live_quotes[data_sym] = {'bid': bid, 'ask': ask, 'mid': mid, 'ts': time.monotonic()}
-        from execution import _gann_tick_fire_check
-        _safe_task(_gann_tick_fire_check(data_sym, mid, 0.0), 'tick_fire_check')
-        from state import bot_state as _bs
-        if _bs.get('is_live_twin_running', False):
-            try:
-                _live_twin_queue.put_nowait({
-                    'symbol': data_sym, 'bid': bid, 'ask': ask, 'mid': mid,
-                    'ts': time.monotonic()
-                })
-            except asyncio.QueueFull:
-                pass
-
-    async def on_connected(self, instance_index, replicas):
-        c_log("MetaAPI streaming connection established (price feed live).")
-
-    async def on_disconnected(self, instance_index):
-        c_log("MetaAPI streaming connection lost -- reconnect loop will retry and resubscribe.")
 
 
 def _lq_is_stale(symbol: str) -> bool:
@@ -203,18 +162,183 @@ async def _lq_price_with_fallback(symbol: str) -> tuple[float | None, str, float
 
 
 def _resolve_broker_symbol(symbol: str) -> str:
+    """MT5/MetaApi broker symbol for execution -- unrelated to the OANDA feed,
+    which always uses our own internal symbol names (they match OANDA's
+    instrument names directly, e.g. 'XAU_USD')."""
     configured = bot_state.get('symbol', '').strip()
     if not configured or '_' in configured:
         return symbol.replace('_', '')
     return configured
 
 
+# ---------------------------------------------------------------------------
+# OANDA LIVE PRICE STREAM
+# ---------------------------------------------------------------------------
+# This is now the ONLY source of live_quotes / tick-driven entry detection.
+# It is a plain OANDA v20 streaming HTTP connection -- entirely independent
+# of MetaApi. Reconnecting it (on staleness, drop, or a new symbol being
+# activated) never calls MetaApi and never touches its quota/usage.
+_oanda_stream_symbols: set[str] = set()
+_oanda_stream_task: asyncio.Task | None = None
+_last_oanda_tick_ts = time.monotonic()
+_OANDA_STREAM_STALE_SECONDS = 20.0
+_last_oanda_reconnect_alert_ts = 0.0  # throttles repeated Telegram alerts
+
+
+async def _oanda_price_stream_loop() -> None:
+    global _last_oanda_tick_ts
+    backoff = 1.0
+    while True:
+        symbols = sorted(_oanda_stream_symbols)
+        if not symbols:
+            await asyncio.sleep(2)
+            continue
+        url = f'{OANDA_STREAM_URL}/accounts/{OANDA_ACCOUNT}/pricing/stream'
+        headers = {'Authorization': f'Bearer {OANDA_TOKEN}'}
+        params = {'instruments': ','.join(symbols)}
+        try:
+            # No overall timeout (it's a long-lived stream); sock_read acts as
+            # our heartbeat timeout -- OANDA sends a HEARTBEAT line at least
+            # every ~5s, so a read gap this long means the connection is dead.
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=_OANDA_STREAM_STALE_SECONDS)
+            async with get_http().get(url, headers=headers, params=params, timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    c_log(f"OANDA price stream: HTTP {resp.status} -- {body[:300]}")
+                    await asyncio.sleep(min(backoff, 30)); backoff = min(backoff * 2, 30)
+                    continue
+                c_log(f"OANDA price stream connected ({', '.join(symbols)}).")
+                backoff = 1.0
+                async for raw_line in resp.content:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue
+                    _last_oanda_tick_ts = time.monotonic()
+                    if msg.get('type') != 'PRICE':
+                        continue  # HEARTBEAT lines just keep _last_oanda_tick_ts fresh
+                    instrument = msg.get('instrument')
+                    if instrument not in _oanda_stream_symbols:
+                        continue
+                    bids = msg.get('bids') or []; asks = msg.get('asks') or []
+                    if not bids or not asks:
+                        continue
+                    try:
+                        bid = float(bids[0]['price']); ask = float(asks[0]['price'])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    mid = (bid + ask) / 2
+                    live_quotes[instrument] = {'bid': bid, 'ask': ask, 'mid': mid, 'ts': time.monotonic()}
+                    from execution import _gann_tick_fire_check
+                    _safe_task(_gann_tick_fire_check(instrument, mid, 0.0), 'tick_fire_check')
+                    from state import bot_state as _bs
+                    if _bs.get('is_live_twin_running', False):
+                        try:
+                            _live_twin_queue.put_nowait({
+                                'symbol': instrument, 'bid': bid, 'ask': ask, 'mid': mid,
+                                'ts': time.monotonic(),
+                            })
+                        except asyncio.QueueFull:
+                            pass
+                c_log("OANDA price stream: connection closed by server -- reconnecting.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_exception('_oanda_price_stream_loop', e)
+        await asyncio.sleep(min(backoff, 30)); backoff = min(backoff * 2, 30)
+
+
+async def _restart_oanda_stream() -> None:
+    """Cancels and relaunches the streaming task against the current
+    _oanda_stream_symbols set. Pure OANDA HTTP -- no MetaApi involved."""
+    global _oanda_stream_task
+    if _oanda_stream_task is not None and not _oanda_stream_task.done():
+        _oanda_stream_task.cancel()
+        try:
+            await asyncio.wait_for(_oanda_stream_task, timeout=5)
+        except Exception:
+            pass
+    _oanda_stream_task = _safe_task(_oanda_price_stream_loop(), 'oanda_price_stream')
+
+
+async def _force_oanda_stream_reconnect(reason: str) -> None:
+    global _last_oanda_tick_ts, _last_oanda_reconnect_alert_ts
+    c_log(f"OANDA STREAM WATCHDOG: reconnecting -- {reason}")
+    await _restart_oanda_stream()
+    _last_oanda_tick_ts = time.monotonic()
+    now = time.monotonic()
+    if now - _last_oanda_reconnect_alert_ts > 180:  # throttle: at most one alert / 3 min
+        _last_oanda_reconnect_alert_ts = now
+        from telegram_ui import send_tg_msg
+        await send_tg_msg(f"🔁 <b>Watchdog: أعيد الاتصال بتغذية أسعار OANDA</b>\nالسبب: {reason}")
+
+
+async def _ensure_oanda_stream_symbol(symbol: str) -> None:
+    """Adds a symbol to the OANDA stream and restarts it if needed. Called
+    whenever a pair is activated. Cheap, pure-OANDA -- no MetaApi cost."""
+    global _oanda_stream_task
+    if symbol in _oanda_stream_symbols:
+        return
+    _oanda_stream_symbols.add(symbol)
+    if _oanda_stream_task is None or _oanda_stream_task.done():
+        _oanda_stream_task = _safe_task(_oanda_price_stream_loop(), 'oanda_price_stream')
+    else:
+        await _restart_oanda_stream()
+
+
+async def init_oanda_price_feed() -> None:
+    """Starts the OANDA live price stream for all currently-active symbols.
+    Call this AFTER init_metaapi() so bot_state['active_symbols'] reflects
+    whatever persistence loaded. This feed is fully independent of MetaApi."""
+    for sym, on in bot_state['active_symbols'].items():
+        if on:
+            _oanda_stream_symbols.add(sym)
+    if _oanda_stream_symbols:
+        await _restart_oanda_stream()
+    else:
+        c_log("init_oanda_price_feed: no active symbols yet -- stream starts once one is activated.")
+
+
+# ---------------------------------------------------------------------------
+# METAAPI CONNECTION LIFECYCLE -- EXECUTION ONLY (no price ticks anymore)
+# ---------------------------------------------------------------------------
+_metaapi = None
+_metaapi_account = None
+_metaapi_conn = None
+
+# ── Strict Singleton: subscription set ──
+# Prevents duplicate subscribe_to_market_data() calls across the
+# entire bot lifecycle.  Once a symbol is subscribed it is NEVER
+# re-subscribed unless the connection is force-reconnected (in which
+# case the set is cleared). This subscription is still required by the
+# MetaApi SDK to load the symbol specification needed for order placement --
+# it just no longer feeds live_quotes.
+_active_subscriptions: set[str] = set()
+
+
+class _GannPriceListener(SynchronizationListener):
+    """Execution-connection lifecycle logging only. Price ticks are no
+    longer read from here -- see _oanda_price_stream_loop above."""
+
+    async def on_connected(self, instance_index, replicas):
+        c_log("MetaAPI execution connection established.")
+
+    async def on_disconnected(self, instance_index):
+        c_log("MetaAPI execution connection lost -- reconnect loop will retry and resubscribe.")
+
+
 async def _lq_subscribe_symbol(symbol: str) -> None:
+    """Ensures the symbol is (a) included in the OANDA price stream and
+    (b) subscribed on MetaApi for execution/symbol-spec purposes. (a) never
+    touches MetaApi; (b) is a no-op if already subscribed."""
     global _active_subscriptions
+    await _ensure_oanda_stream_symbol(symbol)
     if _metaapi_conn is None:
         return
     broker_sym = _resolve_broker_symbol(symbol)
-    _broker_to_data_symbol[broker_sym] = symbol
     if broker_sym in _active_subscriptions:
         return  # already subscribed — guard against duplicate API call
     try:
@@ -224,56 +348,8 @@ async def _lq_subscribe_symbol(symbol: str) -> None:
         log_exception(f"_lq_subscribe_symbol [{symbol} -> {broker_sym}]", e)
 
 
-async def _force_full_reconnect(reason: str) -> None:
-    global _metaapi_conn, _last_any_tick_ts, _active_subscriptions, _last_reconnect_alert_ts
-    c_log(f"WS WATCHDOG: forcing full reconnect -- {reason}")
-    await set_connection_state(CONN_READ_ONLY, f"WS watchdog: {reason}")
-    if _metaapi_account is None:
-        c_log("WS WATCHDOG: _metaapi_account is None — cannot reconnect")
-        return
-    try:
-        if _metaapi_conn is not None:
-            try:
-                await asyncio.wait_for(_metaapi_conn.close(), timeout=15)
-            except Exception as e:
-                log_exception('_force_full_reconnect: close old connection', e)
-        _active_subscriptions.clear()  # reset — re-subscribe below
-        _metaapi_conn = _metaapi_account.get_streaming_connection()
-        _metaapi_conn.add_synchronization_listener(_GannPriceListener())
-        await asyncio.wait_for(_metaapi_conn.connect(), timeout=30)
-        await asyncio.wait_for(_metaapi_conn.wait_synchronized(), timeout=30)
-        for sym, on in bot_state['active_symbols'].items():
-            if on:
-                await _lq_subscribe_symbol(sym)
-        _last_any_tick_ts = time.monotonic()
-        c_log("WS WATCHDOG: reconnect successful, ticks should resume.")
-        await set_connection_state(CONN_RUNNING, "WS watchdog: forced reconnect succeeded.")
-        from telegram_ui import send_tg_msg
-        await send_tg_msg(f"🔁 <b>Watchdog: أعيد الاتصال تلقائياً بـ MetaApi</b>\nالسبب: {reason}")
-    except asyncio.TimeoutError:
-        c_log("WS WATCHDOG: reconnect attempt timed out -- will retry next scan cycle (~15s).")
-        now = time.monotonic()
-        if now - _last_reconnect_alert_ts > 180:  # throttle: at most one Telegram alert / 3 min
-            _last_reconnect_alert_ts = now
-            from telegram_ui import send_tg_msg
-            await send_tg_msg(
-                f"🛑 <b>Watchdog: انتهت مهلة إعادة الاتصال (30s)</b>\nالسبب الأصلي: {reason}\n"
-                f"سيُعاد المحاولة تلقائياً بدورة فحص جديدة خلال ~15 ثانية."
-            )
-    except Exception as e:
-        log_exception('_force_full_reconnect', e)
-        now = time.monotonic()
-        if now - _last_reconnect_alert_ts > 180:
-            _last_reconnect_alert_ts = now
-            from telegram_ui import send_tg_msg
-            await send_tg_msg(f"🛑 <b>Watchdog: فشلت محاولة إعادة الاتصال التلقائي</b>\nالسبب الأصلي: {reason}\nالخطأ: {e}")
-
-
-# ---------------------------------------------------------------------------
-# METAAPI CONNECTION LIFECYCLE
-# ---------------------------------------------------------------------------
 async def _bootstrap_metaapi_connection() -> bool:
-    global _metaapi, _metaapi_account, _metaapi_conn, _last_any_tick_ts, _active_subscriptions
+    global _metaapi, _metaapi_account, _metaapi_conn, _active_subscriptions
     try:
         _metaapi = MetaApi(METAAPI_TOKEN)
         _metaapi_account = await _metaapi.metatrader_account_api.get_account(ACCOUNT_ID)
@@ -290,8 +366,7 @@ async def _bootstrap_metaapi_connection() -> bool:
             for sym, on in bot_state['active_symbols'].items():
                 if on:
                     await _lq_subscribe_symbol(sym)
-            c_log("MetaAPI Streaming Connection established (live quotes subscribed).")
-            _last_any_tick_ts = time.monotonic()
+            c_log("MetaAPI Streaming Connection established (execution ready).")
             await set_connection_state(CONN_RUNNING, "MetaAPI connected and synchronized.")
             return True
         else:

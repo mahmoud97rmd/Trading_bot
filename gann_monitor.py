@@ -31,21 +31,21 @@ from state import (
 import market_data
 from market_data import (
     live_quotes,
-    _lq_price_with_fallback, _force_full_reconnect, _bootstrap_metaapi_connection,
+    _lq_price_with_fallback, _force_oanda_stream_reconnect, _bootstrap_metaapi_connection,
     _lq_is_stale, _lq_subscribe_symbol,
     _gann_cache, fetch_candles, fetch_master_price,
-    _QUOTE_STALE_SECONDS, _WS_WATCHDOG_STALE_SECONDS,
+    _QUOTE_STALE_SECONDS,
 )
-# NOTE: _metaapi_conn / _metaapi_account / _last_any_tick_ts are deliberately
+# NOTE: _metaapi_conn / _metaapi_account / _last_oanda_tick_ts are deliberately
 # NOT imported with `from market_data import ...` here. That syntax copies the
 # value that name pointed to AT IMPORT TIME into this module's namespace.
 # market_data.py later reassigns them with `global _metaapi_conn; _metaapi_conn = ...`
-# inside its own functions -- that only rebinds market_data's own copy, it never
-# updates the frozen copy that would live here. The result: this module would
-# see _metaapi_conn as permanently None and _last_any_tick_ts as whatever it was
-# the instant this module was first imported (long before the connection was
-# ever established) -- so the watchdog below would never fire.
-# Always read `market_data._metaapi_conn` / `market_data._last_any_tick_ts`
+# (or `global _last_oanda_tick_ts; ...`) inside its own functions -- that only
+# rebinds market_data's own copy, it never updates the frozen copy that would
+# live here. The result: this module would see _metaapi_conn as permanently
+# None and _last_oanda_tick_ts as whatever it was the instant this module was
+# first imported -- so the watchdogs below would never fire.
+# Always read `market_data._metaapi_conn` / `market_data._last_oanda_tick_ts`
 # fresh at the point of use instead.
 from strategy import (
     gann_calc_levels, gann_active_levels, _gann_atr, _gann_fetch_last_closed_anchor,
@@ -81,25 +81,27 @@ async def gann_monitor_scanner() -> None:
             if market_data._metaapi_conn is None or market_data._metaapi_account is None:
                 await _bootstrap_metaapi_connection()
 
-            # Stale tick watchdog: if no tick for >60s, trigger full reconnect.
-            # Connection management is in market_data.py (init_metaapi / _bootstrap).
-            # Scanner reads from the shared live_quotes cache ONLY.
-            # Read these fresh from the market_data module every iteration --
-            # see the comment at the top of this file for why a plain
-            # `from market_data import _metaapi_conn` would freeze them.
+            # OANDA price-feed watchdog: if no tick (or heartbeat) for
+            # >_OANDA_STREAM_STALE_SECONDS, reconnect the stream. This is
+            # entirely independent of MetaApi -- it only reopens a plain
+            # OANDA HTTP streaming connection, so it costs nothing against
+            # MetaApi's quota no matter how often it fires.
+            # Read fresh from the market_data module every iteration -- see
+            # the comment at the top of this file for why a plain
+            # `from market_data import _metaapi_conn` would freeze it.
             _metaapi_conn = market_data._metaapi_conn
-            _last_any_tick_ts = market_data._last_any_tick_ts
+            last_oanda_tick = market_data._last_oanda_tick_ts
             active_syms_now = [s for s, on in bot_state['active_symbols'].items() if on]
-            if (_metaapi_conn is not None and active_syms_now and _is_market_hours_now()
-                    and (time.monotonic() - _last_any_tick_ts) > _WS_WATCHDOG_STALE_SECONDS):
-                await _force_full_reconnect(
-                    f"لا تيك واحد وصل منذ {time.monotonic() - _last_any_tick_ts:.0f}s "
-                    f"(الحد: {_WS_WATCHDOG_STALE_SECONDS:.0f}s)"
+            if (active_syms_now and _is_market_hours_now()
+                    and (time.monotonic() - last_oanda_tick) > market_data._OANDA_STREAM_STALE_SECONDS):
+                await _force_oanda_stream_reconnect(
+                    f"لا تيك/نبضة من OANDA وصلت منذ {time.monotonic() - last_oanda_tick:.0f}s "
+                    f"(الحد: {market_data._OANDA_STREAM_STALE_SECONDS:.0f}s)"
                 )
 
             # ── MT5 Zombie Singleton Heartbeat ──
             # Catches the case where connection_state is stuck away from
-            # CONN_RUNNING (e.g. _force_full_reconnect above keeps timing out)
+            # CONN_RUNNING (e.g. a prior reconnect attempt below keeps failing)
             # and escalates to a FULL client+account rebuild via
             # _bootstrap_metaapi_connection(), with up to 5 attempts and
             # exponential backoff (1s, 2s, 4s, 8s, 16s) within this one tick.
@@ -122,11 +124,11 @@ async def gann_monitor_scanner() -> None:
                     await asyncio.sleep(2 ** attempt)
                 if not reconnected:
                     c_log("MetaAPI reconnect exhausted 5 attempts this tick; will retry next cycle.")
-            # Feed-level staleness watchdog: connection_status can still say
-            # CONNECTED while a symbol's subscription silently dropped (no
-            # more ticks arriving). Caught independently of the connection-
-            # level check above, and just re-subscribes rather than tearing
-            # down the whole connection.
+            # Per-symbol feed staleness: catches a symbol that's missing from
+            # the OANDA stream's instrument set (e.g. right after activation,
+            # before the stream task has picked it up). _lq_subscribe_symbol
+            # re-adds it to the OANDA stream and, if a MetaApi execution
+            # connection is up, re-subscribes it there too.
             elif _metaapi_conn is not None:
                 for sym, on in bot_state['active_symbols'].items():
                     if on and _lq_is_stale(sym):
@@ -597,7 +599,7 @@ async def gann_run_diagnostics() -> str:
     lines = ["<b>🩺 تشخيص أسباب عدم فتح الصفقات</b>\n"]
     conn_state = bot_state.get('connection_state', CONN_RUNNING)
     conn_ok = conn_state == CONN_RUNNING
-    lines.append(f"1️⃣ حالة الاتصال: {'✅ RUNNING' if conn_ok else f'🛑 {conn_state}'}")
+    lines.append(f"1️⃣ حالة اتصال MetaApi (التنفيذ): {'✅ RUNNING' if conn_ok else f'🛑 {conn_state}'}")
     if not conn_ok:
         lines.append(f"   السبب: {bot_state.get('connection_state_reason', '-')}")
     dam_blocked = _is_within_dam_restricted_window()
@@ -618,11 +620,11 @@ async def gann_run_diagnostics() -> str:
         q = live_quotes.get(symbol)
         ws_age = (time.monotonic() - q['ts']) if q else None
         if q is None:
-            lines.append("📡 تغذية MetaApi (WS): 🛑 <b>لم تصل ولا تيك واحد</b>")
+            lines.append("📡 تغذية الأسعار (OANDA): 🛑 <b>لم تصل ولا تيك واحد</b>")
         elif ws_age > _QUOTE_STALE_SECONDS:
-            lines.append(f"📡 تغذية MetaApi (WS): 🛑 <b>متوقفة منذ {ws_age:.0f}s</b>")
+            lines.append(f"📡 تغذية الأسعار (OANDA): 🛑 <b>متوقفة منذ {ws_age:.0f}s</b>")
         else:
-            lines.append(f"📡 تغذية MetaApi (WS): ✅ حية ({ws_age:.1f}s)")
+            lines.append(f"📡 تغذية الأسعار (OANDA): ✅ حية ({ws_age:.1f}s)")
         cycle_active = sym_state.get('gann_cycle_active', False)
         n_levels = len(sym_state.get('gann_levels', []))
         lines.append(f"دورة جان نشطة: {'✅' if cycle_active else '🛑'}  |  عدد المستويات: {n_levels}")

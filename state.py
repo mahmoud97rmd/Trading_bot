@@ -73,6 +73,8 @@ SYMBOL_INFO = {
     'NZD_JPY': {'pip_value': 0.01,    'contract_size': 100000, 'prec': 3, 'name': 'NZD/JPY'},
 }
 OANDA_BASE_URL = 'https://api-fxpractice.oanda.com/v3'
+# v20 streaming pricing endpoint lives on a separate host from the REST API.
+OANDA_STREAM_URL = OANDA_BASE_URL.replace('https://api-', 'https://stream-', 1)
 _TFS = ['1m', '2m', '3m', '4m', '5m', '6m', '10m', '15m', '20m', '30m', '1h', '2h']
 DAM_OFF = timedelta(hours=3)
 

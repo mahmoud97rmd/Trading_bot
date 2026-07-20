@@ -487,7 +487,7 @@ async def _handle_callback(d: str, chat_id: int, msg_id: int) -> None:
             f"💰 ربح/خسارة يومي محقق: <b>${daily_pnl:+.2f}</b>\n"
             f"🔒 قفل الحماية اليومي: {hit_msg}\n"
             f"📈 صفقات مفتوحة: <b>{total_open}</b>\n"
-            f"📶 تغذية الأسعار اللحظية (WS): {ws_status}\n"
+            f"📶 تغذية الأسعار اللحظية (OANDA): {ws_status}\n"
         )
         await _show(chat_id, msg_id, text, get_main_keyboard())
         return

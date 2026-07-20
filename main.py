@@ -3,7 +3,7 @@ main.py — Entry point and task orchestration.
 
 v9.5 — Refactored from monolithic Script.py into modular architecture:
   state.py         — global state, config, persistence, connection FSM
-  market_data.py   — OANDA REST, MetaApi WebSocket, live quotes
+  market_data.py   — OANDA REST + live price stream, MetaApi execution connection
   strategy.py      — Gann levels, trend filters, ATR, TP/SL
   execution.py     — order execution, trade management, fill monitor
   backtest.py      — backtest & Live-Twin engines
@@ -22,7 +22,7 @@ from state import (
     bot_state, get_http, c_log, log_exception, _safe_task,
     CONN_RUNNING, CONN_READ_ONLY, CONN_HALTED,
 )
-from market_data import init_metaapi
+from market_data import init_metaapi, init_oanda_price_feed
 from gann_monitor import (
     gann_monitor_scanner, gann_cycle_manager, global_ledger_reconciliation,
 )
@@ -88,7 +88,8 @@ async def handle_ping(request: web.Request) -> web.Response:
 # ── Main Entry Point ──
 async def main() -> None:
     get_http()
-    await init_metaapi()
+    await init_metaapi()          # MetaApi: execution connection only
+    await init_oanda_price_feed()  # OANDA: sole source of live price ticks
 
     app = web.Application()
     app.router.add_get('/', handle_ping)
