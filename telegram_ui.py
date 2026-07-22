@@ -157,6 +157,7 @@ def get_protection_keyboard() -> dict:
         [{'text': f"مزامنة MT4: {'✅' if bot_state.get('prot_true_sync', True) else '🔴'}", 'callback_data': 'tg_prot_sync'}],
         [{'text': f"إلغاء الدورة وقت الانفجار: {'✅' if bot_state.get('prot_cycle_inval', True) else '🔴'}", 'callback_data': 'tg_prot_inval'}],
         [{'text': f"فلتر انفجار السعر عند الدخول (Hybrid): {'✅' if bot_state.get('prot_spike_filter', True) else '🔴'}", 'callback_data': 'tg_prot_spike'}],
+        [{'text': f"إعادة التحقق من السعر عند التنفيذ: {'✅' if bot_state.get('prot_exec_revalidation', True) else '🔴'}", 'callback_data': 'tg_prot_exec_reval'}],
         [{'text': f"حد الانفجار عند الدخول: {bot_state.get('gann_spike_limit_pts', 20)} نقطة", 'callback_data': 'noop'}],
         [{'text': '➖ 5 نقاط', 'callback_data': 'gann_dec_spike'},
          {'text': '➕ 5 نقاط', 'callback_data': 'gann_inc_spike'}],
@@ -621,6 +622,17 @@ async def _cb_tg_prot_inval(chat_id, msg_id, sym, sym_state):
 @_exact('tg_prot_spike')
 async def _cb_tg_prot_spike(chat_id, msg_id, sym, sym_state):
     bot_state['prot_spike_filter'] = not bot_state.get('prot_spike_filter', True)
+    await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
+
+@_exact('tg_prot_exec_reval')
+async def _cb_tg_prot_exec_reval(chat_id, msg_id, sym, sym_state):
+    # Explicit ON/OFF switch for the execution-time re-check in _gann_open_trade
+    # (abs(fresh_px - level_price) > margin). Disabling it means: once a touch
+    # is detected and passes is_trading_allowed(), the trade opens using
+    # whatever the live price is at that moment -- no second "is this still a
+    # real touch" gate. This trades a bit of entry-price precision for not
+    # losing the touch/hybrid channels to brief price drift during execution.
+    bot_state['prot_exec_revalidation'] = not bot_state.get('prot_exec_revalidation', True)
     await _show(chat_id, msg_id, '🛡️ إعدادات الحماية:', get_protection_keyboard())
 
 @_exact('gann_dec_spike')

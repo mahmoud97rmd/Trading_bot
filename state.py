@@ -420,6 +420,7 @@ bot_state: dict = {
     'lt_latency_ms_max': 200,
     'gann_spike_limit_pts': 20,
     'prot_spike_filter': True,
+    'prot_exec_revalidation': True,
 
     'lt_mode': 'realistic',
     'lt_base_spread_usd': 0.34,

@@ -367,7 +367,7 @@ async def _gann_open_trade(symbol: str, is_buy: bool, level: dict, candles: list
                 f"السبب: تجنب استدعاء OANDA REST البطيء ({50}-{150}ms) الذي يفسد السكالبينج."
             )
             return
-        if abs(fresh_px - level['price']) > margin:
+        if bot_state.get('prot_exec_revalidation', True) and abs(fresh_px - level['price']) > margin:
             bot_state['symbol_state'][symbol]['gann_level_status'][_lk] = 'used'
             from telegram_ui import send_tg_msg
             drift = abs(fresh_px - initial_px) if (fresh_px is not None and initial_px is not None) else None
